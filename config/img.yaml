@@ -1,0 +1,11 @@
+resize: False
+# resize_size:
+
+random_crop: False 
+# random_crop_size: 
+
+rotation: Flase
+# rotation_degree:
+
+color_jitter: False
+# color_jitter_params:

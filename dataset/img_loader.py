@@ -1,15 +1,14 @@
-import os
+import argparse, os, yaml
 from PIL import Image
 import numpy as np
-import yaml
+from img_randomer import Image_randomer
 
 class Image_loader:
-    def __init__(self, path, stat):
+    def __init__(self, path, config):
+        self._config = config
         self.path = path
-        # self.param = stat
-        self.resize = config.get("resize",True)
-        self.random_crop = config.get("random_crop", True)
-        self.center_crop = config.get("center_crop", True)
+        self.randomer = Image_randomer(config)
+  
         
     def get_episode_path(self):
         dataset_path = self.path
@@ -63,26 +62,28 @@ class Image_loader:
             for image_key in image_dict[episode_idx]:
                 image_path = image_dict[episode_idx][image_key]
                 img = Image.open(image_path)
-                # image.conver("RGB")
-                rgb_img = img.convert("RGB")               
-                if self.resize:
-                    torch_img = rgb_img.transforms.Resize()
-                if self.random_crop:
-                    torch_img = rgb_img.transforms.RandomCrop()
-                if self.center_crop:
-                    torch_img = rgb_img.transforms.CenterCrop()
-                image_array = torch_img.transform.ToTensor()
-                print(image_array)
-                return image_array
 
-                
+                rgb_img = img.convert("RGB")               
+                image_array = self.randomer(rgb_img)
+                # print(image_array)
+                return image_array
 
 
 if __name__ == "__main__":
-
-    path = "/home/hirol/code/data/train_episode/moving_bread/moving_bread_hirol/"
+    arguments = {"config": {"short_cut": "-c",
+                        "symbol": "--config",
+                        "type": str,
+                        "default": "config/img.yaml",
+                        "help": "Path to the config file"}}
+    args = argparse.ArgumentParser("img loader",arguments)
+    for arg_name, arg_info in arguments.items():
+        args.add_argument(arg_info["short_cut"], arg_info["symbol"], type=arg_info["type"], default=arg_info["default"], help=arg_info["help"])
+    args = args.parse_args()
+    config = yaml.safe_load(open(args.config, "r"))
+    path = "data/pnp_30_ep/pick_and_place"
     image_loader = Image_loader(
-        path = path
+        path = path,
+        config=config
     )
     episode_paths = image_loader.get_episode_path()
     color_paths = image_loader.get_color_path()

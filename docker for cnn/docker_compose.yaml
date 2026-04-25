@@ -1,0 +1,76 @@
+
+services:
+    # CNN train
+  cnn_train:
+    build:
+      context: .  # Assuming the Dockerfile is in the current directory
+      dockerfile: Dockerfile
+      # 启动docker 前执行以下指令:
+      # sudo touch /tmp/.docker.xauth
+      # sudo chown $USER:$USER /tmp/.docker.xauth
+      # chmod 600 /tmp/.docker.xauth
+      # xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f /tmp/.docker.xauth nmerge -
+      # chmod 644 /tmp/.docker.xauth
+      # 使用以下指令来排查： ls -la /tmp/.docker.xauth和xauth -f /tmp/.docker.xauth list
+    volumes:
+      - ../:/workspace
+      - ../../data:/workspace/data
+      # - /mnt/nas/ZML:/mnt/nas/ZML
+      # - $HOME/Code/das-traj-generation/data:/workspace/das_data
+      # - $HOME/Code/hirol:/home/teleophost/zyx
+      # - $HOME/.ssh/id_rsa:/home/teleophost/.ssh/id_rsa
+      # - $HOME/.ssh/id_rsa.pub:/home/teleophost/.ssh/id_rsa.pub
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${XAUTHORITY:-$HOME/.Xauthority}:${XAUTHORITY:-$HOME/.Xauthority}:ro
+      # - $HOME/.Xauthority:/home/teleophost/.Xauthority
+      # 针对ssh 到服务器使用docker的GUI映射支持  
+      # - /tmp/.docker.xauth:/tmp/.docker.xauth:ro
+      - /sys/bus/usb:/sys/bus/usb:ro
+      - /sys/class/input:/sys/class/input:ro
+      # 绑定HTC TRACKER的config
+      - ${HOME}/.config/libsurvive/config.json:/home/teleophost/.config/libsurvive/config.json
+      # 针对USB绑定的设备进行访问
+      - /dev:/dev
+     
+    environment:
+      - ROS_DOMAIN_ID=13
+      - DISPLAY=${DISPLAY}
+      # 针对ssh 到服务器使用docker的GUI映射支持
+      # - XAUTHORITY=/tmp/.docker.xauth
+      - XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
+      - http_proxy=
+      - https_proxy=
+      - no_proxy=
+      - SDL_VIDEODRIVER=x11
+      - SDL_AUDIODRIVER=pulse
+      # 设备权限相关
+      - UDEV=1
+      - SHELL=/bin/bash
+      # - http_proxy=http://127.0.0.1:7897
+      # - https_proxy=http://127.0.0.1:7897
+      # - no_proxy=localhost,127.0.0.1
+    devices:
+      - /dev:/dev  # Mount all devices
+      - /dev/bus/usb:/dev/bus/usb  # Mount USB devices
+      - /dev/input:/dev/input
+      # 蓝牙支持（如果需要）
+      - /var/run/dbus:/var/run/dbus
+      - /run/dbus:/run/dbus
+    privileged: true
+    user: "0:0"
+    # network_mode: rei
+    stdin_open: true
+    gpus: all
+    tty: true
+    command: ["tail", "-f", "/dev/null"]
+    deploy:
+      resources:
+        # limits:
+        #   memory: 32G
+        #   cpus: '20.0'
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, graphics, display, utility, video, compute]
+
