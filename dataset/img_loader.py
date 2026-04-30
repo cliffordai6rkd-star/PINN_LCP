@@ -1,17 +1,20 @@
 import argparse, os, yaml
-from PIL import Image
 import numpy as np
-from img_randomer import Image_randomer
+import matplotlib.pyplot as plt
 
+from img_randomer import transforms
+from img_randomer import Image_randomer
+from PIL import Image
+from pathlib import Path
 class Image_loader:
-    def __init__(self, path, config):
+    def __init__(self, config):
         self._config = config
-        self.path = path
+        self.path = config.get("datapath","data/pnp_30_ep/pick_and_place")
         self.randomer = Image_randomer(config)
   
         
     def get_episode_path(self):
-        dataset_path = self.path
+        dataset_path = Path(self.path)
         episode_paths = []
         components = os.listdir(dataset_path)
         components.sort()  # 给所有内容排序
@@ -64,12 +67,24 @@ class Image_loader:
                 img = Image.open(image_path)
 
                 rgb_img = img.convert("RGB")               
-                image_array = self.randomer(rgb_img)
-                # print(image_array)
-                return image_array
+                image_tensor = self.randomer(rgb_img)
+                return image_tensor
+
+
+    # 用transforms.ToPILImage方法反归一化图片然后show,save
+    # 考虑在层中间正常可视化
+    def show_tensor_image(self, image_tensor):
+        # image = image.tensor.permute(1, 2, 0)
+        tensor_to_pil = transforms.ToPILImage()
+        pil_image = tensor_to_pil(image_tensor)  
+        # pil_image.show()
+        pil_image.save("debug_augmented.jpg")
+        plt.show()
+        return pil_image
 
 
 if __name__ == "__main__":
+
     arguments = {"config": {"short_cut": "-c",
                         "symbol": "--config",
                         "type": str,
@@ -80,16 +95,14 @@ if __name__ == "__main__":
         args.add_argument(arg_info["short_cut"], arg_info["symbol"], type=arg_info["type"], default=arg_info["default"], help=arg_info["help"])
     args = args.parse_args()
     config = yaml.safe_load(open(args.config, "r"))
-    path = "data/pnp_30_ep/pick_and_place"
+
+
     image_loader = Image_loader(
-        path = path,
-        config=config
+        config = config
     )
-    episode_paths = image_loader.get_episode_path()
-    color_paths = image_loader.get_color_path()
-    img_dict = image_loader.get_img_dict()
     # print(img_dict)
-    image_loader.load_image()
+    image = image_loader.load_image()
+    image_loader.show_tensor_image(image)
     
 
   

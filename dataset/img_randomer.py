@@ -55,6 +55,6 @@ class Image_randomer():
         
         if not isinstance(image, Image.Image):
             raise ValueError("Input must be a PIL Image")
-        image_array = self.transform(image)
-        print(image_array)
-        return image_array
+        image_tensor = self.transform(image)
+        print(image_tensor)
+        return image_tensor
