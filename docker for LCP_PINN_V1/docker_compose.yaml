@@ -1,10 +1,14 @@
-
+name: lcp_pinn
 services:
     # CNN train
-  cnn_train:
+  v2:
     build:
       context: .  # Assuming the Dockerfile is in the current directory
       dockerfile: Dockerfile
+      args:
+        USERNAME: ${DOCKER_USER:-teleophost}
+        USER_UID: ${HOST_UID:-1000}
+        USER_GID: ${HOST_GID:-1000}
       # 启动docker 前执行以下指令:
       # sudo touch /tmp/.docker.xauth
       # sudo chown $USER:$USER /tmp/.docker.xauth
@@ -46,6 +50,7 @@ services:
       # 设备权限相关
       - UDEV=1
       - SHELL=/bin/bash
+      - HOME=/home/${DOCKER_USER:-teleophost}
       # - http_proxy=http://127.0.0.1:7897
       # - https_proxy=http://127.0.0.1:7897
       # - no_proxy=localhost,127.0.0.1
@@ -57,7 +62,12 @@ services:
       - /var/run/dbus:/var/run/dbus
       - /run/dbus:/run/dbus
     privileged: true
-    user: "0:0"
+    # 默认用宿主机 UID/GID 运行，避免挂载目录里生成 root:root 文件。
+    # 启动前可执行：
+    #   export HOST_UID=$(id -u)
+    #   export HOST_GID=$(id -g)
+    #   export DOCKER_USER=teleophost
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     # network_mode: rei
     stdin_open: true
     gpus: all
@@ -73,4 +83,3 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu, graphics, display, utility, video, compute]
-
