@@ -27,10 +27,18 @@ def build_rerun_blueprint():
                     ),
                     column_shares=[2, 1],
                 ),
-                rrb.Spatial3DView(
-                    name="EE Pose",
-                    origin="world",
-                    contents="$origin/**",
+                rrb.Horizontal(
+                    rrb.Spatial3DView(
+                        name="EE Matrix",
+                        origin="world/ee",
+                        contents="$origin/**",
+                    ),
+                    rrb.Spatial3DView(
+                        name="EE Quat7",
+                        origin="world/ee_quat7",
+                        contents="$origin/**",
+                    ),
+                    column_shares=[1, 1],
                 ),
                 row_shares=[1, 2],
             ),
@@ -102,29 +110,12 @@ class LeRobotv3Reader:
             value = value.detach().cpu().numpy()
         return value
 
-    def show_image(self, idx=2, key="observation.images.wrist"):
-        import matplotlib.pyplot as plt
-
-        sample = self.dataset[idx]
-        image = sample[key]
-        image = self._to_numpy(image)
-
-        # LeRobot 读出来的图像可能是 CHW，也可能是 HWC
-        if image.ndim == 3 and image.shape[0] in (1, 3):
-            image = image.transpose(1, 2, 0)
-
-        # 如果是 float 且范围是 [0, 1]，imshow 可以直接显示
-        # 如果是 uint8 [0, 255]，imshow 也可以直接显示
-        plt.imshow(image)
-        plt.title(f"{key} @ idx={idx}")
-        plt.axis("off")
-        # plt.show()
-        plt.savefig("/workspace/debug_frame2.png")
 
 class RerunLeRobotVisualizer:
-    def __init__(self, reader, ee_pose_mode="matrix"):
+    def __init__(self, reader, ee_pose_mode="matrix", log_force_window_detail=False):
         self.reader = reader
         self.ee_pose_mode = ee_pose_mode
+        self.log_force_window_detail = log_force_window_detail
         self.ee_trajectory = []
         self.ee_quat7_trajectory = []
         self.image_path_map = {
@@ -140,6 +131,20 @@ class RerunLeRobotVisualizer:
     def reset_episode_state(self):
         self.ee_trajectory = []
         self.ee_quat7_trajectory = []
+
+    def log_world_reference(self):
+        rr.log(
+            "world/origin",
+            rr.Points3D([[0, 0, 0]], radii=0.01, colors=[[255, 255, 255]]),
+        )
+        rr.log(
+            "world/reference_axes",
+            rr.Arrows3D(
+                origins=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+                vectors=[[0.2, 0, 0], [0, 0.2, 0], [0, 0, 0.2]],
+                colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+            ),
+        )
 
     def log_frame(self, idx):
         sample = self.reader.dataset[idx]
@@ -188,12 +193,15 @@ class RerunLeRobotVisualizer:
             name = force_names[ch_i] if ch_i < len(force_names) else f"ch_{ch_i}"
             rr.log(f"signals/force/{name}", rr.Scalars(float(current_ft[ch_i])))
 
-        # 窗口细节：如果需要检查窗口方向/历史值，可在左侧树里打开 force_window。
+        if not self.log_force_window_detail:
+            return
+
+        # 窗口细节：如果需要检查窗口方向/历史值，可在左侧树里打开 debug/force_window。
         for window_i in range(ft.shape[0]):
             for ch_i in range(ft.shape[1]):
                 name = force_names[ch_i] if ch_i < len(force_names) else f"ch_{ch_i}"
                 rr.log(
-                    f"signals/force_window/{name}/past_{window_i}",
+                    f"debug/force_window/{name}/past_{window_i}",
                     rr.Scalars(float(ft[window_i, ch_i])),
                 )
 
@@ -230,17 +238,26 @@ class RerunLeRobotVisualizer:
 
         rr.log(
             "world/ee/current_position",
-            rr.Points3D([translation], radii=0.015),
+            rr.Points3D([translation], radii=0.005),
         )
 
         rr.log(
             "world/ee/trajectory",
             rr.Points3D(
                 np.asarray(self.ee_trajectory),
-                radii=0.006,
-                colors=[[255, 255, 0]],
+                radii=0.002,
+                colors=[[255, 255, 255]],
             ),
         )
+        if len(self.ee_trajectory) >= 2:
+            rr.log(
+                "world/ee/trajectory_line",
+                rr.LineStrips3D(
+                    [np.asarray(self.ee_trajectory)],
+                    radii=0.003,
+                    colors=[[255, 255, 255]],
+                ),
+            )
 
         # 额外画出 EE 坐标轴：x 红、y 绿、z 蓝。
         axis_length = 0.08
@@ -279,17 +296,27 @@ class RerunLeRobotVisualizer:
 
         rr.log(
             "world/ee_quat7/current_position",
-            rr.Points3D([translation], radii=0.012, colors=[[255, 0, 255]]),
+            rr.Points3D([translation], radii=0.005, colors=[[0, 0, 255]]),
         )
 
         rr.log(
             "world/ee_quat7/trajectory",
             rr.Points3D(
                 np.asarray(self.ee_quat7_trajectory),
-                radii=0.005,
-                colors=[[0, 0, 255]],
+                radii=0.002,
+                colors=[[255, 255, 255]],
             ),
+            
         )
+        if len(self.ee_quat7_trajectory) >= 2:
+            rr.log(
+                "world/ee_quat7/trajectory_line",
+                rr.LineStrips3D(
+                    [np.asarray(self.ee_quat7_trajectory)],
+                    radii=0.003,
+                    colors=[[0, 0, 255]],
+                ),
+            )
 
         rr.log(
             "world/ee_quat7/frame",
@@ -435,6 +462,7 @@ def run_episode_review(
             default_blueprint=blueprint,
         )
         rr.send_blueprint(blueprint)
+        visualizer.log_world_reference()
 
         force_close_ui = False
         try:
@@ -474,7 +502,8 @@ def run_episode_review(
 if __name__ == "__main__":
     import rerun as rr
 
-    EE_POSE_MODE = "matrix"  # 可选："matrix"、"quat7"、"both"
+    EE_POSE_MODE = "both"  # 可选："matrix"、"quat7"、"both"
+    LOG_FORCE_WINDOW_DETAIL = False
     PLAYBACK_FPS = 45
     REALTIME_STREAM = True
     MEMORY_LIMIT_GB = 10
@@ -487,7 +516,11 @@ if __name__ == "__main__":
     )
 
     blueprint = build_rerun_blueprint()
-    visualizer = RerunLeRobotVisualizer(reader, ee_pose_mode=EE_POSE_MODE)
+    visualizer = RerunLeRobotVisualizer(
+        reader,
+        ee_pose_mode=EE_POSE_MODE,
+        log_force_window_detail=LOG_FORCE_WINDOW_DETAIL,
+    )
     run_episode_review(
         reader=reader,
         visualizer=visualizer,

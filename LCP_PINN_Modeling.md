@@ -260,7 +260,7 @@ G_n = J_n(q*)
 G_t = J_t(q*)
 N = M^{-1}(q*) J_n(q*)^T
 T = M^{-1}(q*) J_t(q*)^T
-phi(q*)
+
+phi(q*) -> image encoder
 
 
-加入力的任务适合做一些精细操作,而不是那种视觉能够主导执行\只要力够大就能执行,因此Action head 对当前观测下的ee_pose判断应该准确  所以与img做cross attention的不应该只是ft   应该是三者结合  或者是img与eepose embed  再与ft做cross attention

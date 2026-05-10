@@ -5,6 +5,7 @@ services:
     build:
       context: .  # Assuming the Dockerfile is in the current directory
       dockerfile: Dockerfile
+     
       args:
         USERNAME: ${DOCKER_USER:-teleophost}
         USER_UID: ${HOST_UID:-1000}
@@ -16,6 +17,8 @@ services:
       # xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f /tmp/.docker.xauth nmerge -
       # chmod 644 /tmp/.docker.xauth
       # 使用以下指令来排查： ls -la /tmp/.docker.xauth和xauth -f /tmp/.docker.xauth list
+    hostname: trainer
+    container_name: st-pinn
     volumes:
       - ../:/workspace
       - ../../data:/workspace/data
@@ -37,6 +40,8 @@ services:
       - /dev:/dev
      
     environment:
+      - TERM=xterm-256color
+      - PYTHONPATH=/workspace
       - ROS_DOMAIN_ID=13
       - DISPLAY=${DISPLAY}
       # 针对ssh 到服务器使用docker的GUI映射支持
