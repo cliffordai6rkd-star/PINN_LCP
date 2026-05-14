@@ -34,6 +34,9 @@ class MLPBlock(nn.Module):
 
         if use_norm:
             self.norm = nn.LayerNorm(out_dim)
+            # "batchnorm"  -> nn.BatchNorm1d(out_dim)
+            # "rmsnorm"    -> nn.RMSNorm(out_dim)
+            # "identity"   -> nn.Identity()
         else:
             self.norm = nn.Identity()
 

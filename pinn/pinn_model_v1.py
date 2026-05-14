@@ -1,166 +1,101 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from pinn.lowdim_encoder import MLPBlock, ResidualMLPBlock
 
 
-from pinn.lowdim_encoder import EncodedHead, MLPBlock
-# s_k+1 = A s_k + B u_k + D lambda_k + d
-# 输入:s_k = [q_k, v_k]  7,7  u_k = action:join[7](quaternion) or torque..
-# 输出: lambda:4 -> layer ->wrench 
-# 状态更新方程   预测下一帧的状态  用下一帧的真实数据与预测数据作loss
-
-class LCP_PINN_v1(nn.Module):
-    def __init__(self):
+# 直接将 q, v, u 输入端到端预测 lambda，再用物理/PINN loss 约束。
+class PINN_v1(nn.Module):
+    def __init__(
+        self,
+        q_dim: int = 8,
+        v_dim: int = 7,
+        u_dim: int = 7,
+        hidden_dim: int = 256,
+        num_res_blocks: int = 4,
+        block_depth: int = 2,
+        activation: str = "silu",
+        use_norm: bool = True,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.q_dim = 7
-        self.v_dim = 7
-        self.u_dim = 7
-        self.ee_pose_dim = 7
+
+        self.q_dim = q_dim
+        self.v_dim = v_dim
+        self.u_dim = u_dim
         self.lambda_dim = 4
-        self.s_dim = self.q_dim + self.v_dim
+        self.gamma_dim = 1
+        self.xyz_dim = 3
+        self.input_dim = self.q_dim + self.v_dim + self.u_dim
 
-        self.hidden_dim = 256
-        self.latent_dim = 256
-        self.head_depth = 2
-        self.register_buffer("dt", torch.tensor(1/30, dtype=torch.float32)) # 采样freqeancy
+        self.hidden_dim = hidden_dim
+        self.num_res_blocks = num_res_blocks
+        self.block_depth = block_depth
+        self.activation = activation
+        self.use_norm = use_norm
+        self.dropout = dropout
 
-        self.matrix_scale = 0.01
-        self.vector_scale = 0.01
-        self.lambda_scale = 1.0
+        self.register_buffer("dt", torch.tensor(1 / 30, dtype=torch.float32))
 
-        self.A_head = self._make_head(
-            in_dim=self.q_dim + self.v_dim+self.u_dim,
-            out_shape=(self.s_dim, self.s_dim),
-            scale=self.matrix_scale,
-        )
-        self.B_head = self._make_head(
-            in_dim=self.q_dim + self.v_dim + self.u_dim,
-            out_shape=(self.s_dim, self.u_dim),
-            scale=self.matrix_scale,
-        )
-        self.D_head = self._make_head(
-            in_dim=self.q_dim + self.ee_pose_dim,
-            out_shape=(self.s_dim, self.lambda_dim),
-            scale=self.matrix_scale,
-        )
-        self.d_head = self._make_head(
-            in_dim=self.q_dim + self.v_dim + self.u_dim, 
-            out_shape=(self.s_dim,),
-            scale=self.vector_scale,
-        )
-        self.lambda_head = self._make_head(
-            in_dim=self.q_dim + self.v_dim + self.u_dim + self.ee_pose_dim,
-            out_shape=(self.lambda_dim,),
-            scale=self.lambda_scale,
+        self.input_proj = MLPBlock(
+            in_dim=self.input_dim,
+            out_dim=self.hidden_dim,
+            activation=activation,
+            use_norm=use_norm,
+            dropout=dropout,
         )
 
-    # 函数名字前面的下划线:这个函数是类内部使用的辅助函数，不建议外部直接调用
-    def _make_head(self, 
-                in_dim:int,
-                out_shape: tuple[int, ...], 
-                scale:float,
-                hidden_dim: int | None = None, 
-                latent_dim: int | None = None, 
-                head_depth: int | None = None) -> EncodedHead:
-        return EncodedHead(
-            in_dim=in_dim,
-            out_shape=out_shape,
-            hidden_dim=hidden_dim or self.hidden_dim,
-            latent_dim=latent_dim or self.latent_dim,
-            head_depth=head_depth or self.head_depth,
-            scale=scale,
-            activation="silu",
-            use_norm=True,
-            dropout=0.0,
+        self.res_blocks = nn.Sequential(
+            *[
+                ResidualMLPBlock(
+                    in_dim=self.hidden_dim,
+                    hidden_dim=self.hidden_dim,
+                    out_dim=self.hidden_dim,
+                    depth=self.block_depth,
+                    activation=activation,
+                    use_norm=use_norm,
+                    dropout=dropout,
+                    final_activation=activation,
+                )
+                for _ in range(self.num_res_blocks)
+            ]
         )
 
-    def build_A(self, q, v, u):
-        return self.A_head(q, v, u)
-    
-    def build_B(self, q, v, u):
-        return self.B_head(q, v, u)
+        self.lambda_head = nn.Linear(self.hidden_dim, self.lambda_dim)
 
-    def build_D(self, q, ee_pose):
-        return self.D_head(q, ee_pose)
+    def forward(self, q: torch.Tensor, v: torch.Tensor, u: torch.Tensor):
+        x = torch.cat([q, v, u], dim=-1)
+        z = self.input_proj(x)
+        z = self.res_blocks(z)
+        lambda_raw = self.lambda_head(z)
 
-    def build_d(self, q, v, u):
-        return self.d_head(q, v, u)
-    
-    def build_lambda(self, q, v, u, ee_pose):
-        return self.lambda_head(q, v, u, ee_pose)
-    
-    def s_next_h(self, q, v, u, lambda_pred, ee_pose):
-        s = torch.cat([q, v], dim=-1)
+        gamma_raw = lambda_raw[..., : self.gamma_dim]
+        xyz = lambda_raw[..., self.gamma_dim :]
 
-        A, z_A = self.build_A(q, v, u)
-        B, z_B = self.build_B(q, v, u)
-        D, z_D = self.build_D(q, ee_pose)
-        d, z_d = self.build_d(q, v, u)
+        gamma_k = F.softplus(gamma_raw)
+        lambda_pred = torch.cat([gamma_k, xyz], dim=-1)
 
-        # bmm按batch 做矩阵乘法
-        As = torch.bmm(A, s.unsqueeze(-1)).squeeze(-1)  # A*s^T
-        Bu = torch.bmm(B, u.unsqueeze(-1)).squeeze(-1)
-        Dlambda = torch.bmm(D, lambda_pred.unsqueeze(-1)).squeeze(-1)
-
-        s_next_pred = As + Bu + Dlambda + d
-
-        return s_next_pred, {
-            "A": A,
-            "B": B,
-            "D": D,
-            "d": d,
-            "z_A": z_A,
-            "z_B": z_B,
-            "z_D": z_D,
-            "z_d": z_d,
+        aux = {
+            "gamma_k": gamma_k,
+            "xyz": xyz,
+            "lambda_raw": lambda_raw,
+            "gamma_raw": gamma_raw,
+            "z": z,
         }
-    def forward(self, q, v, u, ee_pose, phi_k=None):
-        lambda_pred, z_lambda = self.build_lambda(q, v, u, ee_pose)
-
-        s_next_pred, aux = self.s_next_h(
-            q=q,
-            v=v,
-            u=u,
-            lambda_pred=lambda_pred,
-            ee_pose=ee_pose,
-        )
-
-        aux["lambda_pred"] = lambda_pred
-        aux["z_lambda"] = z_lambda
-
-        if phi_k is not None:
-            aux["phi_k"] = phi_k
-
-        return s_next_pred, aux
-
+        return lambda_pred, aux
 
 
 if __name__ == "__main__":
-    x = torch.randn(8, 14)
+    batch_size = 8
 
-    # f = MLPBlock(in_dim=14, out_dim=256,activation="silu",use_norm=True,dropout=0.0)
-    # y = f(x)
-    # print(y.shape)
-    model = LCP_PINN_v1()
-    print(model)
-    print("ok")
+    model = PINN_v1()
+    q = torch.randn(batch_size, model.q_dim)
+    v = torch.randn(batch_size, model.v_dim)
+    u = torch.randn(batch_size, model.u_dim)
 
-# import torch
-# from PINN.LCP_model_v1 import LCP_PINN_v1
+    lambda_pred, aux = model(q, v, u)
 
-# model = LCP_PINN_v1()
-
-# B = 8
-# q = torch.randn(B, 7)
-# v = torch.randn(B, 7)
-# u = torch.randn(B, 7)
-# ee_pose = torch.randn(B, 7)
-
-# lambda_pred, _ = model.build_lambda(q, v, u, ee_pose)
-# s_next_pred, aux = model.s_next_h(q, v, u, lambda_pred, ee_pose)
-
-# print("lambda:", lambda_pred.shape)      # [8, 4]
-# print("s_next:", s_next_pred.shape)      # [8, 14]
-# print("A:", aux["A"].shape)              # [8, 14, 14]
-# print("B:", aux["B"].shape)              # [8, 14, 7]
-# print("D:", aux["D"].shape)              # [8, 14, 4]
-# print("d:", aux["d"].shape)              # [8, 14]
+    # print("lambda:", lambda_pred.shape)
+    # print("gamma_k:", aux["gamma_k"].shape)
+    # print("xyz:", aux["xyz"].shape)
