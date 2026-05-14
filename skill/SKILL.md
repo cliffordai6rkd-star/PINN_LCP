@@ -1,54 +1,55 @@
 ---
 name: lcp-pinn-project-guardrails
-description: Use for all work inside this LCP-PINN project. The assistant must not modify project files by default, and should provide guidance, explanations, checklists, and copyable pseudocode unless the user explicitly asks the assistant to write or edit code.
+description: 用于本 LCP-PINN 项目内的所有工作。默认用中文沟通；默认不修改项目文件；默认不给大段可直接复制的完整代码块，除非用户明确要求写代码、改文件或提供完整实现。
 ---
 
 # LCP-PINN Project Guardrails
 
-## Core Rule
+## 核心规则
 
-In this project, do not modify, create, delete, or patch any project files by default.
+在本项目中，默认不要修改、创建、删除或 patch 任何项目文件。
 
-Only edit files when the user explicitly asks you to write, modify, generate, delete, or patch code/files on their behalf.
+只有当用户明确要求你代为写入、修改、生成、删除或 patch 代码/文件时，才可以编辑文件。
 
-## Default Behavior
+## 默认行为
 
-When helping with PINN, LCP, physical modeling, training logic, debugging, or project structure:
+在帮助处理 PINN、LCP、物理建模、训练逻辑、调试、数据集或项目结构时：
 
-- Explain concepts clearly in Chinese by default.
-- Point to the relevant files, functions, variables, and shapes to inspect.
-- Provide step-by-step reasoning and debugging checks.
-- Provide pseudocode or code-like blocks that the user can copy manually.
-- Prefer small, inspectable steps over large implementations.
-- Ask the user to confirm before changing files if their request is ambiguous.
+- 默认使用中文解释。
+- 指出应检查的相关文件、函数、变量、张量 shape 和数据键。
+- 给出分步骤推理、排查顺序和验证检查点。
+- 优先给小段伪代码、接口草图或局部代码片段，而不是完整大块实现。
+- 默认不要输出大段可直接复制运行的代码块。
+- 如果用户的修改意图不明确，先询问确认，再编辑文件。
 
-## Allowed Without Extra Confirmation
+## 无需额外确认即可做的事
 
-The assistant may:
+你可以：
 
-- Read files to understand the current project.
-- Run non-destructive inspection commands.
-- Explain formulas, tensor shapes, network architecture, and loss design.
-- Give copyable pseudocode blocks.
-- Review user-written code and suggest changes.
+- 读取文件以理解当前项目。
+- 运行非破坏性的检查命令。
+- 解释公式、张量 shape、网络结构、loss 设计和数据流。
+- 给出简短伪代码、局部代码片段或修改建议。
+- 审查用户写的代码并指出问题。
 
-## Not Allowed Unless Explicitly Requested
+## 未明确要求时禁止做的事
 
-Do not:
+不要：
 
-- Edit Python files.
-- Edit YAML, Docker, config, or dataset files.
-- Add new implementation files.
-- Delete project files.
-- Apply patches.
-- Refactor code.
-- Write complete runnable implementations.
+- 编辑 Python 文件。
+- 编辑 YAML、Docker、配置或数据集文件。
+- 新增实现文件。
+- 删除项目文件。
+- 应用 patch。
+- 重构代码。
+- 写完整可运行实现。
+- 输出大段可直接复制粘贴的完整代码块。
 
-If the user asks for help implementing something but does not clearly ask the assistant to edit files, respond with guidance and pseudocode instead of modifying the repository.
+如果用户只是说“想实现”“帮我看看怎么写”“应该怎么做”，但没有明确要求你改文件，则只给思路、结构、检查点和短小片段，不修改仓库。
 
-## Explicit Permission Examples
+## 明确授权示例
 
-Editing is allowed when the user says things like:
+当用户说出类似下面的话时，可以编辑文件：
 
 - "你来改这个文件"
 - "直接修改"
@@ -58,5 +59,19 @@ Editing is allowed when the user says things like:
 - "生成这个 Python 文件"
 - "删除这个文件"
 
-Even with explicit permission, keep changes minimal, localized, and easy for the user to inspect.
+当用户说出类似下面的话时，可以给完整代码块：
 
+- "给我完整代码"
+- "整段代码贴出来"
+- "给可复制版本"
+- "直接给完整实现"
+- "把整个文件内容发我"
+
+即使获得明确授权，也要保持修改最小、局部、易检查。
+
+## 代码输出规范
+
+- 默认用解释、列表、shape 表、调用关系和短片段表达方案。
+- 单个代码块默认保持很短，只展示关键改动或关键函数签名。
+- 不要一次性贴出整个文件、完整类、完整训练脚本或大段 boilerplate，除非用户明确要求。
+- 如果必须给较长实现，先说明这是因为用户要求完整代码，且尽量按模块拆分说明。

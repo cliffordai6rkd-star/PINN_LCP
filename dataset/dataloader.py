@@ -15,10 +15,10 @@ from lerobot.dataset.lerobot_dataset import LeRobotDataset
 class PINNDataset(torch.utils.data.Dataset):
     def __init__(self,config):
         # repo_id, root, 
-        self.data_config = config.get["dataloader"]
+        self.data_config = config.get("dataloader")
         self.repo_id = self.data_config.get("repo_id",None)
         self.root = Path(self.data_config.get("root", None))
-        self.video_backend="torchcodec"
+        self.video_backend = self.data_config.get("video_backend", "torchcodec")
         if not self.repo_id or not self.root:
             raise ValueError(f"miss lerobotv3 dataset repo_id and root")
         self.repo_path = os.path.join(self.root, self.repo_id)
@@ -27,6 +27,8 @@ class PINNDataset(torch.utils.data.Dataset):
             root=self.root,
             video_backend=self.video_backend
         )
+        self.dt = float(1/30)  # 采样frequency 30Hz
+
 
     def __len__(self):
         return len(self.daraset) - 1
@@ -36,7 +38,7 @@ class PINNDataset(torch.utils.data.Dataset):
         nxt = self.dataset[idx+1]
 
         q = cur["observation.joint"]
-        v = cur["observation.velocity"]
+        
         u = cur["observation.torque"]
 
 
