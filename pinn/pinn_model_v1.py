@@ -9,9 +9,9 @@ from pinn.lowdim_encoder import MLPBlock, ResidualMLPBlock
 class PINN_v1(nn.Module):
     def __init__(
         self,
-        q_dim: int = 8,
+        q_dim: int = 7,
         v_dim: int = 7,
-        u_dim: int = 7,
+        u_dim: int = 14,
         hidden_dim: int = 256,
         num_res_blocks: int = 4,
         block_depth: int = 2,

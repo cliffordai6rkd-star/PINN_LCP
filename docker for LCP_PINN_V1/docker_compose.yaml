@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
      
       args:
-        USERNAME: ${DOCKER_USER:-teleophost}
+        USERNAME: ${DOCKER_USER:-trainer}
         USER_UID: ${HOST_UID:-1000}
         USER_GID: ${HOST_GID:-1000}
       # 启动docker 前执行以下指令:
@@ -35,7 +35,7 @@ services:
       - /sys/bus/usb:/sys/bus/usb:ro
       - /sys/class/input:/sys/class/input:ro
       # 绑定HTC TRACKER的config
-      - ${HOME}/.config/libsurvive/config.json:/home/teleophost/.config/libsurvive/config.json
+      - ${HOME}/.config/libsurvive/config.json:/home/${DOCKER_USER:-trainer}/.config/libsurvive/config.json
       # 针对USB绑定的设备进行访问
       - /dev:/dev
      
@@ -55,7 +55,7 @@ services:
       # 设备权限相关
       - UDEV=1
       - SHELL=/bin/bash
-      - HOME=/home/${DOCKER_USER:-teleophost}
+      - HOME=/home/${DOCKER_USER:-trainer}
       # - http_proxy=http://127.0.0.1:7897
       # - https_proxy=http://127.0.0.1:7897
       # - no_proxy=localhost,127.0.0.1
@@ -71,7 +71,7 @@ services:
     # 启动前可执行：
     #   export HOST_UID=$(id -u)
     #   export HOST_GID=$(id -g)
-    #   export DOCKER_USER=teleophost
+    #   export DOCKER_USER=trainer
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     # network_mode: rei
     stdin_open: true

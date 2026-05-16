@@ -25,7 +25,7 @@ def build_rerun_blueprint():
                         origin="signals/gripper",
                         contents="$origin/**",
                     ),
-                    column_shares=[2, 1],
+                    column_shares=[2, 1]
                 ),
                 rrb.Horizontal(
                     rrb.Spatial3DView(
@@ -228,12 +228,23 @@ class RerunLeRobotVisualizer:
             self._log_ee_pose_quat7(pose)
 
     def _log_ee_pose_matrix(self, pose):
-        # pose shape: [4, 4]
-        if pose.shape != (4, 4):
+        # Accept both old [4, 4] matrix poses and converted quat7 poses:
+        # [x, y, z, qx, qy, qz, qw].
+        if pose.shape == (4, 4):
+            # print(f"rotaion type : rotation matrix")
+            translation = pose[:3, 3]
+            rotation = pose[:3, :3]
+        else:
+            # print(f"rotaion type : quaternion")
+            quat7 = self._pose_to_quat7(pose)
+            if quat7 is None:
+                return
+            translation = quat7[:3]
+            rotation = self._quat_xyzw_to_rotation_matrix(quat7[3:7])
+
+        if translation is None or rotation is None:
             return
 
-        translation = pose[:3, 3]
-        rotation = pose[:3, :3]
         self.ee_trajectory.append(translation.copy())
 
         rr.log(
@@ -281,13 +292,9 @@ class RerunLeRobotVisualizer:
 
     def _log_ee_pose_quat7(self, pose):
         # quat7 约定：[x, y, z, qx, qy, qz, qw]
-        # 如果当前数据仍是 4x4 矩阵，就先从矩阵转换出 xyz + quaternion 用于对照检查。
-        if pose.shape == (4, 4):
-            quat7 = self._matrix_to_quat7(pose)
-        else:
-            quat7 = pose.reshape(-1)
-
-        if quat7.shape[0] < 7:
+        # 兼容旧数据: 如果当前数据仍是 4x4 矩阵，就先转换成 quat7。
+        quat7 = self._pose_to_quat7(pose)
+        if quat7 is None:
             return
 
         translation = quat7[:3]
@@ -332,6 +339,52 @@ class RerunLeRobotVisualizer:
         quat_xyzw = self._rotation_matrix_to_quat_xyzw(rotation)
         return np.concatenate([translation, quat_xyzw])
 
+    def _pose_to_quat7(self, pose):
+        pose = np.asarray(pose)
+        if pose.shape == (4, 4):
+            return self._matrix_to_quat7(pose)
+
+        quat7 = pose.reshape(-1).astype(np.float64)
+        if quat7.shape[0] < 7:
+            return None
+
+        quat7 = quat7[:7]
+        quat = quat7[3:7]
+        norm = np.linalg.norm(quat)
+        if norm > 0:
+            quat7[3:7] = quat / norm
+        if quat7[6] < 0:
+            quat7[3:7] = -quat7[3:7]
+        return quat7
+
+    def _quat_xyzw_to_rotation_matrix(self, quat_xyzw):
+        quat = np.asarray(quat_xyzw, dtype=np.float64)
+        norm = np.linalg.norm(quat)
+        if norm == 0:
+            return np.eye(3, dtype=np.float64)
+        qx, qy, qz, qw = quat / norm
+
+        return np.array(
+            [
+                [
+                    1 - 2 * (qy * qy + qz * qz),
+                    2 * (qx * qy - qz * qw),
+                    2 * (qx * qz + qy * qw),
+                ],
+                [
+                    2 * (qx * qy + qz * qw),
+                    1 - 2 * (qx * qx + qz * qz),
+                    2 * (qy * qz - qx * qw),
+                ],
+                [
+                    2 * (qx * qz - qy * qw),
+                    2 * (qy * qz + qx * qw),
+                    1 - 2 * (qx * qx + qy * qy),
+                ],
+            ],
+            dtype=np.float64,
+        )
+
     def _rotation_matrix_to_quat_xyzw(self, matrix):
         # 返回顺序为 xyzw，和 Rerun rr.Quaternion(xyzw=...) 对齐。
         m = np.asarray(matrix, dtype=np.float64)
@@ -366,6 +419,8 @@ class RerunLeRobotVisualizer:
         norm = np.linalg.norm(quat)
         if norm > 0:
             quat = quat / norm
+        if quat[3] < 0:
+            quat = -quat
         return quat
 
 
