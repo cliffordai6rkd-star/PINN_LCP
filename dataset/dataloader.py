@@ -64,6 +64,8 @@ class PINNDataset(torch.utils.data.Dataset):
         self.normalize_lowdim_keys = self.data_config.get("normalize_lowdim_keys",None)
         if self.normalize_lowdim_keys is None:
             raise ValueError(f"miss normalize lowdim keys")
+        self.lowdim_keys = self.data_config.get("lowdim_keys", {})
+        self.image_keys = self.data_config.get("image_keys", {})
         self.normalize_mode = None
         self.is_normalize = False
         self.normalizer = None
@@ -73,8 +75,10 @@ class PINNDataset(torch.utils.data.Dataset):
         if self.normalize_mode is not None:
             self.is_normalize = True
             self.normalizer = Normalizer.stats_from_dataset(
-                dataset=self.dataset,
-                valid_indices=self.valid_indices,
+                dataset = self.dataset,
+                valid_indices = self.valid_indices,
+                lowdim_keys = self.lowdim_keys,
+                normalize_keys = self.normalize_lowdim_keys,
             )
             if self.normalize_mode == "gaussian":
                 self.normalize_fuc = self.normalizer.gaussian_normalize
@@ -84,13 +88,7 @@ class PINNDataset(torch.utils.data.Dataset):
                 self.normalize_fuc = self.normalizer.quantile_normalize
             else:
                 raise ValueError(f"unknown normalize mode")
-            
-        self.lowdim_keys = self.data_config.get("lowdim_keys", {})
-        self.image_keys = self.data_config.get("image_keys", {})
-
         
-
-
     def __len__(self):
         return len(self.valid_indices) 
     
@@ -106,6 +104,7 @@ class PINNDataset(torch.utils.data.Dataset):
         for key, dataset_key in self.lowdim_keys.items():
             sample[f"{key}_cur"] = cur[dataset_key]
             sample[f"{key}_nxt"] = nxt[dataset_key]
+
 
         
 
@@ -132,17 +131,23 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
     log.info(f"config :{config}")
     dataset = PINNDataset(config)
+    log.info(f"dataset len : {len(dataset)}")
+    assert len(dataset) > 0
+
     sample = dataset[0]
+    log.info(f"sample keys: {sample.keys}")
     log.info(f"sample success")
-    # for v, k in sample.items():
-    #     print(v, k.shape, k.dtype)
+
     loader = torch.utils.data.DataLoader(dataset, 
                                         batch_size=4,
                                         shuffle=True,
                                         num_workers = 4)
+    
     batch = next(iter(loader))
 
     for k, v in batch.items():
-        print(k, v.shape, v.dtype)
+        log.info(f"batch data shape : {k, v.shape, v.dtype}")
+        if torch.is_tensor(v) and v.is_floating_point():
+            assert torch.isfinite(v).all(), f"{k} has nan or inf" # 检查是否有非法数值
 
     
