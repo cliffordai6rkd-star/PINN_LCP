@@ -38,7 +38,7 @@ def parse_args():
 class PINNDataset(torch.utils.data.Dataset):
     def __init__(self,config):
         # repo_id, root, 
-        self.config = config or ""
+        self.config = config 
         self.data_config = config.get("dataloader")
         self.repo_id = self.data_config.get("repo_id",None)
         self.root = Path(self.data_config.get("root", None))
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     assert len(dataset) > 0
 
     sample = dataset[0]
-    log.info(f"sample keys: {sample.keys}")
+    log.info(f"sample keys: {sample.keys()}")
     log.info(f"sample success")
 
     loader = torch.utils.data.DataLoader(dataset, 

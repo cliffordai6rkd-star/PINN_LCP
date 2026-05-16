@@ -26,7 +26,7 @@ class Normalizer:
             for key in normalize_keys:
                 dataset_key = lowdim_keys[key]
                 buffers[key].append(cur[dataset_key])
-
+        log.info("finished loading samples, start stacking tensors")
         for key, values in buffers.items():
             x = torch.stack(values, dim=0)
             stats[key] = {
@@ -38,7 +38,7 @@ class Normalizer:
                 "q99": torch.quantile(x, 0.99, dim=0),
             }
 
-        log.info("finished loading samples, start stacking tensors")
+      
 
         read_time = time.perf_counter() - start_time
         log.info("normalizer stats computed successfully")
