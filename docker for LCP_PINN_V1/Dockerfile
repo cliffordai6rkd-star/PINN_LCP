@@ -6,6 +6,10 @@ ARG USER_GID=1000
 
 USER root
 
+RUN apt-get update && \
+    apt-get install -y python3-tk && \
+    rm -rf /var/lib/apt/lists/*
+
 # 准备一个和宿主机 UID/GID 对齐的运行环境。
 # 基础镜像里可能已经有 UID=1000 的用户（例如 trainer），这种情况下不再强行创建同 UID 用户。
 RUN set -eux; \

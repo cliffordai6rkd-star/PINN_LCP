@@ -1,9 +1,7 @@
-#Q: 我们研究的方程到底是以t为自变量的ODE还是以q,v,u等为自变量的PDE?
-# 若是以t为自变量则应该引入时序建模   若不是则ft是以机器人状态为输入  对应输出ft
-
-# 变量: q v u(action without gripper)
+# 模型学习一个长度为horizon的window  不仅学习点到点的映射关系 也学习力的变化趋势
+# 变量: q v u(action without gripper, tau)
 #      wrench(lambda) Fx Fy Fz τx τy τz
-# img -> phi\miu
+# img -> phi\miu -> loss
 
 
 import torch
@@ -15,8 +13,7 @@ import logging as log
 import logging
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
+log = logging.getLogger()
 
 from pathlib import Path
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -53,12 +50,14 @@ class PINNDataset(torch.utils.data.Dataset):
         )
         self.dt = float(1/30)  # 采样frequency 30Hz
 
+        self.horizon = int(self.data_config.get("horizon", 8))
+
         self.valid_indices = []
         episodes = self.dataset.meta.episodes
         for ep in episodes:
             start_idx = int(ep["dataset_from_index"])
             end_idx = int(ep["dataset_to_index"])
-            for idx in range(start_idx, end_idx - 1):
+            for idx in range(start_idx, end_idx - self.horizon + 1):
                 self.valid_indices.append(idx)
 
         self.normalize_lowdim_keys = self.data_config.get("normalize_lowdim_keys",None)
@@ -94,35 +93,28 @@ class PINNDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
 
-        valid_idx = self.valid_indices[idx]
-        cur = self.dataset[valid_idx]
-        nxt = self.dataset[valid_idx+1]
+        start = self.valid_indices[idx]
+        frame_indices = range(start, start + self.horizon)
+        # log.info(f"window start={start}, end={start + self.horizon - 1}")
+
+        frames = [self.dataset[i] for i in frame_indices]
 
         sample = {}
         
         # ("q", "observation.joint") —> key = "q" , dataset_key = "observation.joint"
         for key, dataset_key in self.lowdim_keys.items():
-            sample[f"{key}_cur"] = cur[dataset_key]
-            sample[f"{key}_nxt"] = nxt[dataset_key]
-
-
-        
+            seq = [frame[dataset_key] for frame in frames]
+            sample[f"{key}"] = torch.stack(seq, dim=0)
 
         for key in self.normalize_lowdim_keys:
             if self.is_normalize:
-                sample[f"{key}_cur"] = self.normalize_fuc(key, sample[f"{key}_cur"])
-                sample[f"{key}_nxt"] = self.normalize_fuc(key, sample[f"{key}_nxt"])
-
-
+                sample[f"{key}"] = self.normalize_fuc(key, sample[f"{key}"])
+    
         for key, dataset_key in self.image_keys.items():
-            sample[f"image_{key}_cur"] = cur[dataset_key]
-            sample[f"image_{key}_nxt"] = nxt[dataset_key]
+            seq = [frame[dataset_key] for frame in frames]
+            sample[f"image_{key}"] = torch.stack(seq, dim=0)            
 
         return sample
-
-
-   
-
         
 if __name__ == "__main__":
 
@@ -134,20 +126,31 @@ if __name__ == "__main__":
     log.info(f"dataset len : {len(dataset)}")
     assert len(dataset) > 0
 
-    sample = dataset[0]
-    log.info(f"sample keys: {sample.keys()}")
-    log.info(f"sample success")
+    log.info(f"dataset len: {len(dataset)}")
+    log.info(f"horizon: {dataset.horizon}")
+    log.info(f"num episodes: {len(dataset.dataset.meta.episodes)}")
+    log.info(f"first valid index: {dataset.valid_indices[0]}")
 
-    loader = torch.utils.data.DataLoader(dataset, 
-                                        batch_size=4,
-                                        shuffle=True,
-                                        num_workers = 4)
-    
-    batch = next(iter(loader))
 
-    for k, v in batch.items():
-        log.info(f"batch data shape : {k, v.shape, v.dtype}")
-        if torch.is_tensor(v) and v.is_floating_point():
-            assert torch.isfinite(v).all(), f"{k} has nan or inf" # 检查是否有非法数值
+    for i in range(1,100):
+        sample = dataset[i]
+        log.info(f"sample keys: {sample.keys()}")
+        log.info(f"sample success")
+        # for k, v in sample.items():
+        #     log.info(f"sample {k}: shape={v.shape}, dtype={v.dtype}")
+        #     if torch.is_tensor(v) and v.is_floating_point():
+        #         assert torch.isfinite(v).all(), f"{k} has nan or inf"
+
+        loader = torch.utils.data.DataLoader(dataset, 
+                                            batch_size=4 ,
+                                            shuffle=False,
+                                            num_workers=4)
+
+        batch = next(iter(loader))
+
+        for k, v in batch.items():
+            log.info(f"batch data shape : {k, v.shape, v.dtype}")
+            if torch.is_tensor(v) and v.is_floating_point():
+                assert torch.isfinite(v).all(), f"{k} has nan or inf" # 检查是否有非法数值
 
     
