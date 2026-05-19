@@ -13,7 +13,7 @@ import logging as log
 import logging
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger()
+log = logging.getLogger(__name__)
 
 from pathlib import Path
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -48,9 +48,10 @@ class PINNDataset(torch.utils.data.Dataset):
             root=self.root,
             video_backend=self.video_backend
         )
-        self.dt = float(1/30)  # 采样frequency 30Hz
+        self.stats_dataset =  self.dataset.hf_dataset
+        # self.dt = float(1/30)  # 采样frequency 30Hz
 
-        self.horizon = int(self.data_config.get("horizon", 8))
+        self.horizon = int(self.data_config.get("horizon", 1))
 
         self.valid_indices = []
         episodes = self.dataset.meta.episodes
@@ -60,11 +61,16 @@ class PINNDataset(torch.utils.data.Dataset):
             for idx in range(start_idx, end_idx - self.horizon + 1):
                 self.valid_indices.append(idx)
 
+        self.load_image = bool(self.data_config.get("load_images",True))
+
         self.normalize_lowdim_keys = self.data_config.get("normalize_lowdim_keys",None)
         if self.normalize_lowdim_keys is None:
             raise ValueError(f"miss normalize lowdim keys")
         self.lowdim_keys = self.data_config.get("lowdim_keys", {})
-        self.image_keys = self.data_config.get("image_keys", {})
+        if self.load_image:
+            self.image_keys = self.data_config.get("image_keys", {})
+        else:
+            self.image_keys = {}
         self.normalize_mode = None
         self.is_normalize = False
         self.normalizer = None
@@ -74,7 +80,7 @@ class PINNDataset(torch.utils.data.Dataset):
         if self.normalize_mode is not None:
             self.is_normalize = True
             self.normalizer = Normalizer.stats_from_dataset(
-                dataset = self.dataset,
+                dataset = self.stats_dataset,
                 valid_indices = self.valid_indices,
                 lowdim_keys = self.lowdim_keys,
                 normalize_keys = self.normalize_lowdim_keys,
@@ -97,7 +103,7 @@ class PINNDataset(torch.utils.data.Dataset):
         frame_indices = range(start, start + self.horizon)
         # log.info(f"window start={start}, end={start + self.horizon - 1}")
 
-        frames = [self.dataset[i] for i in frame_indices]
+        frames = [self._read_frame(i) for i in frame_indices]
 
         sample = {}
         
@@ -115,6 +121,11 @@ class PINNDataset(torch.utils.data.Dataset):
             sample[f"image_{key}"] = torch.stack(seq, dim=0)            
 
         return sample
+    
+    def _read_frame(self, i):
+        if self.load_image:
+            return self.dataset[i]
+        return self.dataset.hf_dataset[i]
         
 if __name__ == "__main__":
 

@@ -1,0 +1,41 @@
+dataloader:
+  repo_id: wrench_bg_lerobotv3
+  root: data/train_episode/wrench_background/wrench_bg_lerobotv3
+  load_images: false
+  video_backend: torchcodec
+  normalize_mode: gaussian
+  horizon: 1
+  lowdim_keys:
+    q: observation.joint                     #q
+    v: observation.velocity                  #v
+    ee_pose: action.ee_pose                  #u             
+    wrench: observation.ft_window            #lambda
+  # image_keys:
+  #   wrist: observation.images.wrist
+  #   side_1: observation.images.side_1
+  #   side_2: observation.images.side_2
+  normalize_lowdim_keys: 
+    - q 
+    - v
+    - ee_pose 
+    - wrench
+train:
+  hidden_dim: 256
+  activation: silu
+  use_norm: true
+  dropout: 0
+  num_res_blocks: 5
+
+  batch_size: 512
+  device: cuda:0
+  num_workers: 8
+  val_ratio: 0.1
+  seed: 42
+  lr: 1e-4
+  weight_decay: 1e-4
+  num_epochs: 300
+  output_dir: outputs/wrench_background_2
+  monitor_key: val_loss
+  top_k: 3
+  
+

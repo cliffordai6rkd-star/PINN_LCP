@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         "--config",
         "-c",
         type=Path,
-        default=Path("tool/config/shape_meta.yaml"),
+        default=Path("dataset/config/shape_meta.yaml"),
         help="Path to the conversion config YAML/JSON.",
     )
     parser.add_argument(
