@@ -1,7 +1,9 @@
 # 推理用：
 dataloader:
-  repo_id: wrench_bg_lerobotv3
-  root: data/train_episode/wrench_background/wrench_bg_lerobotv3
+  repo_id: local/h5_to_lerobot_v3
+  root: data/train_episode/wipe_board/wipe_board_lerobotv3
+  # repo_id: wrench_bg_lerobotv3
+  # root: data/train_episode/wrench_background/wrench_bg_lerobotv3
   load_images: false
   video_backend: torchcodec
   normalize_mode: gaussian
@@ -22,5 +24,4 @@ dataloader:
     - wrench
 
 inferencer:
-  ckpt_path: outputs/wrench_bg/v2/exp9/checkpoints/epoch_173_val_loss_0.0459.pt
-  
+  ckpt_path: outputs/wrench_bg/v2/exp10/checkpoints/epoch_170_val_loss_0.0463.pt
