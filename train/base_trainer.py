@@ -58,6 +58,22 @@ class BaseTrainer:
 
         self.last_summary = None
 
+        self.scheduler_config = self.train_config.get("scheduler", None)
+        self.scheduler = None
+
+    def set_seed(self):
+        import random
+        import numpy as np
+        import torch
+
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
     def batch_to_device(self, batch):
         new_batch = {}
 
@@ -80,7 +96,35 @@ class BaseTrainer:
     def compute_loss(self, batch):
         raise NotImplementedError
     
+    def build_scheduler(self):
+        if self.scheduler_config is None:
+            return None
+
+        name = self.scheduler_config.get("name", "none")
+
+        if name == "none":
+            return None
+
+        if name == "reduce_on_plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=float(self.scheduler_config.get("factor", 0.5)),
+                patience=int(self.scheduler_config.get("patience", 20)),
+                min_lr=float(self.scheduler_config.get("min_lr", 1e-6)),
+            )
+        
+        if name == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=int(self.scheduler_config.get("T_max", self.num_epochs)),
+                eta_min=float(self.scheduler_config.get("eta_min", 1e-6)),
+            )
+        raise ValueError(f"Unsupported scheduler: {name}")
+    
+
     def setup(self):
+        self.set_seed()
         self.dataset = self.build_dataset()
 
         if self.val_ratio > 0:
@@ -119,6 +163,9 @@ class BaseTrainer:
             lr=self.lr,
             weight_decay=self.weight_decay,
         )
+        self.scheduler = self.build_scheduler()
+        
+
 
     def train_one_epoch(self, epoch):
         self.model.train()
@@ -184,15 +231,26 @@ class BaseTrainer:
         return val_loss
     
     def train(self):
+
         self.setup()
 
         for epoch in range(self.num_epochs):
             avg_loss = self.train_one_epoch(epoch)
             val_loss = self.validate_one_epoch(epoch)
-            # if val_loss is None:
-            #     log.info(f"epoch={epoch} avg_loss={avg_loss:.6f}")
-            # else:
-            #     log.info(f"epoch={epoch} avg_loss={avg_loss:.6f} val_loss={val_loss:.6f}")
+            if self.scheduler is not None:
+                name = self.scheduler_config.get("name", "none")
+                if name == "reduce_on_plateau":
+                    monitor_loss = val_loss if val_loss is not None else avg_loss
+                    self.scheduler.step(monitor_loss)
+                else:
+                    self.scheduler.step()
+
+            current_lr = self.optimizer.param_groups[0]["lr"]
+
+            if val_loss is None:
+                log.info(f"epoch={epoch} avg_loss={avg_loss:.6f} lr={current_lr:.2e}")
+            else:
+                log.info(f"epoch={epoch} avg_loss={avg_loss:.6f} val_loss={val_loss:.6f} lr={current_lr:.2e}")
 
             self.loss_history.append({
                 "epoch": epoch,
@@ -318,6 +376,7 @@ class BaseTrainer:
             "avg_loss": avg_loss,
             "val_loss": val_loss,
             "model": self.model.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "optimizer": self.optimizer.state_dict(),
             "config": self.config,
         }
@@ -345,6 +404,7 @@ class BaseTrainer:
             "metrics": metrics,
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "config": self.config,
         }
 

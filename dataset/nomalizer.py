@@ -62,3 +62,17 @@ class Normalizer:
         x = 2 * (x - q01) / (q99 - q01 + self.eps) - 1
         return torch.clamp(x, -1.0, 1.0)
 
+    def gaussian_denormalize(self, key, x):
+        mean = self.stats[key]["mean"].to(x.device)
+        std = self.stats[key]["std"].to(x.device)
+        return x * (std + self.eps) + mean
+
+    def limit_denormalize(self, key, x):
+        min_v = self.stats[key]["min"].to(x.device)
+        max_v = self.stats[key]["max"].to(x.device)
+        return (x + 1) * (max_v - min_v + self.eps) / 2 + min_v
+
+    def quantile_denormalize(self, key, x):
+        q01 = self.stats[key]["q01"].to(x.device)
+        q99 = self.stats[key]["q99"].to(x.device)
+        return (x + 1) * (q99 - q01 + self.eps) / 2 + q01

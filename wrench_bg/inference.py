@@ -1,16 +1,231 @@
 
 import torch
 import yaml
+import logging
+import argparse
 
-ckpt_path = "outputs/wrench_background_1/checkpoints/epoch_238_val_loss_0.0477.pt"
+from pathlib import Path
+from wrench_bg.wrench_background_v2 import Wrench_Background_V2
+from dataset.dataloader import PINNDataset
 
-ckpt = torch.load(ckpt_path, map_location="cuda:0")
 
-print("ckpt keys:", ckpt.keys())
-print("epoch:", ckpt.get("epoch"))
-print("global_step:", ckpt.get("global_step"))
-print("monitor_key:", ckpt.get("monitor_key"))
-print("monitor_score:", ckpt.get("monitor_score"))
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("WrecnhBgInfrencer")
 
-print("\nconfig:")
-print(yaml.safe_dump(ckpt["config"], sort_keys=False, allow_unicode=True))
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        "-c",
+        type=Path,
+        default=Path("dataset/config/inference_cfg/wrench_bg_inference.yaml"),
+    )
+    return parser.parse_args()
+
+class WrecnhBgInferencer:
+    def __init__(self, config):
+        self.config = config
+        self.inference_cfg = config.get("inferencer", {})
+
+        if torch.cuda.is_available():
+            self.device = "cuda:0"
+        else:
+            self.device = "cpu"
+        self.ckpt_path = Path(self.inference_cfg.get("ckpt_path", None))
+        if self.ckpt_path is None:
+            raise ValueError(f"miss ckpt path")
+        self.get_ckpt()
+        self.load_dataset()
+        
+        
+    def get_ckpt(self):
+        log.info(f"Loading checkpoint------------------------")
+        ckpt = torch.load(self.ckpt_path, map_location=self.device)
+        ckpt_cfg = ckpt["config"]
+        log.info(f"Found checkpoint at {self.ckpt_path}")
+        # log.info(f"checkpoint config {ckpt_cfg}")
+
+        model = Wrench_Background_V2(ckpt_cfg).to(self.device)
+        model.load_state_dict(ckpt["model"])
+        model.eval()
+
+        self.ckpt = ckpt
+        self.ckpt_cfg = ckpt_cfg
+        self.model = model
+        return model, ckpt_cfg, ckpt
+    
+    def inferecer_one_step(self, batch):
+        batch = {
+            k: v.to(self.device) if torch.is_tensor(v) else v
+            for k, v in batch.items()
+        }
+
+        with torch.no_grad():
+            out = self.model(batch)
+
+        return out["wrench_pred"]
+    
+    def load_dataset(self):
+        log.info("Loading dataset")
+        self.dataset = PINNDataset(self.config)
+        self.normalizer = self.dataset.normalizer
+        self.lerobot_dataset = self.dataset.dataset
+        self.hf_dataset = self.dataset.dataset.hf_dataset
+        dataloader_cfg = self.config["dataloader"]
+        log.info(f"dataset root: {dataloader_cfg.get('root')}")
+        log.info(f"dataset repo_id: {dataloader_cfg.get('repo_id')}")
+        self.raw_to_sample_idx = {
+            raw_idx: sample_idx
+            for sample_idx, raw_idx in enumerate(self.dataset.valid_indices)
+        }
+
+        log.info(f"dataset length: {len(self.dataset)}")
+        log.info(f"num episodes: {len(self.lerobot_dataset.meta.episodes)}")
+
+    def denormalize_wrench(self, wrench_norm):
+        normalize_mode = self.ckpt_cfg["dataloader"].get("normalize_mode")
+
+        if normalize_mode == "gaussian":
+            return self.normalizer.gaussian_denormalize("wrench", wrench_norm)
+        if normalize_mode == "limit":
+            return self.normalizer.limit_denormalize("wrench", wrench_norm)
+        if normalize_mode == "quantile":
+            return self.normalizer.quantile_denormalize("wrench", wrench_norm)
+
+        raise ValueError(f"unknown normalize mode: {normalize_mode}")
+    
+    def infer_one_sample(self, idx):
+        sample = self.dataset[idx]
+
+        batch = {
+            k: v.unsqueeze(0)
+            for k, v in sample.items()
+            if k in ("q", "v", "ee_pose")
+        }
+
+        wrench_bg_norm = self.inferecer_one_step(batch)
+        wrench_bg = self.denormalize_wrench(wrench_bg_norm)
+
+        raw_idx = self.dataset.valid_indices[idx]
+        raw_frame = self.hf_dataset[raw_idx]
+        wrench_key = self.config["dataloader"]["lowdim_keys"]["wrench"]
+        raw_wrench = raw_frame[wrench_key].unsqueeze(0).unsqueeze(0).to(wrench_bg.device)
+
+        lambda_wrench = raw_wrench - wrench_bg
+
+        return {
+            "raw_idx": raw_idx,
+            "raw_wrench": raw_wrench.squeeze(0).squeeze(0).cpu(),
+            "wrench_bg": wrench_bg.squeeze(0).squeeze(0).cpu(),
+            "lambda_wrench": lambda_wrench.squeeze(0).squeeze(0).cpu(),
+        }
+
+    def infer_one_episode(self, episode_idx):
+        episode = self.lerobot_dataset.meta.episodes[episode_idx]
+
+        start = int(episode["dataset_from_index"])
+        end = int(episode["dataset_to_index"])
+
+        raw_indices = []
+        raw_wrench_list = []
+        wrench_bg_list = []
+        lambda_wrench_list = []
+
+        for raw_idx in range(start, end):
+            if raw_idx not in self.raw_to_sample_idx:
+                continue
+
+            sample_idx = self.raw_to_sample_idx[raw_idx]
+            result = self.infer_one_sample(sample_idx)
+
+            raw_indices.append(raw_idx)
+            raw_wrench_list.append(result["raw_wrench"])
+            wrench_bg_list.append(result["wrench_bg"])
+            lambda_wrench_list.append(result["lambda_wrench"])
+
+        episode_result = {
+            "episode_idx": episode_idx,
+            "raw_indices": raw_indices,
+            "raw_wrench": torch.stack(raw_wrench_list, dim=0),
+            "wrench_bg": torch.stack(wrench_bg_list, dim=0),
+            "lambda_wrench": torch.stack(lambda_wrench_list, dim=0),
+        }
+
+        log.info(f"episode {episode_idx} raw_wrench shape: {episode_result['raw_wrench'].shape}")
+        log.info(f"episode {episode_idx} wrench_bg shape: {episode_result['wrench_bg'].shape}")
+        log.info(f"episode {episode_idx} lambda_wrench shape: {episode_result['lambda_wrench'].shape}")
+
+        return episode_result
+    
+    def plot_episode_result(self, episode_result, output_dir="outputs/wrench_bg/inference_plots"):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        episode_idx = episode_result["episode_idx"]
+
+        raw = episode_result["raw_wrench"]        # [T, 4, 6]
+        lam = episode_result["lambda_wrench"]     # [T, 4, 6]
+
+        # 先画 window 最后一帧，最直观
+        raw_last = raw[:, -1, :]
+        lam_last = lam[:, -1, :]
+
+        names = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+
+        # 图 1：lambda 单独曲线
+        fig, axes = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
+
+        for i, name in enumerate(names):
+            axes[i].plot(lam_last[:, i], label=f"lambda {name}", color="tab:orange")
+            axes[i].set_ylabel(name)
+            axes[i].grid(True)
+            axes[i].legend(loc="upper right")
+
+        axes[-1].set_xlabel("frame")
+        fig.tight_layout()
+
+        path_lambda = output_dir / f"episode_{episode_idx:03d}_lambda.png"
+        fig.savefig(path_lambda)
+        plt.close(fig)
+
+        # 图 2：raw wrench 和 lambda 对比
+        fig, axes = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
+
+        for i, name in enumerate(names):
+            axes[i].plot(raw_last[:, i], label=f"raw {name}", color="tab:blue")
+            axes[i].plot(lam_last[:, i], label=f"lambda {name}", color="tab:orange")
+            axes[i].set_ylabel(name)
+            axes[i].grid(True)
+            axes[i].legend(loc="upper right")
+
+        axes[-1].set_xlabel("frame")
+        fig.tight_layout()
+
+        path_compare = output_dir / f"episode_{episode_idx:03d}_raw_vs_lambda.png"
+        fig.savefig(path_compare)
+        plt.close(fig)
+
+        log.info(f"saved plot: {path_lambda}")
+        log.info(f"saved plot: {path_compare}")
+
+if __name__ == "__main__":
+
+    args = parse_args()
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+    log.info(f"wrench background train config:{config}")
+
+    inferencer = WrecnhBgInferencer(config)
+
+    # inferencer.test_one_sample()
+    num_episodes = 1
+
+    for episode_idx in range(num_episodes):
+        log.info(f"plotting episode {episode_idx}/{num_episodes - 1}")
+        episode_result = inferencer.infer_one_episode(episode_idx)
+        inferencer.plot_episode_result(episode_result)
+
