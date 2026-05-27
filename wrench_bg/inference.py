@@ -100,7 +100,7 @@ class WrecnhBgInferencer:
         batch = {
             k: v.unsqueeze(0)
             for k, v in sample.items()
-            if k in ("q", "v", "ee_pose")
+            if k in self.model.active_inputs
         }
 
         wrench_bg_norm = self.inferecer_one_step(batch)
@@ -167,12 +167,15 @@ class WrecnhBgInferencer:
 
         episode_idx = episode_result["episode_idx"]
 
-        raw = episode_result["raw_wrench"]        # [T, 4, 6]
-        lam = episode_result["lambda_wrench"]     # [T, 4, 6]
+        raw = episode_result["raw_wrench"]
+        lam = episode_result["lambda_wrench"]
+        if raw.ndim != 2:
+            raise ValueError(f"expected raw_wrench shape [T, 6], got {tuple(raw.shape)}")
+        if lam.ndim != 2:
+            raise ValueError(f"expected lambda_wrench shape [T, 6], got {tuple(lam.shape)}")
 
-        # 先画 window 最后一帧，最直观
-        raw_last = raw[:, -1, :]
-        lam_last = lam[:, -1, :]
+        raw_last = raw
+        lam_last = lam
 
         names = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 
@@ -228,4 +231,3 @@ if __name__ == "__main__":
         log.info(f"plotting episode {episode_idx}/{num_episodes - 1}")
         episode_result = inferencer.infer_one_episode(episode_idx)
         inferencer.plot_episode_result(episode_result)
-

@@ -3,7 +3,7 @@ io:
   output: data/train_episode/wrench_background/wrench_bg_lerobotv3
   repo_id: wrench_bg_lerobotv3
   max_episodes: 100
-  no_videos: false
+  no_videos: True
   push_to_hub: false
 
 fps: 30

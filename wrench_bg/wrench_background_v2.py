@@ -35,13 +35,20 @@ class Wrench_Background_V2(nn.Module):
         super().__init__()
         self.config = config 
         self.train_config = config.get("train") or {}
-        self.q_dim = 7
-        self.v_dim = 7
-        self.ee_pose_dim = 7
-        self.ft_window_size = 4
+        self.model_config = config.get("model") or {}
+        self.input_dims = {
+            "q": 7,
+            "v": 7,
+            "a": 7,
+            "ee_pose": 7,
+            **(self.model_config.get("input_dims") or {}),
+        }
+        self.static_inputs = list(self.model_config.get("static_inputs") or ["q", "ee_pose"])
+        self.dynamic_inputs = list(self.model_config.get("dynamic_inputs") or ["q", "v", "a", "ee_pose"])
+        self._validate_input_groups()
         self.wrench_dim = 6
-        self.wrench_shape = (self.ft_window_size, self.wrench_dim)
-        self.wrench_out_dim = self.ft_window_size * self.wrench_dim
+        self.wrench_shape = (self.wrench_dim,)
+        self.wrench_out_dim = self.wrench_dim
 
         self.hidden_dim = int(self.train_config.get("hidden_dim",256))
         self.activation = self.train_config.get("activation", "silu")
@@ -50,14 +57,22 @@ class Wrench_Background_V2(nn.Module):
         self.static_num_res_blocks = int(self.train_config.get("static_num_res_blocks", 1))
         self.dynamic_num_res_blocks = int(self.train_config.get("dynamic_num_res_blocks", 1))
 
-        self.input_dim = self.q_dim + self.v_dim + self.ee_pose_dim 
-        
-        self.q_encoder = MLPBlock(self.q_dim, self.hidden_dim, self.activation, self.use_norm, self.dropout)
-        self.v_encoder = MLPBlock(self.v_dim, self.hidden_dim, self.activation,self.use_norm, self.dropout)
-        self.ee_pose_encoder = MLPBlock(self.ee_pose_dim, self.hidden_dim, self.activation, self.use_norm, self.dropout)
+        self.active_inputs = list(dict.fromkeys(self.static_inputs + self.dynamic_inputs))
+        self.encoders = nn.ModuleDict(
+            {
+                key: MLPBlock(
+                    int(self.input_dims[key]),
+                    self.hidden_dim,
+                    self.activation,
+                    self.use_norm,
+                    self.dropout,
+                )
+                for key in self.active_inputs
+            }
+        )
 
         self.static_proj = MLPBlock(
-            self.hidden_dim * 2,
+            self.hidden_dim * len(self.static_inputs),
             self.hidden_dim,
             self.activation,
             self.use_norm,
@@ -65,7 +80,7 @@ class Wrench_Background_V2(nn.Module):
         )
 
         self.dynamic_proj = MLPBlock(
-            self.hidden_dim * 3,
+            self.hidden_dim * len(self.dynamic_inputs),
             self.hidden_dim,
             self.activation,
             self.use_norm,
@@ -107,17 +122,47 @@ class Wrench_Background_V2(nn.Module):
         self.static_head = nn.Linear(self.hidden_dim, self.wrench_out_dim)
         self.dynamic_head = nn.Linear(self.hidden_dim, self.wrench_out_dim)
 
+    def _validate_input_groups(self):
+        if not self.static_inputs:
+            raise ValueError("model.static_inputs must not be empty.")
+        if not self.dynamic_inputs:
+            raise ValueError("model.dynamic_inputs must not be empty.")
+
+        unknown = [
+            key
+            for key in self.static_inputs + self.dynamic_inputs
+            if key not in self.input_dims
+        ]
+        if unknown:
+            raise ValueError(f"Unknown model input keys: {unknown}")
+
+    def _prepare_input(self, key, value):
+        expected_dim = int(self.input_dims[key])
+        if value.shape[-1] == expected_dim:
+            return value
+
+        if value.ndim >= 2:
+            value = value.flatten(start_dim=-2)
+            if value.shape[-1] == expected_dim:
+                return value
+
+        raise ValueError(
+            f"Input {key!r} has shape {tuple(value.shape)}, expected last dim {expected_dim}."
+        )
+
+    def _encode_inputs(self, batch):
+        encoded = {}
+        for key in self.active_inputs:
+            if key not in batch:
+                raise KeyError(f"Missing model input {key!r} in batch.")
+            encoded[key] = self.encoders[key](self._prepare_input(key, batch[key]))
+        return encoded
+
     def forward(self, batch):
-        q = batch["q"]
-        v = batch["v"]
-        ee_pose = batch["ee_pose"]
+        z = self._encode_inputs(batch)
 
-        z_q = self.q_encoder(q)
-        z_v = self.v_encoder(v)
-        z_ee_pose = self.ee_pose_encoder(ee_pose)
-
-        static_x = torch.cat([z_q, z_ee_pose], dim=-1)
-        dynamic_x = torch.cat([z_q, z_v, z_ee_pose], dim =-1)
+        static_x = torch.cat([z[key] for key in self.static_inputs], dim=-1)
+        dynamic_x = torch.cat([z[key] for key in self.dynamic_inputs], dim=-1)
 
         z_static = self.static_proj(static_x)
         z_static = self.static_blocks(z_static)
@@ -129,24 +174,6 @@ class Wrench_Background_V2(nn.Module):
         wrench_dynamic = self.dynamic_head(z_dynamic)
 
         wrench_pred = wrench_static + wrench_dynamic
-
-        wrench_pred = wrench_pred.view(
-            *wrench_pred.shape[:-1],
-            self.ft_window_size,
-            self.wrench_dim,
-        )
-
-        wrench_static = wrench_static.view(
-            *wrench_static.shape[:-1],
-            self.ft_window_size,
-            self.wrench_dim,
-        )
-
-        wrench_dynamic = wrench_dynamic.view(
-            *wrench_dynamic.shape[:-1],
-            self.ft_window_size,
-            self.wrench_dim,
-        )
 
         out = {
             "wrench_pred": wrench_pred,

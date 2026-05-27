@@ -36,6 +36,9 @@ data/train_episode/
 *.parquet
 *.mp4
 
+# Local Docker setup
+docker for LCP_PINN_V1/
+
 # Plots and generated reports
 loss_epoch.png
 val_loss_epoch.png
@@ -47,4 +50,3 @@ loss_summary.png
 Thumbs.db
 .codex
 .agents/
-
