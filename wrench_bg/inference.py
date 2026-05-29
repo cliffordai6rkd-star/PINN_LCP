@@ -3,10 +3,12 @@ import torch
 import yaml
 import logging
 import argparse
+import copy
 
 from pathlib import Path
 from wrench_bg.wrench_background_v2 import Wrench_Background_V2
 from dataset.dataloader import PINNDataset
+from dataset.nomalizer import Normalizer
 
 
 logging.basicConfig(level=logging.INFO)
@@ -37,21 +39,47 @@ class WrecnhBgInferencer:
         self.get_ckpt()
         self.load_dataset()
         
-        
+
+    def _build_dataset_config(self, ckpt_cfg):
+        dataset_config = copy.deepcopy(ckpt_cfg)
+        dataloader_cfg = dataset_config["dataloader"]
+
+        dataset_override = self.config.get("dataset") or {}
+        for key in ("root", "repo_id", "video_backend", "load_images"):
+            if key in dataset_override:
+                dataloader_cfg[key] = dataset_override[key]
+
+        return dataset_config
+    
     def get_ckpt(self):
         log.info(f"Loading checkpoint------------------------")
-        ckpt = torch.load(self.ckpt_path, map_location=self.device)
+        ckpt = torch.load(self.ckpt_path, map_location="cpu")
         ckpt_cfg = ckpt["config"]
         log.info(f"Found checkpoint at {self.ckpt_path}")
-        # log.info(f"checkpoint config {ckpt_cfg}")
+        log.info(f"checkpoint config {ckpt_cfg}")
 
         model = Wrench_Background_V2(ckpt_cfg).to(self.device)
         model.load_state_dict(ckpt["model"])
         model.eval()
 
         self.ckpt = ckpt
+
+        normalizer_state = ckpt.get("normalizer")
+        if normalizer_state is None:
+            raise KeyError("checkpoint missing normalizer stats")
+
+        self.ckpt_normalizer = Normalizer(
+            stats=normalizer_state["stats"],
+            eps=normalizer_state.get("eps", 1e-6),
+        )
+        self.ckpt_normalize_mode = normalizer_state.get(
+            "normalize_mode",
+            ckpt_cfg["dataloader"].get("normalize_mode"),
+        )
         self.ckpt_cfg = ckpt_cfg
+        self.dataset_config = self._build_dataset_config(ckpt_cfg)
         self.model = model
+
         return model, ckpt_cfg, ckpt
     
     def inferecer_one_step(self, batch):
@@ -67,11 +95,21 @@ class WrecnhBgInferencer:
     
     def load_dataset(self):
         log.info("Loading dataset")
-        self.dataset = PINNDataset(self.config)
+        self.dataset = PINNDataset(
+            self.dataset_config,
+            normalizer=self.ckpt_normalizer,
+            normalize_mode=self.ckpt_normalize_mode,
+            compute_normalizer=False,
+        )
         self.normalizer = self.dataset.normalizer
+        log.info(f"dataset normalize_mode: {self.dataset.normalize_mode}")
+        log.info(f"dataset normalizer from checkpoint: {self.dataset.normalizer is self.ckpt_normalizer}")
+        log.info(f"model active_inputs: {self.model.active_inputs}")
+        log.info("using checkpoint normalizer for inference dataset")
+
         self.lerobot_dataset = self.dataset.dataset
         self.hf_dataset = self.dataset.dataset.hf_dataset
-        dataloader_cfg = self.config["dataloader"]
+        dataloader_cfg = self.dataset_config["dataloader"]
         log.info(f"dataset root: {dataloader_cfg.get('root')}")
         log.info(f"dataset repo_id: {dataloader_cfg.get('repo_id')}")
         self.raw_to_sample_idx = {
@@ -83,7 +121,7 @@ class WrecnhBgInferencer:
         log.info(f"num episodes: {len(self.lerobot_dataset.meta.episodes)}")
 
     def denormalize_wrench(self, wrench_norm):
-        normalize_mode = self.ckpt_cfg["dataloader"].get("normalize_mode")
+        normalize_mode = self.ckpt_normalize_mode
 
         if normalize_mode == "gaussian":
             return self.normalizer.gaussian_denormalize("wrench", wrench_norm)
@@ -108,7 +146,7 @@ class WrecnhBgInferencer:
 
         raw_idx = self.dataset.valid_indices[idx]
         raw_frame = self.hf_dataset[raw_idx]
-        wrench_key = self.config["dataloader"]["lowdim_keys"]["wrench"]
+        wrench_key = self.dataset_config["dataloader"]["lowdim_keys"]["wrench"]
         raw_wrench = raw_frame[wrench_key].unsqueeze(0).unsqueeze(0).to(wrench_bg.device)
 
         lambda_wrench = raw_wrench - wrench_bg
@@ -157,7 +195,8 @@ class WrecnhBgInferencer:
 
         return episode_result
     
-    def plot_episode_result(self, episode_result, output_dir="outputs/wrench_bg/inference_plots"):
+    def plot_episode_result(self, episode_result):
+        output_dir = self.inference_cfg.get("inference_plot_save_path") or "outputs/wrench_bg/inference_plots"
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -168,13 +207,17 @@ class WrecnhBgInferencer:
         episode_idx = episode_result["episode_idx"]
 
         raw = episode_result["raw_wrench"]
+        bg = episode_result["wrench_bg"]
         lam = episode_result["lambda_wrench"]
         if raw.ndim != 2:
             raise ValueError(f"expected raw_wrench shape [T, 6], got {tuple(raw.shape)}")
+        if bg.ndim != 2:
+            raise ValueError(f"expected wrench_bg shape [T, 6], got {tuple(bg.shape)}")
         if lam.ndim != 2:
             raise ValueError(f"expected lambda_wrench shape [T, 6], got {tuple(lam.shape)}")
 
         raw_last = raw
+        bg_last = bg
         lam_last = lam
 
         names = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
@@ -183,7 +226,7 @@ class WrecnhBgInferencer:
         fig, axes = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
 
         for i, name in enumerate(names):
-            axes[i].plot(lam_last[:, i], label=f"lambda {name}", color="tab:orange")
+            axes[i].plot(lam_last[:, i], label=f"lambda {name}", color="tab:red")
             axes[i].set_ylabel(name)
             axes[i].grid(True)
             axes[i].legend(loc="upper right")
@@ -195,12 +238,13 @@ class WrecnhBgInferencer:
         fig.savefig(path_lambda)
         plt.close(fig)
 
-        # 图 2：raw wrench 和 lambda 对比
+        # 图 2：raw wrench、wrench_bg 和 lambda 对比
         fig, axes = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
 
         for i, name in enumerate(names):
             axes[i].plot(raw_last[:, i], label=f"raw {name}", color="tab:blue")
-            axes[i].plot(lam_last[:, i], label=f"lambda {name}", color="tab:orange")
+            axes[i].plot(bg_last[:, i], label=f"wrench_bg {name}", color="gold")
+            axes[i].plot(lam_last[:, i], label=f"lambda {name}", color="tab:red")
             axes[i].set_ylabel(name)
             axes[i].grid(True)
             axes[i].legend(loc="upper right")
@@ -225,7 +269,7 @@ if __name__ == "__main__":
     inferencer = WrecnhBgInferencer(config)
 
     # inferencer.test_one_sample()
-    num_episodes = 1
+    num_episodes = 21
 
     for episode_idx in range(num_episodes):
         log.info(f"plotting episode {episode_idx}/{num_episodes - 1}")

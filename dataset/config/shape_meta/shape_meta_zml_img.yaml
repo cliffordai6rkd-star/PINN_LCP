@@ -1,42 +1,40 @@
 io:
   input: data/train_episode/wrench_background/wrench_bg
-  output: data/train_episode/wrench_background/wrench_bg_lerobotv3_test1
-  repo_id: wrench_bg_lerobotv3_test1
+  output: data/train_episode/wrench_background/wrench_bg_lerobotv3_zml_img
+  repo_id: zml_img
   max_episodes: 100
-  no_videos: True
+  no_videos: false
   push_to_hub: false
 
 fps: 30
 task: wrench_bg
-master_timestamp_path: teleop/timestamp_us
-
+master_timestamp_path: cameras/side_1/timestamp_us
 
 # index:直接拿
 # nearest:从主时间轴对应的最近的timestamp
 # nearest_past_window 
 
-
 features:
-  # observation.images.side_1:
-  #   dtype: video
-  #   shape: [192, 256, 3]
-  #   h5_path: cameras/side_1/frames
-  #   timestamp_path: cteleop/timestamp_us
-  #   align: nearest
+  observation.images.side_1:
+    dtype: video
+    shape: [192, 256, 3]
+    h5_path: cameras/side_1/frames
+    timestamp_path: cameras/side_1/timestamp_us
+    align: nearest
 
-  # observation.images.side_2:
-  #   dtype: video
-  #   shape: [192, 256, 3]
-  #   h5_path: cameras/side_2/frames
-  #   timestamp_path: cameras/side_2/timestamp_us
-  #   align: nearest
+  observation.images.side_2:
+    dtype: video
+    shape: [192, 256, 3]
+    h5_path: cameras/side_2/frames
+    timestamp_path: cameras/side_2/timestamp_us
+    align: nearest
 
-  # observation.images.wrist:
-  #   dtype: video
-  #   shape: [192, 256, 3]
-  #   h5_path: cameras/wrist/frames
-  #   timestamp_path: cameras/wrist/timestamp_us
-  #   align: nearest
+  observation.images.wrist:
+    dtype: video
+    shape: [192, 256, 3]
+    h5_path: cameras/wrist/frames
+    timestamp_path: cameras/wrist/timestamp_us
+    align: nearest
 
   observation.ee_state.ee_pose:
     dtype: float32
@@ -66,12 +64,12 @@ features:
     timestamp_path: teleop/timestamp_us
     align: nearest
 
-  observation.ft_window:
-    dtype: float32
-    shape: [6]
-    h5_path: force_sensor/wrench_filtered
-    timestamp_path: force_sensor/timestamp_us
-    align: nearest
+  # observation.ft:
+  #   dtype: float32
+  #   shape: [6]
+  #   h5_path: force_sensor/wrench_filtered
+  #   timestamp_path: force_sensor/timestamp_us
+  #   align: nearest
     # align: nearest_past_window
     # window_size: 1
 

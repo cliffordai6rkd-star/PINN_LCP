@@ -33,7 +33,10 @@ def parse_args():
     return parser.parse_args()
 
 class PINNDataset(torch.utils.data.Dataset):
-    def __init__(self,config):
+    def __init__(self, config,
+                    normalizer=None,
+                    normalize_mode=None,
+                    compute_normalizer=True,):
         # repo_id, root, 
         self.config = config 
         self.data_config = config.get("dataloader")
@@ -75,16 +78,25 @@ class PINNDataset(torch.utils.data.Dataset):
         self.is_normalize = False
         self.normalizer = None
         self.normalize_fuc = None
-        self.normalize_mode = self.data_config.get("normalize_mode", "gaussian")
-        
+        self.normalize_mode = normalize_mode
+        if self.normalize_mode is None:
+            self.normalize_mode = self.data_config.get("normalize_mode", "gaussian")
+
         if self.normalize_mode is not None:
             self.is_normalize = True
-            self.normalizer = Normalizer.stats_from_dataset(
-                dataset = self.stats_dataset,
-                valid_indices = self.valid_indices,
-                lowdim_keys = self.lowdim_keys,
-                normalize_keys = self.normalize_lowdim_keys,
-            )
+
+            if normalizer is not None:
+                self.normalizer = normalizer
+            elif compute_normalizer:
+                self.normalizer = Normalizer.stats_from_dataset(
+                    dataset = self.stats_dataset,
+                    valid_indices = self.valid_indices,
+                    lowdim_keys = self.lowdim_keys,
+                    normalize_keys = self.normalize_lowdim_keys,
+                )
+            else:
+                raise ValueError("normalizer is required when compute_normalizer=False")
+
             if self.normalize_mode == "gaussian":
                 self.normalize_fuc = self.normalizer.gaussian_normalize
             elif self.normalize_mode == "limit":
@@ -92,8 +104,8 @@ class PINNDataset(torch.utils.data.Dataset):
             elif self.normalize_mode == "quantile":
                 self.normalize_fuc = self.normalizer.quantile_normalize
             else:
-                raise ValueError(f"unknown normalize mode")
-        
+                raise ValueError(f"unknown normalize mode: {self.normalize_mode}")
+
     def __len__(self):
         return len(self.valid_indices) 
     

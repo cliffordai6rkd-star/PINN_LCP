@@ -379,6 +379,12 @@ class BaseTrainer:
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "optimizer": self.optimizer.state_dict(),
             "config": self.config,
+            "normalizer": {
+                "stats": self.dataset.normalizer.stats,
+                "eps": self.dataset.normalizer.eps,
+                "normalize_mode": self.config["dataloader"].get("normalize_mode"),
+                "normalize_lowdim_keys": self.config["dataloader"].get("normalize_lowdim_keys"),
+            }
         }
 
         path = self.ckpt_dir / f"epoch_{epoch:03d}.pt"
@@ -406,6 +412,12 @@ class BaseTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "config": self.config,
+            "normalizer": {
+                "stats": self.dataset.normalizer.stats,
+                "eps": self.dataset.normalizer.eps,
+                "normalize_mode": self.config["dataloader"].get("normalize_mode"),
+                "normalize_lowdim_keys": self.config["dataloader"].get("normalize_lowdim_keys"),
+            }
         }
 
         torch.save(ckpt, path)

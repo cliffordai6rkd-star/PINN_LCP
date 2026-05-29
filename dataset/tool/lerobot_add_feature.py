@@ -1,9 +1,10 @@
 
-# python dataset/tool/lerobot_add_dv.py \
+# python dataset/tool/lerobot_add_feature.py \
 #   --input-root data/train_episode/wrench_background/wrench_bg_lerobotv3 \
 #   --input-repo-id wrench_bg_lerobotv3 \
 #   --output-root data/train_episode/wrench_background/wrench_bg_lerobotv3_dv \
 #   --output-repo-id wrench_bg_lerobotv3_dv \
+#   --features acceleration ee_velocity ee_acceleration \
 #   --overwrite
 
 
@@ -26,20 +27,29 @@ DEFAULT_FEATURE_KEYS = {
     "task_index",
 }
 
+FEATURE_CHOICES = ("acceleration", "ee_velocity", "ee_acceleration")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a LeRobot dataset with acceleration computed from velocity differences."
+        description="Create a LeRobot dataset with selected derivative features added."
     )
     parser.add_argument("--input-root", type=Path, required=True, help="Source LeRobot dataset root.")
     parser.add_argument("--input-repo-id", required=True, help="Source LeRobot repo id.")
     parser.add_argument("--output-root", type=Path, required=True, help="Output LeRobot dataset root.")
     parser.add_argument("--output-repo-id", required=True, help="Output LeRobot repo id.")
+    parser.add_argument(
+        "--features",
+        nargs="+",
+        choices=FEATURE_CHOICES,
+        default=list(FEATURE_CHOICES),
+        help="Features to add. Default: add all supported derivative features.",
+    )
     parser.add_argument("--velocity-key", default="observation.velocity")
     parser.add_argument("--acceleration-key", default="observation.acceleration")
     parser.add_argument("--ee-pose-key", default="action.ee_pose")
-    parser.add_argument("--ee-linear-velocity-key", default="observation.ee_linear_velocity")
-    parser.add_argument("--ee-linear-acceleration-key", default="observation.ee_linear_acceleration")
+    parser.add_argument("--ee-velocity-key", default="observation.ee_velocity")
+    parser.add_argument("--ee-acceleration-key", default="observation.ee_acceleration")
     parser.add_argument("--timestamp-key", default="timestamp")
     parser.add_argument("--min-dt", type=float, default=1e-6, help="Lower bound for timestamp deltas.")
     parser.add_argument("--video-backend", default="torchcodec")
@@ -82,10 +92,13 @@ def is_video_feature(feature: Any) -> bool:
 
 def source_features_for_create(
     source_dataset: Any,
-    acceleration_key: str,
-    ee_linear_velocity_key: str,
-    ee_linear_acceleration_key: str,
     *,
+    selected_features: set[str],
+    velocity_key: str,
+    acceleration_key: str,
+    ee_pose_key: str,
+    ee_velocity_key: str,
+    ee_acceleration_key: str,
     keep_videos: bool,
 ) -> dict[str, Any]:
     features = {}
@@ -96,19 +109,38 @@ def source_features_for_create(
             continue
         features[key] = feature_to_plain_dict(spec)
 
-    features[acceleration_key] = {
-        "dtype": "float32",
-        "shape": (7,),
-    }
-    features[ee_linear_velocity_key] = {
-        "dtype": "float32",
-        "shape": (3,),
-    }
-    features[ee_linear_acceleration_key] = {
-        "dtype": "float32",
-        "shape": (3,),
-    }
+    if "acceleration" in selected_features:
+        features[acceleration_key] = derivative_feature_spec(source_dataset, velocity_key)
+    if "ee_velocity" in selected_features:
+        features[ee_velocity_key] = ee_twist_feature_spec(source_dataset, ee_pose_key)
+    if "ee_acceleration" in selected_features:
+        features[ee_acceleration_key] = ee_twist_feature_spec(source_dataset, ee_pose_key)
     return features
+
+
+def derivative_feature_spec(source_dataset: Any, source_key: str) -> dict[str, Any]:
+    if source_key not in source_dataset.features:
+        raise KeyError(f"missing source feature spec: {source_key}")
+    spec = feature_to_plain_dict(source_dataset.features[source_key])
+    if "shape" not in spec:
+        raise KeyError(f"missing shape in source feature spec: {source_key}")
+    return {
+        "dtype": "float32",
+        "shape": tuple(spec["shape"]),
+    }
+
+
+def ee_twist_feature_spec(source_dataset: Any, source_key: str) -> dict[str, Any]:
+    if source_key not in source_dataset.features:
+        raise KeyError(f"missing source feature spec: {source_key}")
+    spec = feature_to_plain_dict(source_dataset.features[source_key])
+    shape = tuple(spec.get("shape", ()))
+    if shape != (4, 4):
+        raise ValueError(f"{source_key} must have shape (4, 4) to compute ee twist, got {shape}.")
+    return {
+        "dtype": "float32",
+        "shape": (6,),
+    }
 
 
 def create_dataset(
@@ -275,19 +307,74 @@ def compute_episode_accelerations(
     return accelerations
 
 
-def ee_position(ee_pose: Any) -> Any:
+def ee_pose_value(ee_pose: Any) -> Any:
     import torch
 
     if not torch.is_tensor(ee_pose):
         ee_pose = torch.as_tensor(ee_pose)
     ee_pose = ee_pose.to(dtype=torch.float32)
+    if tuple(ee_pose.shape) != (4, 4):
+        raise ValueError(f"ee pose must have shape (4, 4), got {tuple(ee_pose.shape)}.")
+    return ee_pose
 
-    if ee_pose.shape[-1] == 7:
-        return ee_pose[..., :3]
-    if ee_pose.shape[-2:] == (4, 4):
-        return ee_pose[..., :3, 3]
 
-    raise ValueError(f"Unsupported ee_pose shape for position extraction: {tuple(ee_pose.shape)}")
+def so3_log(rotation: Any) -> Any:
+    import torch
+
+    rotation = torch.as_tensor(rotation, dtype=torch.float32)
+    trace = torch.trace(rotation)
+    cos_theta = torch.clamp((trace - 1.0) * 0.5, -1.0, 1.0)
+    theta = torch.acos(cos_theta)
+    vee = torch.stack(
+        (
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        )
+    )
+
+    sin_theta = torch.sin(theta)
+    if torch.abs(sin_theta) < 1e-6:
+        return 0.5 * vee
+    return theta / (2.0 * sin_theta) * vee
+
+
+def ee_velocity_from_poses(current_pose: Any, previous_pose: Any, dt: float) -> Any:
+    import torch
+
+    current_pose = ee_pose_value(current_pose)
+    previous_pose = ee_pose_value(previous_pose)
+    linear_velocity = (current_pose[:3, 3] - previous_pose[:3, 3]) / dt
+
+    # Spatial angular velocity in the same frame as the pose translation.
+    rotation_delta = current_pose[:3, :3] @ previous_pose[:3, :3].transpose(0, 1)
+    angular_velocity = so3_log(rotation_delta) / dt
+    return torch.cat((linear_velocity, angular_velocity), dim=0)
+
+
+def compute_episode_ee_velocities(
+    ee_poses: list[Any],
+    *,
+    timestamps: list[Any],
+    min_dt: float,
+) -> list[Any]:
+    import torch
+
+    if not ee_poses:
+        return []
+    if len(ee_poses) != len(timestamps):
+        raise ValueError("ee_poses and timestamps must have the same length.")
+
+    velocities = [torch.zeros(6, dtype=torch.float32)]
+    for idx in range(1, len(ee_poses)):
+        dt = scalar_timestamp(timestamps[idx]) - scalar_timestamp(timestamps[idx - 1])
+        if dt < min_dt:
+            dt = min_dt
+        velocities.append(ee_velocity_from_poses(ee_poses[idx], ee_poses[idx - 1], dt))
+
+    if len(velocities) > 1:
+        velocities[0] = velocities[1].clone()
+    return velocities
 
 
 def compute_episode_derivative(values: list[Any], *, timestamps: list[Any], min_dt: float) -> list[Any]:
@@ -314,10 +401,10 @@ def compute_episode_derivative(values: list[Any], *, timestamps: list[Any], min_
 
 def main() -> None:
     args = parse_args()
-    import torch
 
     if args.min_dt <= 0:
         raise ValueError("--min-dt must be positive.")
+    selected_features = set(args.features)
 
     if args.output_root.exists():
         if not args.overwrite:
@@ -334,9 +421,12 @@ def main() -> None:
 
     features = source_features_for_create(
         source_dataset,
-        args.acceleration_key,
-        args.ee_linear_velocity_key,
-        args.ee_linear_acceleration_key,
+        selected_features=selected_features,
+        velocity_key=args.velocity_key,
+        acceleration_key=args.acceleration_key,
+        ee_pose_key=args.ee_pose_key,
+        ee_velocity_key=args.ee_velocity_key,
+        ee_acceleration_key=args.ee_acceleration_key,
         keep_videos=args.keep_videos,
     )
     output_feature_keys = set(features.keys())
@@ -365,45 +455,59 @@ def main() -> None:
             for raw_idx in range(start, end)
         ]
         velocities = []
-        ee_positions = []
+        ee_poses = []
         timestamps = []
         for source_frame in source_frames:
-            if args.velocity_key not in source_frame:
+            if "acceleration" in selected_features and args.velocity_key not in source_frame:
                 raise KeyError(f"missing velocity key in source frame: {args.velocity_key}")
-            if args.ee_pose_key not in source_frame:
+            if (
+                {"ee_velocity", "ee_acceleration"} & selected_features
+                and args.ee_pose_key not in source_frame
+            ):
                 raise KeyError(f"missing ee pose key in source frame: {args.ee_pose_key}")
             if args.timestamp_key not in source_frame:
                 raise KeyError(f"missing timestamp key in source frame: {args.timestamp_key}")
-            velocities.append(source_frame[args.velocity_key])
-            ee_positions.append(ee_position(source_frame[args.ee_pose_key]))
+            if "acceleration" in selected_features:
+                velocities.append(source_frame[args.velocity_key])
+            if {"ee_velocity", "ee_acceleration"} & selected_features:
+                ee_poses.append(ee_pose_value(source_frame[args.ee_pose_key]))
             timestamps.append(source_frame[args.timestamp_key])
-        accelerations = compute_episode_accelerations(
-            velocities,
-            timestamps=timestamps,
-            min_dt=args.min_dt,
-        )
-        ee_linear_velocities = compute_episode_derivative(
-            ee_positions,
-            timestamps=timestamps,
-            min_dt=args.min_dt,
-        )
-        ee_linear_accelerations = compute_episode_derivative(
-            ee_linear_velocities,
-            timestamps=timestamps,
-            min_dt=args.min_dt,
-        )
 
-        for source_frame, acceleration, ee_linear_velocity, ee_linear_acceleration in tqdm(
-            zip(source_frames, accelerations, ee_linear_velocities, ee_linear_accelerations),
+        # Derivatives are episode-local: each ee_pose/velocity sample is paired
+        # with the timestamp from the same episode row, then differenced in order.
+        # EE velocity is a 6D twist: [vx, vy, vz, wx, wy, wz].
+        computed_features: dict[str, list[Any]] = {}
+        if "acceleration" in selected_features:
+            computed_features[args.acceleration_key] = compute_episode_accelerations(
+                velocities,
+                timestamps=timestamps,
+                min_dt=args.min_dt,
+            )
+        if "ee_velocity" in selected_features or "ee_acceleration" in selected_features:
+            ee_velocities = compute_episode_ee_velocities(
+                ee_poses,
+                timestamps=timestamps,
+                min_dt=args.min_dt,
+            )
+            if "ee_velocity" in selected_features:
+                computed_features[args.ee_velocity_key] = ee_velocities
+            if "ee_acceleration" in selected_features:
+                computed_features[args.ee_acceleration_key] = compute_episode_derivative(
+                    ee_velocities,
+                    timestamps=timestamps,
+                    min_dt=args.min_dt,
+                )
+
+        for frame_idx, source_frame in tqdm(
+            enumerate(source_frames),
             total=len(source_frames),
             desc=f"frames {start}:{end}",
             leave=False,
             unit="frame",
         ):
             frame = frame_for_output(source_frame, output_feature_keys)
-            frame[args.acceleration_key] = acceleration
-            frame[args.ee_linear_velocity_key] = ee_linear_velocity
-            frame[args.ee_linear_acceleration_key] = ee_linear_acceleration
+            for key, values in computed_features.items():
+                frame[key] = values[frame_idx]
             frame = coerce_frame_to_features(frame, features)
             add_frame(output_dataset, frame, task)
 
@@ -412,11 +516,20 @@ def main() -> None:
     print(f"wrote dataset: root={args.output_root} repo_id={args.output_repo_id}")
     print(
         "added keys: "
-        f"{args.acceleration_key}, "
-        f"{args.ee_linear_velocity_key}, "
-        f"{args.ee_linear_acceleration_key}, "
+        f"{', '.join(computed_key_names(args, selected_features))}, "
         f"timestamp_key={args.timestamp_key}"
     )
+
+
+def computed_key_names(args: argparse.Namespace, selected_features: set[str]) -> list[str]:
+    keys = []
+    if "acceleration" in selected_features:
+        keys.append(args.acceleration_key)
+    if "ee_velocity" in selected_features:
+        keys.append(args.ee_velocity_key)
+    if "ee_acceleration" in selected_features:
+        keys.append(args.ee_acceleration_key)
+    return keys
 
 
 if __name__ == "__main__":
