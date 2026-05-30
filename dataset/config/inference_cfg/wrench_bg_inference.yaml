@@ -1,9 +1,11 @@
 # 推理用：
+
+num_episodes: 1
 dataset:
-  # root: data/xxx
-  # repo_id: xxx
+  # root: data/train_episode/wipe_board/wipe_board_lerobotv3
+  # repo_id: wipe_board_lerobotv3
 inferencer:
-  inference_plot_save_path: 
+  inference_plot_save_path: outputs/inferene/wrench_bg/plot2
   # ckpt_path: outputs/wrench_bg/v2/exp3/checkpoints/epoch_290_val_loss_0.0531.pt
   # ckpt_path: outputs/wrench_bg/v2/exp11/checkpoints/epoch_046_val_loss_0.0555.pt
-  ckpt_path: outputs/wrench_bg/v2/exp1/checkpoints/epoch_237_val_loss_0.0021.pt
+  ckpt_path: outputs/wrench_bg/v2/exp2/checkpoints/epoch_394_val_loss_0.000234.pt

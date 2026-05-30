@@ -1,9 +1,9 @@
 io:
-  input: data/train_episode/wrench_background/wrench_bg
-  output: data/train_episode/wrench_background/wrench_bg_lerobotv3
-  repo_id: wrench_bg_lerobotv3
+  input: data/train_episode/wipe_board/wipe_board
+  output: data/train_episode/wipe_board/wipe_board_lerobotv3
+  repo_id: wipe_board_lerobotv3
   max_episodes: 100
-  no_videos: True
+  no_videos: false
   push_to_hub: false
 
 fps: 30

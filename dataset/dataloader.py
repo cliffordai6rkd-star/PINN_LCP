@@ -58,11 +58,18 @@ class PINNDataset(torch.utils.data.Dataset):
 
         self.valid_indices = []
         episodes = self.dataset.meta.episodes
+
+        self.raw_idx_to_episode_start = {}
+        self.raw_idx_to_episode_end = {}
+
         for ep in episodes:
             start_idx = int(ep["dataset_from_index"])
             end_idx = int(ep["dataset_to_index"])
-            for idx in range(start_idx, end_idx - self.horizon + 1):
+
+            for idx in range(start_idx, end_idx):
                 self.valid_indices.append(idx)
+                self.raw_idx_to_episode_start[idx] = start_idx
+                self.raw_idx_to_episode_end[idx] = end_idx
 
         self.load_image = bool(self.data_config.get("load_images",True))
 
@@ -111,9 +118,15 @@ class PINNDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
 
-        start = self.valid_indices[idx]
-        frame_indices = range(start, start + self.horizon)
-        # log.info(f"window start={start}, end={start + self.horizon - 1}")
+        raw_idx = self.valid_indices[idx]
+        episode_start = self.raw_idx_to_episode_start[raw_idx]
+
+        # 构造horizon窗口  用max来结局解决开头几帧的问题  相当于padding
+        frame_indices = [
+                max(episode_start, raw_idx - self.horizon + 1 + offset)
+                for offset in range(self.horizon)
+        ]
+
 
         frames = [self._read_frame(i) for i in frame_indices]
 

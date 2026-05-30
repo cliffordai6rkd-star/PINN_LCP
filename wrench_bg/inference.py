@@ -143,19 +143,21 @@ class WrecnhBgInferencer:
 
         wrench_bg_norm = self.inferecer_one_step(batch)
         wrench_bg = self.denormalize_wrench(wrench_bg_norm)
+        if wrench_bg.ndim == 3:
+            wrench_bg = wrench_bg[:, -1, :]
 
         raw_idx = self.dataset.valid_indices[idx]
         raw_frame = self.hf_dataset[raw_idx]
         wrench_key = self.dataset_config["dataloader"]["lowdim_keys"]["wrench"]
-        raw_wrench = raw_frame[wrench_key].unsqueeze(0).unsqueeze(0).to(wrench_bg.device)
+        raw_wrench = raw_frame[wrench_key].unsqueeze(0).to(wrench_bg.device)
 
         lambda_wrench = raw_wrench - wrench_bg
 
         return {
             "raw_idx": raw_idx,
-            "raw_wrench": raw_wrench.squeeze(0).squeeze(0).cpu(),
-            "wrench_bg": wrench_bg.squeeze(0).squeeze(0).cpu(),
-            "lambda_wrench": lambda_wrench.squeeze(0).squeeze(0).cpu(),
+            "raw_wrench": raw_wrench.squeeze(0).cpu(),
+            "wrench_bg": wrench_bg.squeeze(0).cpu(),
+            "lambda_wrench": lambda_wrench.squeeze(0).cpu(),
         }
 
     def infer_one_episode(self, episode_idx):
@@ -222,6 +224,11 @@ class WrecnhBgInferencer:
 
         names = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 
+        def use_fx_ylim(axes):
+            fx_ylim = axes[0].get_ylim()
+            for axis in axes[1:]:
+                axis.set_ylim(fx_ylim)
+
         # 图 1：lambda 单独曲线
         fig, axes = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
 
@@ -231,6 +238,7 @@ class WrecnhBgInferencer:
             axes[i].grid(True)
             axes[i].legend(loc="upper right")
 
+        use_fx_ylim(axes)
         axes[-1].set_xlabel("frame")
         fig.tight_layout()
 
@@ -249,6 +257,7 @@ class WrecnhBgInferencer:
             axes[i].grid(True)
             axes[i].legend(loc="upper right")
 
+        use_fx_ylim(axes)
         axes[-1].set_xlabel("frame")
         fig.tight_layout()
 
@@ -269,7 +278,7 @@ if __name__ == "__main__":
     inferencer = WrecnhBgInferencer(config)
 
     # inferencer.test_one_sample()
-    num_episodes = 21
+    num_episodes = config.get("num_episodes", 100)
 
     for episode_idx in range(num_episodes):
         log.info(f"plotting episode {episode_idx}/{num_episodes - 1}")

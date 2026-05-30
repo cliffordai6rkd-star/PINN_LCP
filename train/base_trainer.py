@@ -33,6 +33,7 @@ class BaseTrainer:
             self.device = "cpu"
 
         self.val_ratio = float(self.train_config.get("val_ratio", 0.1))
+        self.split_mode = self.train_config.get("split_mode", "episode")
         self.seed = int(self.train_config.get("seed", 42))
         self.val_loader = None
 
@@ -60,6 +61,7 @@ class BaseTrainer:
 
         self.scheduler_config = self.train_config.get("scheduler", None)
         self.scheduler = None
+        
 
     def set_seed(self):
         import random
@@ -121,22 +123,68 @@ class BaseTrainer:
                 eta_min=float(self.scheduler_config.get("eta_min", 1e-6)),
             )
         raise ValueError(f"Unsupported scheduler: {name}")
-    
+
+    def split_dataset_by_episode(self):
+        episodes = list(self.dataset.dataset.meta.episodes)
+
+        num_val_episodes = int(len(episodes) * self.val_ratio)
+        num_val_episodes = max(1, num_val_episodes)
+        num_val_episodes = min(num_val_episodes, len(episodes) - 1)
+
+        generator = torch.Generator().manual_seed(self.seed)
+        perm = torch.randperm(len(episodes), generator=generator).tolist()
+        val_episode_indices = set(perm[:num_val_episodes])
+
+        episode_start_to_idx = {
+            int(ep["dataset_from_index"]): ep_idx
+            for ep_idx, ep in enumerate(episodes)
+        }
+
+        train_indices = []
+        val_indices = []
+
+        for sample_idx, raw_idx in enumerate(self.dataset.valid_indices):
+            episode_start = self.dataset.raw_idx_to_episode_start[raw_idx]
+            episode_idx = episode_start_to_idx[episode_start]
+
+            if episode_idx in val_episode_indices:
+                val_indices.append(sample_idx)
+            else:
+                train_indices.append(sample_idx)
+
+        log.info(
+            f"episode split: "
+            f"train_episodes={len(episodes) - len(val_episode_indices)} "
+            f"val_episodes={len(val_episode_indices)} "
+            f"train_samples={len(train_indices)} "
+            f"val_samples={len(val_indices)}"
+        )
+        log.info(f"val episode indices: {sorted(val_episode_indices)}")
+
+        train_dataset = torch.utils.data.Subset(self.dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(self.dataset, val_indices)
+
+        return train_dataset, val_dataset
 
     def setup(self):
         self.set_seed()
         self.dataset = self.build_dataset()
 
         if self.val_ratio > 0:
-            val_size = int(len(self.dataset) * self.val_ratio)
-            train_size = len(self.dataset) - val_size
-
-            generator = torch.Generator().manual_seed(self.seed)
-            train_dataset, val_dataset = torch.utils.data.random_split(
-                self.dataset,
-                [train_size, val_size],
-                generator=generator,
-            )
+            if self.split_mode == "episode":
+                train_dataset, val_dataset = self.split_dataset_by_episode()
+            elif self.split_mode == "sample":
+                val_size = int(len(self.dataset) * self.val_ratio)
+                train_size = len(self.dataset) - val_size
+        
+                generator = torch.Generator().manual_seed(self.seed)
+                train_dataset, val_dataset = torch.utils.data.random_split(
+                    self.dataset,
+                    [train_size, val_size],
+                    generator=generator,
+                )
+            else:
+                raise ValueError(f"unknown split_mode: {self.split_mode}")
         else:
             train_dataset = self.dataset
             val_dataset = None
@@ -400,7 +448,7 @@ class BaseTrainer:
 
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        path = self.ckpt_dir / f"epoch_{epoch:03d}_{self.monitor_key}_{score:.4f}.pt"
+        path = self.ckpt_dir / f"epoch_{epoch:03d}_{self.monitor_key}_{score:.6f}.pt"
 
         ckpt = {
             "epoch": epoch,

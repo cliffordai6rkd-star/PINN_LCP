@@ -33,7 +33,7 @@ train:
   seed: 42
   lr: 1e-4
   weight_decay: 1e-5
-  num_epochs: 500
+  num_epochs: 1000
   output_dir: outputs/wrench_background_11
   monitor_key: val_loss
   top_k: 3
