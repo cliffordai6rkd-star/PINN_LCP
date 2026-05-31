@@ -1,12 +1,11 @@
 io:
   input: data/train_episode/wrench_background/wrench_bg
-  output: data/train_episode/wrench_background/wrench_bg_lerobotv3_test1
+  output: data/train_episode/wrench_background/wrench_bg_lerobotv3_
   repo_id: wrench_bg_lerobotv3_test1
   max_episodes: 100
   no_videos: True
   push_to_hub: false
 
-fps: 30
 task: wrench_bg
 master_timestamp_path: teleop/timestamp_us
 

@@ -10,8 +10,8 @@ from typing import Any, Mapping
 from tqdm import tqdm
 
 EXAMPLE_SHAPE_META = {
-    "fps": 30,
     "task": "your_task_name",
+    "master_timestamp_path": "TODO/path/to/master_timestamp",
     "features": {
         "observation.images.wrist": {
             "type": "image",
@@ -137,7 +137,6 @@ def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
 
     return {
         "io": shape_meta.get("io", {}),
-        "fps": int(shape_meta.get("fps", 30)),
         "task": str(shape_meta.get("task", "default_task")),
         "mappings": mappings,
         "lerobot_features": lerobot_features,
@@ -320,6 +319,58 @@ class H5Dataset:
         # 主timestamp长度即为episode长度
         master_ts = self._timestamp_array(h5_file, master_timestamp_path, h5_path, cache)
         return int(master_ts.shape[0])
+
+    def estimate_fps_from_master_timestamps(self, master_timestamp_path: str) -> int:
+        if self.np is None:
+            raise RuntimeError("numpy is required to estimate fps from timestamps.")
+
+        dt_chunks = []
+        for h5_path in self.files():
+            with self.open_episode(h5_path) as h5_file:
+                timestamps = self.np.asarray(
+                    self._timestamp_array(h5_file, master_timestamp_path, h5_path),
+                    dtype=self.np.float64,
+                ).reshape(-1)
+
+            if timestamps.shape[0] < 2:
+                continue
+
+            dt = self.np.diff(timestamps)
+            dt = dt[self.np.isfinite(dt) & (dt > 0)]
+            if dt.size:
+                dt_chunks.append(dt)
+
+        if not dt_chunks:
+            raise ValueError(
+                f"Cannot estimate fps: no positive timestamp deltas found at "
+                f"{master_timestamp_path!r}."
+            )
+
+        all_dt = self.np.concatenate(dt_chunks)
+        mean_dt_seconds = float(all_dt.mean()) * self._timestamp_seconds_scale(master_timestamp_path)
+        if mean_dt_seconds <= 0:
+            raise ValueError(f"Invalid mean timestamp delta: {mean_dt_seconds}")
+
+        fps = int(round(1.0 / mean_dt_seconds))
+        if fps <= 0:
+            raise ValueError(f"Invalid estimated fps: {fps}")
+
+        print(
+            f"estimated fps={fps} from {master_timestamp_path} "
+            f"(mean_dt={mean_dt_seconds:.9f}s, num_deltas={all_dt.size})"
+        )
+        return fps
+
+    @staticmethod
+    def _timestamp_seconds_scale(timestamp_path: str) -> float:
+        name = str(timestamp_path).lower()
+        if name.endswith("_us") or "timestamp_us" in name:
+            return 1e-6
+        if name.endswith("_ms") or "timestamp_ms" in name:
+            return 1e-3
+        if name.endswith("_ns") or "timestamp_ns" in name:
+            return 1e-9
+        return 1.0
 
     def read_frame(self, h5_file, frame_idx, mappings, h5_path, master_timestamp_path, cache=None):
         # 从 H5 里读出一帧，返回 LeRobotDataset.add_frame 需要的字典
@@ -605,11 +656,12 @@ def run_conversion(args: argparse.Namespace) -> None:
         np=np,
         max_episodes=config_int(config, "max_episodes"),
     )
+    fps = h5_dataset.estimate_fps_from_master_timestamps(spec["master_timestamp_path"])
     lerobot_dataset = LeRobotV3Dataset(
         LeRobotDataset,
         repo_id=config_str(config, "repo_id", "local/h5_to_lerobot_v3"),
         root=config_path(config, "output"),
-        fps=spec["fps"],
+        fps=fps,
         features=spec["lerobot_features"],
         no_videos=config_bool(config, "no_videos"),
     )

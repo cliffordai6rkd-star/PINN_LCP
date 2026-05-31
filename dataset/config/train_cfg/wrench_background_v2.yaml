@@ -1,10 +1,10 @@
 dataloader:
-  repo_id: wrench_bg_lerobotv3_added_test1
-  root: data/train_episode/wrench_background/wrench_bg_lerobotv3_added_test1
+  repo_id: wrench_bg_lerobotv3_
+  root: data/train_episode/wrench_background/wrench_bg_lerobotv3_
   load_images: false
   video_backend: torchcodec
   normalize_mode: limit
-  horizon: 1
+  horizon: 3
   lowdim_keys:
     q: observation.joint                     #q
     v: observation.velocity                  #v
@@ -58,7 +58,7 @@ train:
     patience: 20
     min_lr: 1e-10
 
-  batch_size: 128
+  batch_size: 512
   device: cuda:0
   num_workers: 32
   val_ratio: 0.2
@@ -67,7 +67,7 @@ train:
   lr: 1e-4
   weight_decay: 1e-4
   num_epochs: 500
-  output_dir: outputs/wrench_bg/v2/exp6
+  output_dir: outputs/wrench_bg/v2/h3
   monitor_key: val_loss
   top_k: 5
   

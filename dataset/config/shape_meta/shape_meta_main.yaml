@@ -6,7 +6,7 @@ io:
   no_videos: false
   push_to_hub: false
 
-fps: 120
+
 task: wipe_board
 master_timestamp_path: teleop/timestamp_us
 

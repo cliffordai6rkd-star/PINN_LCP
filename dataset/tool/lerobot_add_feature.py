@@ -2,42 +2,28 @@
 # python dataset/tool/lerobot_add_feature.py \
 #   --input-root data/train_episode/wrench_background/wrench_bg_lerobotv3 \
 #   --input-repo-id wrench_bg_lerobotv3 \
-#   --output-root data/train_episode/wrench_background/wrench_bg_lerobotv3_dv \
-#   --output-repo-id wrench_bg_lerobotv3_dv \
 #   --features acceleration ee_velocity ee_acceleration \
-#   --overwrite
 
 
 from __future__ import annotations
 
 import argparse
-import inspect
-import shutil
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
 from tqdm import tqdm
 
 
-DEFAULT_FEATURE_KEYS = {
-    "timestamp",
-    "frame_index",
-    "episode_index",
-    "index",
-    "task_index",
-}
-
 FEATURE_CHOICES = ("acceleration", "ee_velocity", "ee_acceleration")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a LeRobot dataset with selected derivative features added."
+        description="Append selected lowdim derivative features to an existing LeRobot dataset."
     )
     parser.add_argument("--input-root", type=Path, required=True, help="Source LeRobot dataset root.")
     parser.add_argument("--input-repo-id", required=True, help="Source LeRobot repo id.")
-    parser.add_argument("--output-root", type=Path, required=True, help="Output LeRobot dataset root.")
-    parser.add_argument("--output-repo-id", required=True, help="Output LeRobot repo id.")
     parser.add_argument(
         "--features",
         nargs="+",
@@ -53,25 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp-key", default="timestamp")
     parser.add_argument("--min-dt", type=float, default=1e-6, help="Lower bound for timestamp deltas.")
     parser.add_argument("--video-backend", default="torchcodec")
-    parser.add_argument(
-        "--keep-videos",
-        action="store_true",
-        help="Copy video features too. By default this script writes a lowdim-only dataset.",
-    )
-    parser.add_argument("--overwrite", action="store_true", help="Remove output-root before writing.")
-    parser.add_argument("--max-episodes", type=int, default=None)
     return parser.parse_args()
-
-
-def filter_supported_kwargs(callable_obj: Any, kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError):
-        return dict(kwargs)
-
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
-        return dict(kwargs)
-    return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
 def feature_to_plain_dict(feature: Any) -> dict[str, Any]:
@@ -84,13 +52,7 @@ def feature_to_plain_dict(feature: Any) -> dict[str, Any]:
     raise TypeError(f"Unsupported feature spec type: {type(feature).__name__}")
 
 
-def is_video_feature(feature: Any) -> bool:
-    spec = feature_to_plain_dict(feature)
-    dtype = str(spec.get("dtype", "")).lower()
-    return dtype in {"video", "image"}
-
-
-def source_features_for_create(
+def added_feature_specs(
     source_dataset: Any,
     *,
     selected_features: set[str],
@@ -99,16 +61,8 @@ def source_features_for_create(
     ee_pose_key: str,
     ee_velocity_key: str,
     ee_acceleration_key: str,
-    keep_videos: bool,
 ) -> dict[str, Any]:
     features = {}
-    for key, spec in source_dataset.features.items():
-        if key in DEFAULT_FEATURE_KEYS:
-            continue
-        if not keep_videos and is_video_feature(spec):
-            continue
-        features[key] = feature_to_plain_dict(spec)
-
     if "acceleration" in selected_features:
         features[acceleration_key] = derivative_feature_spec(source_dataset, velocity_key)
     if "ee_velocity" in selected_features:
@@ -141,120 +95,6 @@ def ee_twist_feature_spec(source_dataset: Any, source_key: str) -> dict[str, Any
         "dtype": "float32",
         "shape": (6,),
     }
-
-
-def create_dataset(
-    LeRobotDataset: Any,
-    *,
-    repo_id: str,
-    root: Path,
-    fps: int,
-    features: dict[str, Any],
-    use_videos: bool,
-    video_backend: str,
-) -> Any:
-    kwargs = {
-        "repo_id": repo_id,
-        "root": root,
-        "fps": fps,
-        "features": features,
-        "use_videos": use_videos,
-        "video_backend": video_backend,
-    }
-    return LeRobotDataset.create(**filter_supported_kwargs(LeRobotDataset.create, kwargs))
-
-
-def add_frame(dataset: Any, frame: dict[str, Any], task: str) -> None:
-    frame = dict(frame)
-    frame.setdefault("task", task)
-    kwargs = {"frame": frame, "task": task}
-    try:
-        dataset.add_frame(**filter_supported_kwargs(dataset.add_frame, kwargs))
-    except TypeError:
-        dataset.add_frame(frame)
-
-
-def save_episode(dataset: Any, task: str) -> None:
-    kwargs = {"task": task}
-    try:
-        dataset.save_episode(**filter_supported_kwargs(dataset.save_episode, kwargs))
-    except TypeError:
-        dataset.save_episode()
-
-
-def frame_for_output(frame: Mapping[str, Any], output_feature_keys: set[str]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in frame.items()
-        if key not in DEFAULT_FEATURE_KEYS and key in output_feature_keys
-    }
-
-
-def torch_dtype(dtype_name: str) -> Any:
-    import torch
-
-    dtypes = {
-        "float32": torch.float32,
-        "float64": torch.float64,
-        "int8": torch.int8,
-        "int16": torch.int16,
-        "int32": torch.int32,
-        "int64": torch.int64,
-        "uint8": torch.uint8,
-        "bool": torch.bool,
-    }
-    return dtypes.get(str(dtype_name).lower())
-
-
-def coerce_value_to_feature(value: Any, feature: Mapping[str, Any]) -> Any:
-    import torch
-
-    dtype = torch_dtype(str(feature.get("dtype", "")))
-    shape = tuple(feature.get("shape", ()))
-    if dtype is None:
-        return value
-
-    if not torch.is_tensor(value):
-        value = torch.as_tensor(value)
-    value = value.to(dtype=dtype)
-
-    if shape and tuple(value.shape) != shape:
-        if value.numel() != int(torch.tensor(shape).prod().item()):
-            raise ValueError(f"Cannot reshape value from {tuple(value.shape)} to feature shape {shape}.")
-        value = value.reshape(shape)
-
-    return value
-
-
-def coerce_frame_to_features(frame: dict[str, Any], features: Mapping[str, Any]) -> dict[str, Any]:
-    coerced = {}
-    for key, value in frame.items():
-        if key in features:
-            coerced[key] = coerce_value_to_feature(value, features[key])
-        else:
-            coerced[key] = value
-    return coerced
-
-
-def get_task(source_dataset: Any, episode: Mapping[str, Any], fallback: str = "default") -> str:
-    task = episode.get("task")
-    if task is not None:
-        return str(task)
-
-    task_index = episode.get("tasks")
-    if isinstance(task_index, list) and task_index:
-        task_index = task_index[0]
-    if task_index is None:
-        task_index = episode.get("task_index")
-
-    try:
-        tasks = source_dataset.meta.tasks
-        if tasks is not None and task_index is not None:
-            return str(tasks[int(task_index)]["task"])
-    except Exception:
-        pass
-
-    return fallback
 
 
 def compute_acceleration(
@@ -399,61 +239,127 @@ def compute_episode_derivative(values: list[Any], *, timestamps: list[Any], min_
     return derivatives
 
 
-def main() -> None:
-    args = parse_args()
+def data_parquet_files(root: Path) -> list[Path]:
+    files = sorted((root / "data").glob("**/*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No parquet files found under {root / 'data'}")
+    return files
 
-    if args.min_dt <= 0:
-        raise ValueError("--min-dt must be positive.")
-    selected_features = set(args.features)
 
-    if args.output_root.exists():
-        if not args.overwrite:
-            raise FileExistsError(f"output root already exists: {args.output_root}")
-        shutil.rmtree(args.output_root)
+def tensor_to_list(value: Any) -> list[float]:
+    import torch
 
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    if not torch.is_tensor(value):
+        value = torch.as_tensor(value)
+    return value.detach().cpu().to(dtype=torch.float32).reshape(-1).tolist()
 
-    source_dataset = LeRobotDataset(
-        repo_id=args.input_repo_id,
-        root=args.input_root,
-        video_backend=args.video_backend,
-    )
 
-    features = source_features_for_create(
-        source_dataset,
-        selected_features=selected_features,
-        velocity_key=args.velocity_key,
-        acceleration_key=args.acceleration_key,
-        ee_pose_key=args.ee_pose_key,
-        ee_velocity_key=args.ee_velocity_key,
-        ee_acceleration_key=args.ee_acceleration_key,
-        keep_videos=args.keep_videos,
-    )
-    output_feature_keys = set(features.keys())
-    use_videos = args.keep_videos and bool(getattr(source_dataset.meta, "video_keys", []))
-    output_dataset = create_dataset(
-        LeRobotDataset,
-        repo_id=args.output_repo_id,
-        root=args.output_root,
-        fps=int(source_dataset.fps),
-        features=features,
-        use_videos=use_videos,
-        video_backend=args.video_backend,
-    )
+def compute_stats(values: list[Any]) -> dict[str, Any]:
+    import numpy as np
 
-    episodes = list(source_dataset.meta.episodes)
-    if args.max_episodes is not None:
-        episodes = episodes[: args.max_episodes]
+    array = np.asarray([tensor_to_list(value) for value in values], dtype=np.float64)
+    return {
+        "min": array.min(axis=0).tolist(),
+        "max": array.max(axis=0).tolist(),
+        "mean": array.mean(axis=0).tolist(),
+        "std": array.std(axis=0).tolist(),
+        "count": [int(array.shape[0])] * int(array.shape[1]),
+        "q01": np.quantile(array, 0.01, axis=0).tolist(),
+        "q10": np.quantile(array, 0.10, axis=0).tolist(),
+        "q50": np.quantile(array, 0.50, axis=0).tolist(),
+        "q90": np.quantile(array, 0.90, axis=0).tolist(),
+        "q99": np.quantile(array, 0.99, axis=0).tolist(),
+    }
+
+
+def feature_arrow_type(feature: Mapping[str, Any]) -> Any:
+    import pyarrow as pa
+
+    shape = tuple(feature.get("shape", ()))
+    if len(shape) != 1:
+        raise ValueError(f"in-place add_feature only supports 1D lowdim features, got shape={shape}")
+    return pa.list_(pa.float32(), list_size=int(shape[0]))
+
+
+def huggingface_feature_metadata(feature: Mapping[str, Any]) -> dict[str, Any]:
+    shape = tuple(feature.get("shape", ()))
+    if len(shape) != 1:
+        raise ValueError(f"in-place add_feature only supports 1D lowdim features, got shape={shape}")
+    return {
+        "feature": {
+            "dtype": "float32",
+            "_type": "Value",
+        },
+        "length": int(shape[0]),
+        "_type": "Sequence",
+    }
+
+
+def update_huggingface_schema_metadata(table: Any, features: Mapping[str, Mapping[str, Any]]) -> Any:
+    metadata = dict(table.schema.metadata or {})
+    raw = metadata.get(b"huggingface")
+    if raw is None:
+        return table
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        hf_features = payload["info"]["features"]
+    except (KeyError, TypeError, ValueError):
+        return table
+
+    for key, feature in features.items():
+        hf_features[key] = huggingface_feature_metadata(feature)
+
+    metadata[b"huggingface"] = json.dumps(payload).encode("utf-8")
+    return table.replace_schema_metadata(metadata)
+
+
+def replace_or_append_column(table: Any, name: str, array: Any) -> Any:
+    if name in table.column_names:
+        col_idx = table.column_names.index(name)
+        return table.set_column(col_idx, name, array)
+    return table.append_column(name, array)
+
+
+def update_meta_files_in_place(root: Path, features: Mapping[str, Mapping[str, Any]], stats: Mapping[str, Any]) -> None:
+    info_path = root / "meta" / "info.json"
+    stats_path = root / "meta" / "stats.json"
+    if not info_path.exists():
+        raise FileNotFoundError(f"missing {info_path}")
+    if not stats_path.exists():
+        raise FileNotFoundError(f"missing {stats_path}")
+
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info_features = info.setdefault("features", {})
+    for key, feature in features.items():
+        info_features[key] = {
+            "dtype": "float32",
+            "shape": list(feature["shape"]),
+            "names": feature.get("names"),
+        }
+    info_path.write_text(json.dumps(info, ensure_ascii=False, indent=4), encoding="utf-8")
+
+    stats_data = json.loads(stats_path.read_text(encoding="utf-8"))
+    for key, value in stats.items():
+        stats_data[key] = value
+    stats_path.write_text(json.dumps(stats_data, ensure_ascii=False, indent=4), encoding="utf-8")
+
+
+def compute_added_features_by_index(
+    source_dataset: Any,
+    episodes: list[Mapping[str, Any]],
+    selected_features: set[str],
+    args: argparse.Namespace,
+) -> dict[str, list[Any]]:
+    added_keys = computed_key_names(args, selected_features)
+    values_by_key = {key: [None] * len(source_dataset) for key in added_keys}
 
     episode_iter = tqdm(episodes, desc="episodes", unit="episode")
     for episode in episode_iter:
         start = int(episode["dataset_from_index"])
         end = int(episode["dataset_to_index"])
-        task = get_task(source_dataset, episode)
-        source_frames = [
-            source_dataset[raw_idx] if args.keep_videos else source_dataset.hf_dataset[raw_idx]
-            for raw_idx in range(start, end)
-        ]
+        source_frames = [source_dataset.hf_dataset[raw_idx] for raw_idx in range(start, end)]
+
         velocities = []
         ee_poses = []
         timestamps = []
@@ -473,9 +379,6 @@ def main() -> None:
                 ee_poses.append(ee_pose_value(source_frame[args.ee_pose_key]))
             timestamps.append(source_frame[args.timestamp_key])
 
-        # Derivatives are episode-local: each ee_pose/velocity sample is paired
-        # with the timestamp from the same episode row, then differenced in order.
-        # EE velocity is a 6D twist: [vx, vy, vz, wx, wy, wz].
         computed_features: dict[str, list[Any]] = {}
         if "acceleration" in selected_features:
             computed_features[args.acceleration_key] = compute_episode_accelerations(
@@ -498,27 +401,75 @@ def main() -> None:
                     min_dt=args.min_dt,
                 )
 
-        for frame_idx, source_frame in tqdm(
-            enumerate(source_frames),
-            total=len(source_frames),
-            desc=f"frames {start}:{end}",
-            leave=False,
-            unit="frame",
-        ):
-            frame = frame_for_output(source_frame, output_feature_keys)
+        for frame_offset, raw_idx in enumerate(range(start, end)):
             for key, values in computed_features.items():
-                frame[key] = values[frame_idx]
-            frame = coerce_frame_to_features(frame, features)
-            add_frame(output_dataset, frame, task)
+                values_by_key[key][raw_idx] = values[frame_offset]
 
-        save_episode(output_dataset, task)
+    return values_by_key
 
-    print(f"wrote dataset: root={args.output_root} repo_id={args.output_repo_id}")
+
+def run_in_place(source_dataset: Any, features: Mapping[str, Mapping[str, Any]], episodes, args) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    selected_features = set(args.features)
+    values_by_key = compute_added_features_by_index(source_dataset, list(episodes), selected_features, args)
+    stats = {key: compute_stats(values) for key, values in values_by_key.items()}
+
+    for parquet_path in tqdm(data_parquet_files(args.input_root), desc="parquet", unit="file"):
+        table = pq.read_table(parquet_path)
+        if "index" not in table.column_names:
+            raise KeyError(f"'index' column is required for in-place update: {parquet_path}")
+        row_indices = [int(index) for index in table["index"].to_pylist()]
+        updated = table
+
+        for key, feature in features.items():
+            column_values = []
+            for raw_idx in row_indices:
+                value = values_by_key[key][raw_idx]
+                if value is None:
+                    raise ValueError(f"missing computed value for {key} at dataset index {raw_idx}")
+                column_values.append(tensor_to_list(value))
+            array = pa.array(column_values, type=feature_arrow_type(feature))
+            updated = replace_or_append_column(updated, key, array)
+
+        updated = update_huggingface_schema_metadata(updated, features)
+        pq.write_table(updated, parquet_path)
+
+    update_meta_files_in_place(args.input_root, features, stats)
+    print(f"updated dataset in-place: root={args.input_root} repo_id={args.input_repo_id}")
     print(
         "added keys: "
         f"{', '.join(computed_key_names(args, selected_features))}, "
         f"timestamp_key={args.timestamp_key}"
     )
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.min_dt <= 0:
+        raise ValueError("--min-dt must be positive.")
+    selected_features = set(args.features)
+
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    source_dataset = LeRobotDataset(
+        repo_id=args.input_repo_id,
+        root=args.input_root,
+        video_backend=args.video_backend,
+    )
+
+    features = added_feature_specs(
+        source_dataset,
+        selected_features=selected_features,
+        velocity_key=args.velocity_key,
+        acceleration_key=args.acceleration_key,
+        ee_pose_key=args.ee_pose_key,
+        ee_velocity_key=args.ee_velocity_key,
+        ee_acceleration_key=args.ee_acceleration_key,
+    )
+    run_in_place(source_dataset, features, source_dataset.meta.episodes, args)
 
 
 def computed_key_names(args: argparse.Namespace, selected_features: set[str]) -> list[str]:
