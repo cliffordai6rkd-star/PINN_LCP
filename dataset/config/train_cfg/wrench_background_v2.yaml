@@ -4,7 +4,7 @@ dataloader:
   load_images: false
   video_backend: torchcodec
   normalize_mode: limit
-  horizon: 2
+  horizon: 1
   lowdim_keys:
     q: observation.joint                     #q
     v: observation.velocity                  #v
@@ -58,16 +58,16 @@ train:
     patience: 20
     min_lr: 1e-10
 
-  batch_size: 512
+  batch_size: 128
   device: cuda:0
   num_workers: 32
-  val_ratio: 0.1
+  val_ratio: 0.2
   split_mode: sample   # sample(单点) episode
   seed: 42
   lr: 1e-4
   weight_decay: 1e-4
-  num_epochs: 1000
-  output_dir: outputs/wrench_bg/v2/exp4
+  num_epochs: 500
+  output_dir: outputs/wrench_bg/v2/exp6
   monitor_key: val_loss
   top_k: 5
   

@@ -224,10 +224,18 @@ class WrecnhBgInferencer:
 
         names = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 
-        def use_fx_ylim(axes):
-            fx_ylim = axes[0].get_ylim()
-            for axis in axes[1:]:
-                axis.set_ylim(fx_ylim)
+        def use_data_ylim(axes, *arrays):
+            values = torch.cat([array.reshape(-1) for array in arrays])
+            finite_values = values[torch.isfinite(values)]
+            if finite_values.numel() == 0:
+                return
+            max_abs = float(finite_values.abs().max().item())
+            if max_abs <= 0:
+                max_abs = 1.0
+            pad = max_abs * 0.05
+            ylim = (-max_abs - pad, max_abs + pad)
+            for axis in axes:
+                axis.set_ylim(ylim)
 
         # 图 1：lambda 单独曲线
         fig, axes = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
@@ -238,7 +246,7 @@ class WrecnhBgInferencer:
             axes[i].grid(True)
             axes[i].legend(loc="upper right")
 
-        use_fx_ylim(axes)
+        use_data_ylim(axes, lam_last)
         axes[-1].set_xlabel("frame")
         fig.tight_layout()
 
@@ -257,7 +265,7 @@ class WrecnhBgInferencer:
             axes[i].grid(True)
             axes[i].legend(loc="upper right")
 
-        use_fx_ylim(axes)
+        use_data_ylim(axes, raw_last, bg_last, lam_last)
         axes[-1].set_xlabel("frame")
         fig.tight_layout()
 

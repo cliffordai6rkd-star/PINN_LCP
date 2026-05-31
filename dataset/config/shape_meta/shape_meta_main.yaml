@@ -6,9 +6,9 @@ io:
   no_videos: false
   push_to_hub: false
 
-fps: 30
+fps: 120
 task: wipe_board
-master_timestamp_path: cameras/wrist/timestamp_us
+master_timestamp_path: teleop/timestamp_us
 
 
 # index:直接拿
@@ -68,11 +68,12 @@ features:
 
   observation.ft_window:
     dtype: float32
-    shape: [4, 6]
+    shape: [6]
     h5_path: force_sensor/wrench_filtered
     timestamp_path: force_sensor/timestamp_us
-    align: nearest_past_window
-    window_size: 4
+    align: nearest
+    # align: nearest_past_window
+    # window_size: 4
 
   observation.torque:
     dtype: float32
