@@ -11,7 +11,7 @@ class PINN_v1(nn.Module):
         self,
         q_dim: int = 7,
         v_dim: int = 7,
-        u_dim: int = 14,
+        tau_dim: int = 7,
         hidden_dim: int = 256,
         num_res_blocks: int = 4,
         block_depth: int = 2,
