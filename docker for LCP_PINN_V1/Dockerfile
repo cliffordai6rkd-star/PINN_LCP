@@ -7,8 +7,23 @@ ARG USER_GID=1000
 USER root
 
 RUN apt-get update && \
-    apt-get install -y python3-tk && \
+    apt-get install -y \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        python3-tk && \
     rm -rf /var/lib/apt/lists/*
+
+RUN /opt/venv/bin/python -m pip install --no-cache-dir \
+    pyrealsense2 \
+    opencv-python \
+    numpy \
+    "huggingface-hub[cli,hf-transfer]>=0.34.2,<0.36.0" \
+    "fsspec[http]>=2023.1.0,<=2025.3.0" \
+    "packaging>=24.2,<26.0" \
+    ultralytics \
+    open3d \
+    git+https://github.com/ultralytics/CLIP.git
 
 # 准备一个和宿主机 UID/GID 对齐的运行环境。
 # 基础镜像里可能已经有 UID=1000 的用户（例如 trainer），这种情况下不再强行创建同 UID 用户。
