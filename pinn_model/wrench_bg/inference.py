@@ -6,9 +6,9 @@ import argparse
 import copy
 
 from pathlib import Path
-from wrench_bg.wrench_background_v2 import Wrench_Background_V2
-from dataset.dataloader import PINNDataset
-from dataset.nomalizer import Normalizer
+from pinn_model.wrench_bg.wrench_background_v2 import Wrench_Background_V2
+from data_process.dataloader import PINNDataset
+from train.nomalizer import Normalizer
 
 
 logging.basicConfig(level=logging.INFO)

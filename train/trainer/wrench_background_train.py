@@ -7,7 +7,7 @@ import yaml
 from pathlib import Path
 from dataset.dataloader import PINNDataset
 from base_trainer import BaseTrainer
-from wrench_bg.wrench_background_v2 import Wrench_Background_V2
+from pinn_model.wrench_bg.wrench_background_v2 import Wrench_Background_V2
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -33,8 +33,9 @@ class WrenchBgTrainer(BaseTrainer):
          return Wrench_Background_V2(self.config)
 
     def compute_loss(self, batch):  
+      
         out = self.model(batch)
-        loss = F.mse_loss(out["wrench_pred"], out["wrench_target"])
+        loss = F.mseloss(out(batch["wrench_pred"]),out(batch["wrench_target"]))
         return loss, out
     
 

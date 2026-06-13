@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 from pathlib import Path
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from dataset.nomalizer import Normalizer
+from train.nomalizer import Normalizer
 
 def parse_args():
     parser = argparse.ArgumentParser(

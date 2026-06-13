@@ -29,7 +29,7 @@ class Fhead_transformerv1(nn.Module):
         self.hidden_dim = int(self.train_config.get("hidden_dim", 256))
 
         # 将历史状态观测投影到隐藏层
-        self.fram_dim = self.frame_dim = self.q_dim + self.v_dim + self.a_dim + self.tau_dim
+        self.fram_dim = self.q_dim + self.v_dim + self.a_dim + self.tau_dim
         self.history_proj = nn.Linear(self.frame_dim, self.hidden_dim)
 
         self.future_query = nn.Parameter(torch.zeros(1, self.future_horizon, self.hidden_dim))
