@@ -34,7 +34,7 @@ class MujocoSim_interface_fr3:
 
     # Load .urdf or .xml.
     def load_model(self):
-        log.info(f"loading model from {self.model_path}")
+        # log.info(f"loading model from {self.model_path}")
         self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
         self.data = mujoco.MjData(self.model)
         return self.model, self.data
@@ -129,20 +129,43 @@ class MujocoSim_interface_fr3:
 
         mujoco.mj_forward(self.model, self.data)
 
-    def play_joint_sequence(self, q_seq, dt):
+
+    def play_joint_sequences(self, all_q_seqs, dt):
         self.ensure_loaded()
 
-        with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
-            for q in q_seq:
-                # if not viewer.is_running():
-                #     break
+        go_next = {"value": False}
 
-                self.set_joint_positions(q)
-                viewer.sync()
-                if self.quick_replay is False:
-                    time.sleep(dt)
+        def key_callback(keycode):
+            if keycode in (257, 335):
+                go_next["value"] = True
 
-    
+        with mujoco.viewer.launch_passive(
+            self.model,
+            self.data,
+            key_callback=key_callback,
+        ) as viewer:
+            for ep_idx, q_seq in enumerate(all_q_seqs):
+                if not viewer.is_running():
+                    break
+
+                log.info(f"playing episode {ep_idx}")
+
+                # 播放当前 episode
+                for q in q_seq:
+                    if not viewer.is_running():
+                        break
+
+                    self.set_joint_positions(q)
+                    viewer.sync()
+
+                    if self.quick_replay is False:
+                        time.sleep(dt)
+                log.info(f"press enter to continue")
+                    # 停在当前 episode 最后一帧，等待按 n
+                go_next["value"] = False
+                while viewer.is_running() and not go_next["value"]:
+                    viewer.sync()
+                    time.sleep(0.02)
 
 
 
