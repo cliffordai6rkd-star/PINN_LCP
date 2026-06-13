@@ -33,5 +33,5 @@ class PinnV1_trainer(BaseTrainer):
 
     def compute_loss(self, batch):  
         out = self.model(batch)
-        loss = F.mse_loss(out["wrench_pred"], out["wrench_target"])
+        loss = loss_compute()
         return loss, out

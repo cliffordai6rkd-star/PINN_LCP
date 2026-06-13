@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from pinn.lowdim_encoder import MLPBlock, ResidualMLPBlock
 
 
-# 输入为长度horizon的qk, vk, ak, tauk  输出F_k+1
+# 输入为长度horizon的qk, vk, ak, tauk  输出F_k+1  decoder_only
 
 class Fhead_transformerv1(nn.Module):
     def __init__(self, config):
@@ -14,6 +14,7 @@ class Fhead_transformerv1(nn.Module):
         self.train_config = config.get("train") or {}
         self.model_config = config.get("model") or {}
 
+        self.activation = self.train_config.get("activation", "gelu")
         # H
         self.history_horizon = int(self.data_config.get("history_horizon",  8))
         # F
@@ -39,7 +40,7 @@ class Fhead_transformerv1(nn.Module):
             nhead=int(self.train_config.get("nhead", 4)),
             dim_feedforward=self.hidden_dim * 4,
             dropout=float(self.train_config.get("dropout", 1e-3)),
-            activation="gelu",
+            activation=self.activation,
             batch_first=True,
             norm_first=True,
         )
@@ -88,7 +89,7 @@ class Fhead_transformerv1(nn.Module):
 
         return {
             "wrench_pred": wrench_pred,
-            "future_z": future_z,
+            # "future_z": future_z,
         }
     
 if __name__ == "__main__":
