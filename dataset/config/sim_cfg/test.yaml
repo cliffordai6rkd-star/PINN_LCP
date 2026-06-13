@@ -1,0 +1,18 @@
+
+model_path: sim_mesh/franka_fr3/fr3_pika_gripper_ati.urdf
+# model_path: sim_mesh/franka_fr3/fr3_pika_ati_torque.xml
+# model_path: sim_mesh/scene/fr3_pika_gripper_ati_world.xml
+output_path: sim_mesh/franka_fr3/mjcf/fr3_pika_gripper_ati.compiled.xml
+print_info: false
+save_mjcf: false
+show_sim: true
+quick_replay: false
+
+# q: [0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785]
+q: [0.0, -0.185, 0.0, -2.355, 0.0, 1.57079, 0.785]
+
+root: data/train_episode/wrench_background/wrench_bg_lerobotv3_
+repo_id: wrench_bg_lerobotv3_
+video_backend: torchcodec
+episode_index: 1
+q_key: observation.joint

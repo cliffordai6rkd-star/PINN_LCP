@@ -75,7 +75,7 @@ class PINNDataset(torch.utils.data.Dataset):
 
         self.normalize_lowdim_keys = self.data_config.get("normalize_lowdim_keys",None)
         if self.normalize_lowdim_keys is None:
-            raise ValueError(f"miss normalize lowdim keys")
+            self.normalize_lowdim_keys = []
         self.lowdim_keys = self.data_config.get("lowdim_keys", {})
         if self.load_image:
             self.image_keys = self.data_config.get("image_keys", {})

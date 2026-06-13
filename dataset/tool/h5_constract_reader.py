@@ -65,7 +65,7 @@ class H5Dataset:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Print the structure of H5/HDF5 episode files.")
     parser.add_argument(
-        "input_path",
+        "--input_path",
         nargs="?",
         type=Path,
         default=Path("data/train_episode/wipe_board/wipe_board"),

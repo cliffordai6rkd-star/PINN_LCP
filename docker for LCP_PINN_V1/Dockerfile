@@ -9,8 +9,17 @@ USER root
 RUN apt-get update && \
     apt-get install -y \
         git \
+        libegl1 \
         libgl1 \
+        libglfw3 \
         libglib2.0-0 \
+        libosmesa6 \
+        libx11-6 \
+        libxcursor1 \
+        libxext6 \
+        libxinerama1 \
+        libxi6 \
+        libxrandr2 \
         python3-tk && \
     rm -rf /var/lib/apt/lists/*
 
@@ -24,6 +33,13 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir \
     ultralytics \
     open3d \
     git+https://github.com/ultralytics/CLIP.git
+
+RUN /opt/venv/bin/python -m pip install --no-cache-dir \
+    "mujoco>=3.1.3,<3.4.0" \
+    "cmeel-tinyxml2==10.0.0" \
+    "cmeel-urdfdom==4.0.1" \
+    "libpinocchio==3.9.0" \
+    "pin==3.9.0"
 
 # 准备一个和宿主机 UID/GID 对齐的运行环境。
 # 基础镜像里可能已经有 UID=1000 的用户（例如 trainer），这种情况下不再强行创建同 UID 用户。
@@ -42,10 +58,14 @@ RUN set -eux; \
     else \
         useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash "${USERNAME}"; \
     fi; \
-    mkdir -p "/home/${USERNAME}" /workspace; \
+    mkdir -p "/home/${USERNAME}" /workspace /tmp/matplotlib; \
+    chmod 1777 /tmp/matplotlib; \
     chown -R "${USER_UID}:${USER_GID}" "/home/${USERNAME}" /workspace
 
 ENV HOME=/home/${USERNAME}
+ENV MPLCONFIGDIR=/tmp/matplotlib
+ENV CMAKE_PREFIX_PATH=/opt/venv/lib/python3.10/site-packages/cmeel.prefix
+ENV LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/cmeel.prefix/lib
 WORKDIR /workspace
 
 USER ${USER_UID}:${USER_GID}

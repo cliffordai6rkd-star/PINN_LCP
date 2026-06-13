@@ -40,13 +40,13 @@ dataloader:
     - q 
     - v
     - a
-    - ee_pose 
-    - ee_acceleration
-    - ee_velocity
+    # - ee_pose 
+    # - ee_acceleration
+    # - ee_velocity
     - wrench
-
   history_horizon: 8
   future_horizon: 8
+  
 model:
   q_dim: 7
   v_dim: 7

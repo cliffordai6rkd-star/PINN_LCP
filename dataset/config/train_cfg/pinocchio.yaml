@@ -1,0 +1,71 @@
+dataloader:
+  repo_id: wipe_board_lerobotv3
+  root: data/train_episode/wipe_board/wipe_board_lerobotv3
+  load_images: false
+  video_backend: torchcodec
+  normalize_mode: null
+  horizon: 1
+  lowdim_keys:
+    q: observation.joint                     #q
+    v: observation.velocity                  #v
+    a: observation.acceleration
+    tau: observation.torque
+    # ee_velocity: observation.ee_velocity
+    # ee_acceleration: observation.ee_acceleration
+    # ee_pose: action.ee_pose                  #u             
+    wrench: observation.ft_window            #lambda
+  # image_keys:
+  #   wrist: observation.images.wrist
+  #   side_1: observation.images.side_1p
+  #   side_2: observation.images.side_2
+  normalize_lowdim_keys:
+    # - q
+    # - v
+    # - a
+    # - wrench
+
+model:
+  input_dims:
+    q: 7
+    v: 7
+    a: 7
+    ee_pose: 7
+    ee_acceleration: 6
+    ee_velocity: 6
+  static_inputs:
+    - q
+    - ee_pose
+  dynamic_inputs:
+    - q
+    - ee_pose
+    - v
+    - a
+    - ee_acceleration
+    - ee_velocity
+train:
+  hidden_dim: 256
+  activation: silu
+  use_norm: True
+  dropout: 1e-3
+  static_num_res_blocks: 3
+  dynamic_num_res_blocks: 5
+
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 20
+    min_lr: 1e-10
+
+  batch_size: 512
+  device: cuda:0
+  num_workers: 32
+  val_ratio: 0.2
+  split_mode: sample   # sample(单点) episode
+  seed: 42
+  lr: 1e-4
+  weight_decay: 1e-4
+  num_epochs: 1000
+  output_dir: outputs/wrench_bg/v2/h3_2
+  monitor_key: val_loss
+  top_k: 5
+  
