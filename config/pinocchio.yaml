@@ -18,7 +18,7 @@ dataloader:
   #   wrist: observation.images.wrist
   #   side_1: observation.images.side_1p
   #   side_2: observation.images.side_2
-  normalize_lowdim_keys:
+  # normalize_lowdim_keys:
     # - q
     # - v
     # - a

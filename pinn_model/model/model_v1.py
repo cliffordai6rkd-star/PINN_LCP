@@ -24,12 +24,13 @@ class Fhead_transformerv1(nn.Module):
         self.v_dim = int(self.model_config.get("v_dim", 7))
         self.a_dim = int(self.model_config.get("a_dim", 7))
         self.tau_dim = int(self.model_config.get("tau_dim", 7))
+        self.ee_pose_dim = int(self.model_config.get("ee_pose_dim", 7))
         self.wrench_dim = int(self.model_config.get("wrench_dim", 6))
 
         self.hidden_dim = int(self.train_config.get("hidden_dim", 256))
 
         # 将历史状态观测投影到隐藏层
-        self.fram_dim = self.q_dim + self.v_dim + self.a_dim + self.tau_dim
+        self.fram_dim = self.q_dim + self.v_dim + self.a_dim + self.tau_dim + self.ee_pose_dim
         self.history_proj = nn.Linear(self.frame_dim, self.hidden_dim)
 
         self.future_query = nn.Parameter(torch.zeros(1, self.future_horizon, self.hidden_dim))
@@ -37,8 +38,8 @@ class Fhead_transformerv1(nn.Module):
 
         layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
-            nhead=int(self.train_config.get("nhead", 4)),
-            dim_feedforward=self.hidden_dim * 4,
+            nhead=int(self.train_config.get("nhead", 5)),
+            dim_feedforward=self.hidden_dim * 5,
             dropout=float(self.train_config.get("dropout", 1e-3)),
             activation=self.activation,
             batch_first=True,
@@ -72,7 +73,7 @@ class Fhead_transformerv1(nn.Module):
         future_tokens = self.future_query.expand(B, -1, -1)
 
         tokens = torch.cat([history_tokens, future_tokens], dim=1)
-        tokens = tokens + self.pos_embed[:, :tokens.shape[1], :] # 兼容token长度变化：后面再发生拼接操作
+        tokens = tokens + self.pos_embed[:, :tokens.shape[1], :] # 兼容token长度变化：后面可能引入新的feature发生拼接操作
 
         # causal mask
         T = tokens.shape[1]
@@ -89,7 +90,6 @@ class Fhead_transformerv1(nn.Module):
 
         return {
             "wrench_pred": wrench_pred,
-            # "future_z": future_z,
         }
     
 if __name__ == "__main__":
