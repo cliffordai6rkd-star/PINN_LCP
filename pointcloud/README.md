@@ -12,7 +12,7 @@ RGB 图像 + 对齐后的 depth_meters.npy + RealSense metadata
 先检查脚本参数：
 
 ```bash
-python sam3_pointcloud/single_frame_reconstruct.py --help
+python pointcloud/single_frame_reconstruct.py --help
 ```
 
 ## 0. 安装依赖与下载 SAM3 权重
@@ -124,7 +124,7 @@ hf download facebook/sam3 sam3.pt --local-dir weights
 之后脚本中使用：
 
 ```bash
-python sam3_pointcloud/single_frame_reconstruct.py \
+python pointcloud/single_frame_reconstruct.py \
   --sam-model weights/sam3.pt \
   --box 100 120 420 460
 ```
@@ -198,7 +198,7 @@ docker exec -it st-pinn /opt/venv/bin/python -m pip check
 如果当前环境还没有装 SAM3，建议先传入已有 mask，验证 depth 反投影和点云保存是否正确：
 
 ```bash
-python sam3_pointcloud/single_frame_reconstruct.py \
+python pointcloud/single_frame_reconstruct.py \
   --rgb outputs/realsense_rgbd/frame_000000_rgb.png \
   --depth-meters outputs/realsense_rgbd/frame_000000_depth_meters.npy \
   --metadata outputs/realsense_rgbd/frame_000000_metadata.json \
@@ -212,7 +212,7 @@ python sam3_pointcloud/single_frame_reconstruct.py \
 如果容器里已经安装了支持 SAM3 的 `ultralytics`，可以用 box prompt：
 
 ```bash
-python sam3_pointcloud/single_frame_reconstruct.py \
+python pointcloud/single_frame_reconstruct.py \
   --box 100 120 420 460
 ```
 
@@ -225,7 +225,7 @@ x1 y1 x2 y2
 也可以用 point prompt：
 
 ```bash
-python sam3_pointcloud/single_frame_reconstruct.py \
+python pointcloud/single_frame_reconstruct.py \
   --point 320 240
 ```
 
@@ -234,7 +234,7 @@ python sam3_pointcloud/single_frame_reconstruct.py \
 如果安装的 `ultralytics` 版本支持 SAM3 concept segmentation，可以用文本 prompt：
 
 ```bash
-python sam3_pointcloud/single_frame_reconstruct.py \
+python pointcloud/single_frame_reconstruct.py \
   --prompt "the object"
 ```
 
@@ -245,7 +245,7 @@ python sam3_pointcloud/single_frame_reconstruct.py \
 默认输出目录：
 
 ```text
-outputs/sam3_pointcloud_single_frame/
+outputs/pointcloud_single_frame/
 ```
 
 里面会生成：
@@ -263,7 +263,7 @@ unsigned_sdf_grid.npz     # 只有加 --sdf-grid 时才会生成
 如果你有一个工具点或末端点在 RealSense 相机坐标系下的位置，可以传入：
 
 ```bash
-python sam3_pointcloud/single_frame_reconstruct.py \
+python pointcloud/single_frame_reconstruct.py \
   --mask path/to/mask.png \
   --query-point-camera 0.0 0.0 0.5
 ```

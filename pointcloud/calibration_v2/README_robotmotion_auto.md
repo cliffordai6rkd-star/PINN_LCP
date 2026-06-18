@@ -1,6 +1,6 @@
 # Calibration V2 RobotMotion Auto Guide
 
-本文档说明 `calibration/calibration_v2` 下基于 `RobotMotion` 的 AprilTag 自动采集和手眼标定流程。
+本文档说明 `pointcloud/calibration_v2` 下基于 `RobotMotion` 的 AprilTag 自动采集和手眼标定流程。
 
 ## 文件
 
@@ -87,7 +87,7 @@ robot:
 编辑:
 
 ```bash
-calibration/calibration_v2/robotmotion_auto_config.yaml
+pointcloud/calibration_v2/robotmotion_auto_config.yaml
 ```
 
 关键字段:
@@ -149,20 +149,20 @@ python3 -m pip install pupil-apriltags
 在仓库根目录执行:
 
 ```bash
-python3 calibration/calibration_v2/data_recording_robotmotion_auto.py
+python3 pointcloud/calibration_v2/data_recording_robotmotion_auto.py
 ```
 
 如果要指定另一份配置:
 
 ```bash
-python3 calibration/calibration_v2/data_recording_robotmotion_auto.py \
-  --config calibration/calibration_v2/robotmotion_auto_config.yaml
+python3 pointcloud/calibration_v2/data_recording_robotmotion_auto.py \
+  --config pointcloud/calibration_v2/robotmotion_auto_config.yaml
 ```
 
 采集输出默认保存到:
 
 ```text
-calibration/calibration_v2/robotmotion_runs/<timestamp>/
+pointcloud/calibration_v2/robotmotion_runs/<timestamp>/
 ```
 
 目录内会包含:
@@ -183,8 +183,8 @@ motion_config_without_gripper.yaml
 采集完成后执行:
 
 ```bash
-python3 calibration/calibration_v2/calibration.py \
-  --data calibration/calibration_v2/robotmotion_runs/<timestamp>/data_<camera_name>.json
+python3 pointcloud/calibration_v2/calibration.py \
+  --data pointcloud/calibration_v2/robotmotion_runs/<timestamp>/data_<camera_name>.json
 ```
 
 求解脚本会优先读取 JSON 里的 `metadata.cali_type`。
@@ -192,16 +192,16 @@ python3 calibration/calibration_v2/calibration.py \
 也可以手动覆盖:
 
 ```bash
-python3 calibration/calibration_v2/calibration.py \
-  --data calibration/calibration_v2/robotmotion_runs/<timestamp>/data_third_person_cam.json \
+python3 pointcloud/calibration_v2/calibration.py \
+  --data pointcloud/calibration_v2/robotmotion_runs/<timestamp>/data_third_person_cam.json \
   --cali-type eye_to_hand
 ```
 
 或:
 
 ```bash
-python3 calibration/calibration_v2/calibration.py \
-  --data calibration/calibration_v2/robotmotion_runs/<timestamp>/data_ee_cam.json \
+python3 pointcloud/calibration_v2/calibration.py \
+  --data pointcloud/calibration_v2/robotmotion_runs/<timestamp>/data_ee_cam.json \
   --cali-type eye_in_hand
 ```
 

@@ -10,7 +10,7 @@ from typing import Any
 
 
 DEFAULT_DATASET = Path("data/train_episode/Ft_test_data")
-DEFAULT_CALIBRATION = Path("calibration_v2/camera_extrinsics.json")
+DEFAULT_CALIBRATION = Path("pointcloud/calibration_v2/camera_extrinsics.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
         "--calibration",
         type=Path,
         default=DEFAULT_CALIBRATION,
-        help="JSON produced by calibration_v2/export_camera_extrinsics.py.",
+        help="JSON produced by pointcloud/calibration_v2/export_camera_extrinsics.py.",
     )
     parser.add_argument(
         "--input-json",
@@ -320,7 +320,8 @@ def main() -> None:
         raise FileNotFoundError(f"Input episode JSON not found: {input_path}")
     if not calibration_path.exists():
         raise FileNotFoundError(
-            f"Calibration JSON not found: {calibration_path}. Run calibration_v2/export_camera_extrinsics.py first."
+            f"Calibration JSON not found: {calibration_path}. "
+            "Run pointcloud/calibration_v2/export_camera_extrinsics.py first."
         )
 
     episode = read_json(input_path)
@@ -355,7 +356,7 @@ def main() -> None:
     episode["pointcloud_reconstruction"] = {
         "schema_version": "1.0",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "created_by": "data_process/tool/add_rgbd_extrinsics.py",
+        "created_by": "pointcloud/tools/add_rgbd_extrinsics.py",
         "source_episode_json": input_path.as_posix(),
         "source_calibration_json": calibration_path.as_posix(),
         "world_frame": "robot_base",

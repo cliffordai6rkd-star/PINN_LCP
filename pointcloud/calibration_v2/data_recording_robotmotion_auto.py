@@ -26,7 +26,7 @@ from factory.tasks.robot_motion import RobotMotion
 from hardware.base.utils import convert_7D_2_homo, dynamic_load_yaml
 
 
-DEFAULT_CONFIG_PATH = "calibration/calibration_v2/robotmotion_auto_config.yaml"
+DEFAULT_CONFIG_PATH = "pointcloud/calibration_v2/robotmotion_auto_config.yaml"
 DEFAULT_CONFIG = {
     "robot": {
         "motion_config": "factory/components/motion_configs/left_fr3_with_pika_ati_ik.yaml",
@@ -136,7 +136,7 @@ def resolve_repo_path(path_like: str | Path) -> Path:
 def make_output_dir(output_dir: Optional[str]) -> Path:
     if output_dir is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = f"calibration/calibration_v2/robotmotion_runs/{stamp}"
+        output_dir = f"pointcloud/calibration_v2/robotmotion_runs/{stamp}"
     path = resolve_repo_path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
     (path / "images").mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-motion_config: !include calibration/calibration_v2/ee_cam_d435/motion_config_without_gripper.yaml
+motion_config: !include pointcloud/calibration_v2/third_person_cam_d455/motion_config_without_gripper.yaml
 data_collection:
   save_path_prefix: calibration_v2_robotmotion_auto
   data_record_frequency: 30

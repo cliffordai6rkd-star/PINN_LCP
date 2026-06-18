@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
-  "created_at_utc": "2026-06-18T07:43:49.775910+00:00",
-  "created_by": "calibration_v2/export_camera_extrinsics.py",
+  "created_at_utc": "2026-06-18T15:31:31.552299+00:00",
+  "created_by": "pointcloud/calibration_v2/export_camera_extrinsics.py",
   "opencv_hand_eye_method": "tsai",
   "frame_convention": {
     "robot_base": "Franka/base frame used by calibration robot pose matrices",
@@ -19,20 +19,20 @@
         [
           0.021354949845769466,
           -0.7119510224237396,
-          0.701904343758376,
+          0.7019043437583761,
           -0.1512741222660403
         ],
         [
           0.9994694519800328,
-          -0.002066764856972325,
-          -0.03250450802210314,
-          -0.007012139261442361
+          -0.002066764856972547,
+          -0.03250450802210331,
+          -0.007012139261442403
         ],
         [
-          0.024592288950353036,
-          0.702226081937162,
-          0.7115291625586155,
-          -0.15004633795435074
+          0.024592288950353203,
+          0.7022260819371622,
+          0.7115291625586153,
+          -0.15004633795435068
         ],
         [
           0.0,
@@ -56,25 +56,25 @@
           0.0
         ]
       },
-      "source_json": "calibration_v2/ee_cam_d435/data_ee_cam.json",
+      "source_json": "pointcloud/calibration_v2/ee_cam_d435/data_ee_cam.json",
       "num_samples": 47,
       "verification": {
         "samples": 47,
-        "mean_position_error_m": 0.014791414550464132,
-        "max_position_error_m": 0.02311390669497321,
-        "mean_position_error_mm": 14.791414550464133,
-        "max_position_error_mm": 23.11390669497321,
-        "mean_rotation_error_deg": 0.40108990724029286,
+        "mean_position_error_m": 0.014791414550464158,
+        "max_position_error_m": 0.023113906694973194,
+        "mean_position_error_mm": 14.791414550464157,
+        "max_position_error_mm": 23.113906694973192,
+        "mean_rotation_error_deg": 0.4010899072387461,
         "max_rotation_error_deg": 1.1249072812819216,
         "translation_mean_m": [
-          0.5222094482630641,
-          0.022766612946793413,
-          -0.02953849052748758
+          0.5222094482630643,
+          0.022766612946793528,
+          -0.02953849052748754
         ],
         "translation_std_m": [
-          0.007546456457520125,
-          0.006481530166327587,
-          0.004989602670271143
+          0.007546456457520124,
+          0.0064815301663275855,
+          0.0049896026702711494
         ],
         "constant_transform_checked": "T_base_tag"
       }
@@ -86,22 +86,22 @@
       "transform_name": "T_base_camera",
       "T_base_camera": [
         [
-          -0.02656043441326461,
+          -0.026560434413265055,
           0.39525979523972143,
           -0.9181852958912118,
-          1.3175535886812764
+          1.3175535886812766
         ],
         [
           0.9994751291858697,
           0.027542225987078117,
-          -0.017055554126612193,
-          0.06165917818942767
+          -0.01705555412661236,
+          0.06165917818942811
         ],
         [
-          0.018547492085663086,
+          0.018547492085663253,
           -0.9181563701541966,
           -0.3957838683961261,
-          0.6752037874092603
+          0.6752037874092608
         ],
         [
           0.0,
@@ -125,25 +125,25 @@
           -0.019877292215824127
         ]
       },
-      "source_json": "calibration_v2/third_person_cam_d455/data_third_person_cam.json",
+      "source_json": "pointcloud/calibration_v2/third_person_cam_d455/data_third_person_cam.json",
       "num_samples": 48,
       "verification": {
         "samples": 48,
-        "mean_position_error_m": 0.017137618819173847,
-        "max_position_error_m": 0.026514819284467115,
-        "mean_position_error_mm": 17.13761881917385,
-        "max_position_error_mm": 26.514819284467116,
-        "mean_rotation_error_deg": 0.8841074492908808,
+        "mean_position_error_m": 0.01713761881917382,
+        "max_position_error_m": 0.026514819284467313,
+        "mean_position_error_mm": 17.13761881917382,
+        "max_position_error_mm": 26.51481928446731,
+        "mean_rotation_error_deg": 0.8841074492908293,
         "max_rotation_error_deg": 1.806817728672587,
         "translation_mean_m": [
-          0.08672742856336335,
-          -0.021412877813786767,
-          -0.38310772222096096
+          0.08672742856336346,
+          -0.02141287781378717,
+          -0.3831077222209613
         ],
         "translation_std_m": [
-          0.00794198849675939,
-          0.007882605222663283,
-          0.00611599357318493
+          0.007941988496759401,
+          0.00788260522266329,
+          0.006115993573184946
         ],
         "constant_transform_checked": "T_ee_tag"
       }

@@ -10,27 +10,27 @@ from typing import Any
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Solve calibration_v2 AprilTag hand-eye datasets and export a single "
+            "Solve pointcloud/calibration_v2 AprilTag hand-eye datasets and export a single "
             "camera-extrinsics JSON for RGB-D point-cloud reconstruction."
         )
     )
     parser.add_argument(
         "--ee-calibration",
         type=Path,
-        default=Path("calibration_v2/ee_cam_d435/data_ee_cam.json"),
+        default=Path("pointcloud/calibration_v2/ee_cam_d435/data_ee_cam.json"),
         help="Eye-in-hand calibration JSON for the wrist camera.",
     )
     parser.add_argument(
         "--third-person-calibration",
         type=Path,
-        default=Path("calibration_v2/third_person_cam_d455/data_third_person_cam.json"),
+        default=Path("pointcloud/calibration_v2/third_person_cam_d455/data_third_person_cam.json"),
         help="Eye-to-hand calibration JSON for the fixed third-person camera.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("calibration_v2/camera_extrinsics.json"),
-        help="Output JSON path consumed by data_process/tool/add_rgbd_extrinsics.py.",
+        default=Path("pointcloud/calibration_v2/camera_extrinsics.json"),
+        help="Output JSON path consumed by pointcloud/tools/add_rgbd_extrinsics.py.",
     )
     parser.add_argument(
         "--method",
@@ -281,7 +281,7 @@ def main() -> None:
     payload = {
         "schema_version": "1.0",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "created_by": "calibration_v2/export_camera_extrinsics.py",
+        "created_by": "pointcloud/calibration_v2/export_camera_extrinsics.py",
         "opencv_hand_eye_method": args.method,
         "frame_convention": {
             "robot_base": "Franka/base frame used by calibration robot pose matrices",

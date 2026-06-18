@@ -69,8 +69,8 @@ collection:
   stop_key: "q"
 
 output:
-  # null creates calibration/calibration_v2/robotmotion_runs/<timestamp>/
-  dir: calibration/calibration_v2/third_person_cam_d455/
+  # null creates pointcloud/calibration_v2/robotmotion_runs/<timestamp>/
+  dir: pointcloud/calibration_v2/third_person_cam_d455/
 
   # null writes data_<camera_name>.json.
   json_name: null
