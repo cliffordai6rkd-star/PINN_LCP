@@ -59,7 +59,7 @@ A 按钮    -> 末端向下
 右摇杆 Y  -> 末端 pitch
 RT/R2     -> 按一次切换夹爪开/闭
 O 键      -> 复位机器人和遥操 target 到 q_reset
-LT + A    -> 复位机器人和遥操 target 到 q_reset
+LT        -> 复位机器人和遥操 target 到 q_reset
 ```
 
 注意：`O` 复位是键盘输入，需要 MuJoCo viewer 窗口获得焦点。先点击 viewer 窗口，再按 `O`。
@@ -156,6 +156,10 @@ teleop_gripper_closed_q: [0.0, 0.0]
 teleop_gripper_initial_closed: false
 teleop_gripper_toggle_threshold: 0.5
 teleop_reset_combo_threshold: 0.5
+teleop_reset_requires_a: false
+teleop_reset_hold_steps: 20
+teleop_reset_joint_speed: 0.8
+teleop_reset_position_tolerance: 0.01
 ```
 
 含义：
@@ -170,7 +174,11 @@ teleop_reset_combo_threshold: 0.5
 - `teleop_gripper_*_q`：Pinocchio IK 内部同步的夹爪关节状态。
 - `teleop_gripper_initial_closed`：启动时夹爪 toggle 状态是否为闭合。
 - `teleop_gripper_toggle_threshold`：RT/R2 大于该值时认为“按下”。
-- `teleop_reset_combo_threshold`：LT 大于该值且 A 被按下时触发复位。
+- `teleop_reset_combo_threshold`：LT 大于该值时触发复位。
+- `teleop_reset_requires_a`：设为 `true` 时，需要 LT + A 才复位；默认 `false`，LT 单独复位。
+- `teleop_reset_joint_speed`：复位时每个关节向 `q_reset` 回去的最大速度，单位约 rad/s。
+- `teleop_reset_position_tolerance`：关节误差小于该值后认为复位完成。
+- `teleop_reset_hold_steps`：旧的保持参数，目前主要保留兼容。
 
 坐标轴索引：
 
@@ -324,21 +332,22 @@ RT/R2 不影响 `r2`
 - 如果 `r2` 一直不变，可能驱动把 RT/R2 暴露成 button。
 - 将 `xbox_r2_button` 设置成观察到的按钮编号。
 
-按 `O` 没有复位
+按 `O` 或 `LT` 没有复位
 
 - 先点击 MuJoCo viewer 窗口，让 viewer 获得键盘焦点。
 - 按键触发时终端会打印 `reset requested by O key`。
 - 如果没有打印，说明 viewer 没收到键盘事件。
 - 如果打印了但没有复位，检查是否正在运行 `teleoperation.py` 或 `ik_follow_test.py` 的最新版本。
+- 现在复位不是瞬移，而是按 `teleop_reset_joint_speed` 平滑运动回 `q_reset`。
 
-按 `LT + A` 没有复位
+按 `LT` 没有复位
 
 - 先运行 `python sim_mujoco/xbox_controller.py --raw`。
-- 确认按 LT 时 `lt` 会变大，按 A 时 `a` 会从 `0` 变 `1`。
+- 确认按 LT 时 `lt` 会变大。
 - 如果 `lt` 不变，检查 `xbox_axis_map.lt` 或设置 `xbox_lt_button`。
-- 如果 `a` 不变，检查 `xbox_button_map.a`。
-- 如果你实际想用 LB+A，观察 raw 输出里 LB 对应的 button 编号，并设置 `xbox_reset_button`。
-- 触发时终端会打印 `reset requested by Xbox LT+A`。
+- 如果你想用 LB 或其他按钮复位，观察 raw 输出里对应的 button 编号，并设置 `xbox_reset_button`。
+- 触发时终端会打印 `reset requested by Xbox` 和 `started smooth reset motion to q_reset`。
+- 如果你想恢复成 LT+A，设置 `teleop_reset_requires_a: true`，并确认 `a` 会从 `0` 变 `1`。
 
 机器人运动太快
 

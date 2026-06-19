@@ -60,6 +60,10 @@ teleop_gripper_closed_q: [0.0, 0.0]
 teleop_gripper_initial_closed: false
 teleop_gripper_toggle_threshold: 0.5
 teleop_reset_combo_threshold: 0.5
+teleop_reset_requires_a: false
+teleop_reset_hold_steps: 20
+teleop_reset_joint_speed: 0.8
+teleop_reset_position_tolerance: 0.01
 
 # MuJoCo physics integration frequency. This sets model.opt.timestep = 1 / sim_frequency.
 sim_frequency: 500.0

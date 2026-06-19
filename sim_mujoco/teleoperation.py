@@ -58,6 +58,10 @@ class XboxTeleoperation:
         self.gripper_closed = self.gripper_initial_closed
         self.last_gripper_pressed = False
         self.reset_combo_threshold = float(config.get("teleop_reset_combo_threshold", 0.5))
+        self.reset_requires_a = bool(config.get("teleop_reset_requires_a", False))
+        self.reset_hold_steps = int(config.get("teleop_reset_hold_steps", 20))
+        self.reset_joint_speed = float(config.get("teleop_reset_joint_speed", 0.8))
+        self.reset_position_tolerance = float(config.get("teleop_reset_position_tolerance", 0.01))
         self.last_reset_combo_pressed = False
 
     def close(self):
@@ -93,7 +97,7 @@ class XboxTeleoperation:
             state.lt >= self.reset_combo_threshold
             or state.reset_modifier > 0.5
         )
-        pressed = modifier_pressed and state.a > 0.5
+        pressed = modifier_pressed and (not self.reset_requires_a or state.a > 0.5)
         triggered = pressed and not self.last_reset_combo_pressed
         self.last_reset_combo_pressed = pressed
         return triggered
@@ -137,23 +141,45 @@ class XboxTeleoperation:
         )
         q_safe = q_seed.copy()
         reset_requested = {"value": False}
+        reset_motion = {"active": False, "q_cmd": None}
 
-        def reset_teleop():
+        def start_reset_motion():
             nonlocal target_pose, q_seed, q_safe
 
             self.gripper_closed = self.gripper_initial_closed
-            self.sim.reset_arm_to_q(q_home)
-            target_pose = self.ik.forward_kinematics(q_home)
-            q_seed = self.ik.compose_q(
-                arm_q=q_home,
-                gripper_q=self._gripper_q(),
-            )
-            q_safe = q_seed.copy()
+            reset_motion["active"] = True
+            reset_motion["q_cmd"] = np.asarray(self.sim.get_arm_qpos(), dtype=np.float64)
             self.sim.command_gripper(self._gripper_ctrl(), step=False)
             self.last_gripper_pressed = False
-            self.last_reset_combo_pressed = False
             reset_requested["value"] = False
-            log.info("reset teleoperation to q_reset")
+            log.info("started smooth reset motion to q_reset")
+
+        def step_reset_motion():
+            nonlocal target_pose, q_seed, q_safe
+
+            q_target = np.asarray(q_home, dtype=np.float64)
+            q_cmd = np.asarray(reset_motion["q_cmd"], dtype=np.float64)
+            max_step = self.reset_joint_speed * actual_control_dt
+            delta = np.clip(q_target - q_cmd, -max_step, max_step)
+            q_cmd = q_cmd + delta
+            reset_motion["q_cmd"] = q_cmd
+
+            self.sim.command_gripper(self._gripper_ctrl(), step=False)
+            for _ in range(steps_per_control):
+                self.sim.command_joint_pos(q_cmd)
+
+            if np.max(np.abs(q_target - q_cmd)) <= self.reset_position_tolerance:
+                reset_motion["active"] = False
+                q_seed = self.ik.compose_q(
+                    arm_q=q_home,
+                    gripper_q=self._gripper_q(),
+                )
+                q_safe = q_seed.copy()
+                target_pose = self.ik.forward_kinematics(q_home)
+                self.last_reset_combo_pressed = False
+                log.info("finished smooth reset motion to q_reset")
+
+            return q_cmd
 
         def request_reset(keycode):
             if keycode in (79, ord("o"), ord("O")):
@@ -173,10 +199,18 @@ class XboxTeleoperation:
                     state = self.xbox.poll()
                     if self._reset_combo_pressed(state):
                         reset_requested["value"] = True
-                        log.info("reset requested by Xbox LT+A")
+                        log.info("reset requested by Xbox")
 
                     if reset_requested["value"]:
-                        reset_teleop()
+                        start_reset_motion()
+
+                    if reset_motion["active"]:
+                        step_reset_motion()
+                        viewer.sync()
+                        elapsed = time.perf_counter() - loop_start
+                        sleep_time = actual_control_dt - elapsed
+                        if sleep_time > 0.0:
+                            time.sleep(sleep_time)
                         continue
 
                     self._update_gripper_toggle(state)

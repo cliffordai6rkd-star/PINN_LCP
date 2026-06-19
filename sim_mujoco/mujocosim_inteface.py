@@ -64,6 +64,7 @@ class MujocoSim_interface_fr3:
         ])
         self.gripper_actuator_name = config.get("gripper_actuator_name", "pika_gripper_actuator")
         self.gripper_ctrl_range = config.get("gripper_ctrl_range", [-0.11, 0.0])
+        self.reset_hold_steps = int(config.get("teleop_reset_hold_steps", 20))
 
     # Load .urdf or .xml.
     def load_model(self):
