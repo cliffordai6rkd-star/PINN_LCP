@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from data_process.tool.mujocosim_inteface import MujocoSim_interface_fr3
+from sim_mujoco.mujocosim_inteface import MujocoSim_interface_fr3
 
 
 
