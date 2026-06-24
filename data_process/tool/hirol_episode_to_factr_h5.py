@@ -76,6 +76,28 @@ def timestamp_to_us(value: Any, *, base_wall_us: int | None = None, base_mono_s:
     return int(round(ts * 1_000_000.0))
 
 
+def timestamp_mapping_to_us(
+    mapping: dict[str, Any],
+    default: Any,
+    *,
+    base_wall_us: int | None = None,
+    base_mono_s: float | None = None,
+) -> int:
+    if mapping.get("timestamp_us") is not None:
+        return int(round(float(mapping["timestamp_us"])))
+    if mapping.get("timestamp_ms") is not None:
+        return int(round(float(mapping["timestamp_ms"]) * 1_000.0))
+    if mapping.get("timestamp_ns") is not None:
+        return int(round(float(mapping["timestamp_ns"]) / 1_000.0))
+    if mapping.get("timestamp_s") is not None:
+        return timestamp_to_us(mapping["timestamp_s"], base_wall_us=base_wall_us, base_mono_s=base_mono_s)
+    return timestamp_to_us(
+        mapping.get("time_stamp", mapping.get("timestamp", default)),
+        base_wall_us=base_wall_us,
+        base_mono_s=base_mono_s,
+    )
+
+
 def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
     q = np.asarray(quat, dtype=np.float64).reshape(4)
     norm = np.linalg.norm(q)
@@ -126,6 +148,13 @@ def get_single(item: dict[str, Any], key: str) -> dict[str, Any]:
     return {}
 
 
+def first_present(mapping: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
 def require_json_list(episode_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     json_path = episode_dir / "data.json"
     with json_path.open("r", encoding="utf-8") as f:
@@ -174,8 +203,9 @@ def collect_camera_frames(
             image_path = episode_dir / rel_path
             frames_by_target.setdefault(target_name, []).append(read_image(cv2, image_path, output_size))
             ts_by_target.setdefault(target_name, []).append(
-                timestamp_to_us(
-                    color_info.get("time_stamp"),
+                timestamp_mapping_to_us(
+                    color_info,
+                    0,
                     base_wall_us=base_wall_us,
                     base_mono_s=base_mono_s,
                 )
@@ -198,6 +228,7 @@ def collect_teleop_arrays(
     timestamp_us = []
     q_follower = []
     dq_follower = []
+    ddq_follower = []
     tau_ext = []
     q_cmd = []
     ee_pose = []
@@ -214,15 +245,37 @@ def collect_teleop_arrays(
         action_ee = action.get("ee") or {}
         action_tool = action.get("tool") or {}
 
-        master_ts = joint.get("time_stamp", ee.get("time_stamp", item.get("idx", 0)))
-        timestamp_us.append(timestamp_to_us(master_ts, base_wall_us=base_wall_us, base_mono_s=base_mono_s))
+        master_default = ee.get("time_stamp", ee.get("timestamp", item.get("idx", 0)))
+        timestamp_us.append(
+            timestamp_mapping_to_us(
+                joint,
+                master_default,
+                base_wall_us=base_wall_us,
+                base_mono_s=base_mono_s,
+            )
+        )
         q = np.asarray(joint.get("position", np.zeros(7)), dtype=np.float64).reshape(-1)
         dq = np.asarray(joint.get("velocity", np.zeros_like(q)), dtype=np.float64).reshape(-1)
+        ddq = np.asarray(
+            first_present(
+                joint,
+                (
+                    "acceleration",
+                    "accelerations",
+                    "ddq",
+                    "joint_acceleration",
+                    "joint_accelerations",
+                ),
+                np.zeros_like(q),
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
         tau = np.asarray(joint.get("torque", np.zeros_like(q)), dtype=np.float64).reshape(-1)
         q_action = np.asarray(action_joint.get("position", q), dtype=np.float64).reshape(-1)
 
         q_follower.append(q)
         dq_follower.append(dq)
+        ddq_follower.append(ddq)
         tau_ext.append(tau)
         q_cmd.append(q_action)
         ee_pose.append(pose7_to_matrix(ee.get("pose", np.zeros(7))))
@@ -234,10 +287,12 @@ def collect_teleop_arrays(
         "timestamp_us": np.asarray(timestamp_us, dtype=np.int64),
         "q_follower": np.asarray(q_follower, dtype=np.float64),
         "dq_follower": np.asarray(dq_follower, dtype=np.float64),
+        "ddq_follower": np.asarray(ddq_follower, dtype=np.float64),
         "tau_ext": np.asarray(tau_ext, dtype=np.float64),
         "q_cmd": np.asarray(q_cmd, dtype=np.float64),
         "q_leader": np.asarray(q_cmd, dtype=np.float64),
         "dq_leader": np.zeros_like(np.asarray(q_cmd, dtype=np.float64)),
+        "ddq_leader": np.zeros_like(np.asarray(q_cmd, dtype=np.float64)),
         "tau_leader": np.zeros_like(np.asarray(q_cmd, dtype=np.float64)),
         "ee_pose": np.asarray(ee_pose, dtype=np.float64),
         "cmd_ee_pose": np.asarray(cmd_ee_pose, dtype=np.float64),
@@ -246,29 +301,62 @@ def collect_teleop_arrays(
     }
 
 
+def collect_ati_json_arrays(
+    ati_path: Path,
+    timestamp_base: tuple[int, float] | None,
+) -> dict[str, np.ndarray]:
+    base_wall_us, base_mono_s = timestamp_base if timestamp_base else (None, None)
+    with ati_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"{ati_path} must contain non-empty data list")
+
+    wrench = []
+    ts = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{ati_path} data[{idx}] must be a JSON object")
+        if "ft_data" not in row:
+            raise KeyError(f"{ati_path} data[{idx}] missing required key 'ft_data'")
+        if "time_stamp" not in row:
+            raise KeyError(f"{ati_path} data[{idx}] missing required key 'time_stamp'")
+
+        wrench_row = np.asarray(row["ft_data"], dtype=np.float64).reshape(-1)
+        if wrench_row.size != 6:
+            raise ValueError(f"{ati_path} data[{idx}].ft_data must have length 6, got {wrench_row.size}")
+        wrench.append(wrench_row)
+        ts.append(
+            timestamp_to_us(
+                row["time_stamp"],
+                base_wall_us=base_wall_us,
+                base_mono_s=base_mono_s,
+            )
+        )
+
+    return build_force_dict(np.asarray(wrench, dtype=np.float64), np.asarray(ts, dtype=np.int64))
+
+
+def empty_force_dict() -> dict[str, np.ndarray]:
+    return build_force_dict(np.zeros((0, 6), dtype=np.float64), np.zeros((0,), dtype=np.int64))
+
+
 def collect_force_arrays(
     data: list[dict[str, Any]],
     episode_dir: Path,
     timestamp_base: tuple[int, float] | None,
     *,
     prefer_async_ft: bool,
+    ati_json_name: str,
 ) -> dict[str, np.ndarray]:
     base_wall_us, base_mono_s = timestamp_base if timestamp_base else (None, None)
 
     if prefer_async_ft:
-        async_files = sorted(episode_dir.glob("*_ft_data.json")) + sorted(episode_dir.glob("*_data.json"))
-        async_files = [p for p in async_files if p.name != "data.json"]
-        for async_path in async_files:
-            with async_path.open("r", encoding="utf-8") as f:
-                payload = json.load(f)
-            rows = payload.get("data")
-            if isinstance(rows, list) and rows:
-                wrench = [row.get("ft_data", np.zeros(6)) for row in rows]
-                ts = [
-                    timestamp_to_us(row.get("time_stamp"), base_wall_us=base_wall_us, base_mono_s=base_mono_s)
-                    for row in rows
-                ]
-                return build_force_dict(np.asarray(wrench, dtype=np.float64), np.asarray(ts, dtype=np.int64))
+        async_path = episode_dir / ati_json_name
+        if async_path.exists():
+            return collect_ati_json_arrays(async_path, timestamp_base)
+        return empty_force_dict()
 
     wrench_rows = []
     ts_rows = []
@@ -280,7 +368,7 @@ def collect_force_arrays(
         ts_rows.append(timestamp_to_us(ee.get("ft_time_stamp"), base_wall_us=base_wall_us, base_mono_s=base_mono_s))
 
     if not wrench_rows:
-        return build_force_dict(np.zeros((0, 6), dtype=np.float64), np.zeros((0,), dtype=np.int64))
+        return empty_force_dict()
     return build_force_dict(np.stack(wrench_rows, axis=0), np.asarray(ts_rows, dtype=np.int64))
 
 
@@ -376,19 +464,23 @@ def convert_episode(episode_dir: Path, output_dir: Path, args: argparse.Namespac
         base_mono_s = float(first_joint.get("time_stamp", first_ee.get("time_stamp", 0.0)))
         timestamp_base = (int(time.time_ns() // 1000), base_mono_s)
 
-    cameras = collect_camera_frames(
-        episode_dir=episode_dir,
-        data=data,
-        camera_map=camera_map,
-        output_size=output_size,
-        timestamp_base=timestamp_base,
-    )
+    if getattr(args, "skip_cameras", False):
+        cameras = {}
+    else:
+        cameras = collect_camera_frames(
+            episode_dir=episode_dir,
+            data=data,
+            camera_map=camera_map,
+            output_size=output_size,
+            timestamp_base=timestamp_base,
+        )
     teleop = collect_teleop_arrays(data, timestamp_base)
     force = collect_force_arrays(
         data,
         episode_dir,
         timestamp_base,
         prefer_async_ft=args.prefer_async_ft,
+        ati_json_name=args.ati_json_name,
     )
 
     if args.require_cameras and not cameras:
@@ -444,10 +536,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Map source color key to target camera name, e.g. ee_cam_color=wrist. Can be repeated.",
     )
-    parser.add_argument("--prefer-async-ft", action="store_true", help="Use *_ft_data.json if present.")
+    parser.add_argument("--use-ati-json", dest="prefer_async_ft", action="store_true", help="Use the explicit ATI JSON file beside data.json.")
+    parser.add_argument("--prefer-async-ft", dest="prefer_async_ft", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--ati-json-name",
+        default="ee_ft_data.json",
+        help="Exact ATI JSON filename beside data.json. Expected schema: data[*].ft_data + data[*].time_stamp.",
+    )
     parser.add_argument("--epoch-timestamps", action="store_true", help="Convert perf_counter timestamps to wall-clock-like us.")
     parser.add_argument("--require-cameras", action="store_true", help="Fail if no mapped cameras are found.")
     parser.add_argument("--require-ft", action="store_true", help="Fail if no FT data is found.")
+    parser.add_argument("--skip-cameras", action="store_true", help="Do not read/write camera frames.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--inspect", action="store_true", help="Print converted H5 structure.")
     return parser.parse_args()

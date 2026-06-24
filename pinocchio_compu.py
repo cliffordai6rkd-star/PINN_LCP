@@ -1,5 +1,6 @@
 # pinocchio计算动力学线性项，映射成末端等效 wrench，并按 episode 画对比曲线。
 
+import argparse
 import logging
 from pathlib import Path
 
@@ -10,11 +11,20 @@ import numpy as np
 import pinocchio as pin
 import yaml
 
-from dataset.dataloader import PINNDataset
+from data_process.dataloader import PINNDataset
 
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Compare ATI wrench with Pinocchio equivalent endpoint wrench.")
+    parser.add_argument("--config", type=Path, default=Path("config/pinocchio.yaml"))
+    parser.add_argument("--urdf", type=Path, default=Path("sim_mesh/franka_fr3/fr3_franka_hand.urdf"))
+    parser.add_argument("--frame-name", default="fr3_hand")
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/pinocchio_check"))
+    return parser.parse_args()
 
 
 def to_numpy_1d(value):
@@ -26,7 +36,7 @@ def to_numpy_1d(value):
 def plot_episode(ati_list, tau_eq_list, diff_list, save_path):
     ati = np.asarray(ati_list)
     tau_eq = np.asarray(tau_eq_list)
-    # diff = np.asarray(diff_list)
+    diff = np.asarray(diff_list)
 
     names = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 
@@ -34,8 +44,8 @@ def plot_episode(ati_list, tau_eq_list, diff_list, save_path):
 
     for i, name in enumerate(names):
         axes[i].plot(ati[:, i], label="ATI wrench", linewidth=1.2)
-        axes[i].plot(tau_eq[:, i], label="Pinocchio eq wrench", linewidth=1.2)
-        # axes[i].plot(diff[:, i], label="ATI - Pinocchio", linewidth=1.0)
+        axes[i].plot(tau_eq[:, i], label="Pinocchio external eq wrench", linewidth=1.2)
+        axes[i].plot(diff[:, i], label="ATI - Pinocchio", linewidth=0.9, alpha=0.75)
         axes[i].set_ylabel(name)
         axes[i].grid(True)
         axes[i].legend(loc="upper right")
@@ -47,8 +57,8 @@ def plot_episode(ati_list, tau_eq_list, diff_list, save_path):
 
 
 def main():
-    urdf_path = "sim_mesh/franka_fr3/fr3_franka_hand.urdf"
-    full_model = pin.buildModelFromUrdf(urdf_path)
+    args = parse_args()
+    full_model = pin.buildModelFromUrdf(str(args.urdf))
     locked_joint_names = ["fr3_finger_joint1", "fr3_finger_joint2"]
     locked_joint_ids = [full_model.getJointId(name) for name in locked_joint_names]
     model = pin.buildReducedModel(
@@ -58,12 +68,11 @@ def main():
     )
     data = model.createData()
 
-    frame_name = "fr3_hand"
-    frame_id = model.getFrameId(frame_name)
+    frame_id = model.getFrameId(args.frame_name)
     if frame_id == len(model.frames):
-        raise ValueError(f"frame not found: {frame_name}")
+        raise ValueError(f"frame not found: {args.frame_name}")
 
-    with open("dataset/config/train_cfg/pinocchio.yaml", "r") as f:
+    with args.config.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     dataset = PINNDataset(config)
@@ -72,7 +81,7 @@ def main():
         for sample_idx, raw_idx in enumerate(dataset.valid_indices)
     }
 
-    output_dir = Path("outputs/pinocchio_check")
+    output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     episodes = list(dataset.dataset.meta.episodes)
@@ -100,9 +109,8 @@ def main():
             tau = to_numpy_1d(sample["tau"][0])
             wrench = to_numpy_1d(sample["wrench"][0])
 
-            tau_id= pin.rnea(model, data, q, v, a)
-            
-        
+            tau_id = pin.rnea(model, data, q, v, a)
+
             pin.computeJointJacobians(model, data, q)
             pin.framesForwardKinematics(model, data, q)
 
@@ -112,7 +120,7 @@ def main():
                 frame_id,
                 pin.ReferenceFrame.LOCAL,
             )
-            
+
             # tau_g = pin.rnea(
             #     model,
             #     data,
@@ -122,7 +130,7 @@ def main():
             # )
 
             tau_ext = tau_id - tau
-            tau_eq_wrench = np.linalg.lstsq(J.T, tau, rcond=None)[0]
+            tau_eq_wrench = np.linalg.lstsq(J.T, tau_ext, rcond=None)[0]
             diff = wrench - tau_eq_wrench
 
             ati_list.append(wrench)
