@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pinn.lowdim_encoder import MLPBlock, ResidualMLPBlock
-
 
 # 输入为长度horizon的qk, vk, ak, tauk  输出F_k+1  decoder_only
 

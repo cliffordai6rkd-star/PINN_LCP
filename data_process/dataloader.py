@@ -55,21 +55,13 @@ class PINNDataset(torch.utils.data.Dataset):
         # self.dt = float(1/30)  # 采样frequency 30Hz
 
         self.horizon = int(self.data_config.get("horizon", 1))
+        self.history_horizon = int(self.data_config.get("history_horizon", self.horizon))
+        self.future_horizon = int(self.data_config.get("future_horizon", self.horizon))
 
         self.valid_indices = []
-        episodes = self.dataset.meta.episodes
-
         self.raw_idx_to_episode_start = {}
         self.raw_idx_to_episode_end = {}
-
-        for ep in episodes:
-            start_idx = int(ep["dataset_from_index"])
-            end_idx = int(ep["dataset_to_index"])
-
-            for idx in range(start_idx, end_idx):
-                self.valid_indices.append(idx)
-                self.raw_idx_to_episode_start[idx] = start_idx
-                self.raw_idx_to_episode_end[idx] = end_idx
+        self._build_valid_indices()
 
         self.load_image = bool(self.data_config.get("load_images",True))
 
@@ -113,6 +105,18 @@ class PINNDataset(torch.utils.data.Dataset):
             else:
                 raise ValueError(f"unknown normalize mode: {self.normalize_mode}")
 
+    def _build_valid_indices(self):
+        episodes = self.dataset.meta.episodes
+
+        for ep in episodes:
+            start_idx = int(ep["dataset_from_index"])
+            end_idx = int(ep["dataset_to_index"])
+
+            for idx in range(start_idx, end_idx):
+                self.valid_indices.append(idx)
+                self.raw_idx_to_episode_start[idx] = start_idx
+                self.raw_idx_to_episode_end[idx] = end_idx
+
     def __len__(self):
         return len(self.valid_indices) 
     
@@ -151,6 +155,77 @@ class PINNDataset(torch.utils.data.Dataset):
         if self.load_image:
             return self.dataset[i]
         return self.dataset.hf_dataset[i]
+
+
+class PINNHistoryFutureDataset(PINNDataset):
+    def _build_valid_indices(self):
+        episodes = self.dataset.meta.episodes
+        self.pad_future = bool(self.data_config.get("pad_future", False))
+
+        for ep in episodes:
+            start_idx = int(ep["dataset_from_index"])
+            end_idx = int(ep["dataset_to_index"])
+            if self.pad_future:
+                valid_end = end_idx
+            else:
+                valid_end = end_idx - self.future_horizon
+
+            for idx in range(start_idx, max(start_idx, valid_end)):
+                self.valid_indices.append(idx)
+                self.raw_idx_to_episode_start[idx] = start_idx
+                self.raw_idx_to_episode_end[idx] = end_idx
+
+    def __getitem__(self, idx):
+        raw_idx = self.valid_indices[idx]
+        episode_start = self.raw_idx_to_episode_start[raw_idx]
+        episode_end = self.raw_idx_to_episode_end[raw_idx]
+
+        # raw_idx 是历史观测窗口的最后一帧，未来窗口从 raw_idx + 1 开始。
+        history_indices = [
+            max(episode_start, raw_idx - self.history_horizon + 1 + offset)
+            for offset in range(self.history_horizon)
+        ]
+        future_indices = [
+            min(episode_end - 1, raw_idx + 1 + offset)
+            for offset in range(self.future_horizon)
+        ]
+
+        history_frames = [self._read_frame(i) for i in history_indices]
+        future_frames = [self._read_frame(i) for i in future_indices]
+
+        sample = {
+            "raw_idx": torch.tensor(raw_idx, dtype=torch.long),
+            "history_indices": torch.tensor(history_indices, dtype=torch.long),
+            "future_indices": torch.tensor(future_indices, dtype=torch.long),
+        }
+
+        pinocchio_raw_keys = set(
+            self.data_config.get("pinocchio_raw_keys", ["q", "v", "a", "tau"])
+        )
+
+        for key, dataset_key in self.lowdim_keys.items():
+            history_seq = torch.stack([frame[dataset_key] for frame in history_frames], dim=0)
+            future_seq = torch.stack([frame[dataset_key] for frame in future_frames], dim=0)
+
+            sample[key] = history_seq
+            sample[f"{key}_future"] = future_seq
+
+            # Pinocchio 必须使用真实物理量；如果后续对 q/v/a/tau 做归一化，这里保留原始未来量。
+            if key in pinocchio_raw_keys:
+                sample[f"{key}_future_raw"] = future_seq.clone()
+
+        for key in self.normalize_lowdim_keys:
+            if self.is_normalize:
+                sample[key] = self.normalize_fuc(key, sample[key])
+                future_key = f"{key}_future"
+                if future_key in sample:
+                    sample[future_key] = self.normalize_fuc(key, sample[future_key])
+
+        for key, dataset_key in self.image_keys.items():
+            seq = [frame[dataset_key] for frame in history_frames]
+            sample[f"image_{key}"] = torch.stack(seq, dim=0)
+
+        return sample
         
 if __name__ == "__main__":
 
