@@ -1,3 +1,30 @@
+# Pointcloud 重建入口
+
+多帧双视角 RGBD 点云重建推荐直接跑薄上层：
+
+```bash
+python pointcloud/run_rgbd_reconstruction.py \
+  --config pointcloud/config/rgbd_reconstruction/ft_test_data.yaml
+```
+
+它会串起：
+
+```text
+标定外参 -> 每帧 RGBD 外参 -> episode fused 点云
+```
+
+常用调试：
+
+```bash
+python pointcloud/run_rgbd_reconstruction.py \
+  --max-frames 10 \
+  --stride 8 \
+  --cameras third_person_cam \
+  --no-view
+```
+
+完整说明见 `pointcloud/RGBD_POINTCLOUD_RECONSTRUCTION.md`。
+
 # 单帧 SAM3 RGB-D 点云重建
 
 这个文件夹用于单帧 RGB-D 点云重建：

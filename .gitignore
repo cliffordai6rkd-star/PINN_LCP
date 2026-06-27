@@ -36,8 +36,10 @@ data/train_episode/
 *.parquet
 *.mp4
 
-# Local Docker setup
-docker for LCP_PINN_V1/
+# Local Docker overrides
+docker for LCP_PINN_V1/.env
+docker for LCP_PINN_V1/*.local.yaml
+docker for LCP_PINN_V1/*.override.yaml
 
 # Plots and generated reports
 loss_epoch.png

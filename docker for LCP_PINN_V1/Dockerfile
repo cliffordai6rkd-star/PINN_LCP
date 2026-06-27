@@ -41,6 +41,23 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir \
     "libpinocchio==3.9.0" \
     "pin==3.9.0"
 
+# dp_hirol policy inference extras. Torch/torchvision stay inherited from the
+# base LCP-PINN image so their CUDA ABI remains aligned with this repository.
+RUN /opt/venv/bin/python -m pip install --no-cache-dir \
+    "hydra-core==1.3.2" \
+    "omegaconf==2.3.0" \
+    "dill==0.3.8" \
+    "diffusers==0.35.1" \
+    "transformers==4.56.2" \
+    "einops==0.8.1" \
+    "pandas==2.2.3" \
+    "pyarrow==18.1.0" \
+    "av==15.0.0" \
+    "zarr==2.18.3" \
+    "numcodecs==0.12.1" \
+    "scipy==1.11.4" \
+    "tqdm==4.67.1"
+
 # 准备一个和宿主机 UID/GID 对齐的运行环境。
 # 基础镜像里可能已经有 UID=1000 的用户（例如 trainer），这种情况下不再强行创建同 UID 用户。
 RUN set -eux; \

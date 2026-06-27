@@ -42,7 +42,7 @@ class PinocchioIKController:
         self.reject_unconverged = bool(config.get("ik_reject_unconverged", False))
         self.max_position_error = float(config.get("ik_max_position_error", 0.03))
         self.max_orientation_error = float(config.get("ik_max_orientation_error", 0.5))
-        self.max_joint_delta = float(config.get("ik_max_joint_delta", 0.12))
+        self.max_joint_delta = float(config.get("ik_max_joint_delta", 0.2))
         self.max_joint_delta_norm = float(config.get("ik_max_joint_delta_norm", 0.35))
 
         full_model = pin.buildModelFromUrdf(str(self.urdf_path))

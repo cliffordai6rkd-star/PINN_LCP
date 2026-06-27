@@ -337,7 +337,7 @@ class MujocoSim_interface_fr3:
                     time.sleep(actual_control_dt)
                 t += actual_control_dt
 
-    def play_joint_sequences(self, all_q_seqs, dt):
+    def play_joint_sequences(self, all_q_seqs, dt, pause_between_episodes=True):
         self.ensure_loaded()
 
         go_next = {"value": False}
@@ -367,12 +367,13 @@ class MujocoSim_interface_fr3:
 
                     if self.quick_replay is False:
                         time.sleep(dt)
-                log.info(f"press enter to continue")
+                if pause_between_episodes:
+                    log.info(f"press enter to continue")
                     # 停在当前 episode 最后一帧，等待按 n
-                go_next["value"] = False
-                while viewer.is_running() and not go_next["value"]:
-                    viewer.sync()
-                    time.sleep(0.02)
+                    go_next["value"] = False
+                    while viewer.is_running() and not go_next["value"]:
+                        viewer.sync()
+                        time.sleep(0.02)
 
 
 

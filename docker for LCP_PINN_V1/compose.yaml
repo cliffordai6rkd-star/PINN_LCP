@@ -1,0 +1,67 @@
+name: pinn-lcp
+
+services:
+  v2:
+    build:
+      context: ..
+      dockerfile: docker for LCP_PINN_V1/Dockerfile
+      args:
+        USERNAME: ${CONTAINER_USER:-teleophost}
+        USER_UID: ${LOCAL_UID:-1000}
+        USER_GID: ${LOCAL_GID:-1000}
+    image: st-pinn:v2
+    container_name: st-pinn
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    working_dir: /workspace/PINN_LCP
+    command: sleep infinity
+    stdin_open: true
+    tty: true
+    ipc: host
+    network_mode: host
+    shm_size: 16gb
+    privileged: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      HOME: /home/${CONTAINER_USER:-teleophost}
+      MPLCONFIGDIR: /tmp/matplotlib
+      PYTHONPATH: /workspace/PINN_LCP:/workspace/dp_hirol-main
+      MUJOCO_GL: ${MUJOCO_GL:-glfw}
+      DISPLAY: ${DISPLAY}
+      XAUTHORITY: /tmp/.docker.xauth
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-all}
+      HF_HOME: /workspace/data/huggingface
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+      http_proxy: ${http_proxy:-}
+      https_proxy: ${https_proxy:-}
+      no_proxy: ${no_proxy:-}
+      SDL_VIDEODRIVER: x11
+      SDL_AUDIODRIVER: pulse
+      UDEV: "1"
+
+      # Used by inference/sim_inference.py when paths are null in YAML.
+      DP_HIROL_ROOT: /workspace/dp_hirol-main
+      DP_CKPT: /workspace/data/0627/latest.ckpt
+      DP_IMAGE_DATASET: /workspace/dp_hirol-main/data/zml_data/push_cube_ada_29ep_lerobot_v3_img
+      DP_FT_DATASET: /workspace/data/push_cube_ada_29ep_lerobot_v3_ft
+      DP_DINO_MODEL: /workspace/dp_hirol-main/data/models/dinov2-base
+      SIM_CONFIG: /workspace/PINN_LCP/config/sim_cfg/replay_test.yaml
+      SIM_INFERENCE_CONFIG: /workspace/PINN_LCP/inference/sim_inference.yaml
+    volumes:
+      - ..:/workspace/PINN_LCP
+      - ../../data:/workspace/data
+      - ../../dp_hirol-main:/workspace/dp_hirol-main
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-$HOME/.Xauthority}:/tmp/.docker.xauth:ro

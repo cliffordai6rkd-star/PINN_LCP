@@ -23,7 +23,64 @@ cd /workspace
 data/train_episode/Ft_test_data
 ```
 
-## 1. 导出相机标定外参
+## 1. 一键执行完整 RGBD 重建流
+
+最常用入口是薄上层脚本：
+
+```bash
+python pointcloud/run_rgbd_reconstruction.py \
+  --config pointcloud/config/rgbd_reconstruction/ft_test_data.yaml
+```
+
+它会按顺序执行：
+
+```text
+1. 需要时导出 pointcloud/calibration_v2/camera_extrinsics.json
+2. 写入 data_with_rgbd_extrinsics.json
+3. 按 config 重建 fused .ply 和 summary.json
+```
+
+常用调试命令：
+
+```bash
+python pointcloud/run_rgbd_reconstruction.py \
+  --max-frames 10 \
+  --stride 8 \
+  --cameras third_person_cam \
+  --no-view
+```
+
+如果想强制重新导出标定：
+
+```bash
+python pointcloud/run_rgbd_reconstruction.py \
+  --calibration-mode always \
+  --write-npy
+```
+
+如果只想复用已有标定并跳过重建前的 JSON 写入：
+
+```bash
+python pointcloud/run_rgbd_reconstruction.py \
+  --calibration-mode skip \
+  --skip-extrinsics
+```
+
+检查实际会执行哪些命令：
+
+```bash
+python pointcloud/run_rgbd_reconstruction.py --dry-run
+```
+
+上层脚本只负责编排；实际几何计算仍然在：
+
+```text
+pointcloud/calibration_v2/export_camera_extrinsics.py
+pointcloud/tools/add_rgbd_extrinsics.py
+pointcloud/tools/reconstruct_rgbd_episode.py
+```
+
+## 2. 分步执行：导出相机标定外参
 
 如果已经生成过最新的 `pointcloud/calibration_v2/camera_extrinsics.json`，这一步可以跳过。
 
@@ -49,7 +106,7 @@ third_person_cam:
   T_base_camera    # 固定相机 D455，相机坐标系到 robot_base 坐标系
 ```
 
-## 2. 写入每帧 RGBD 外参
+## 3. 分步执行：写入每帧 RGBD 外参
 
 该步骤读取 `data.json`，根据每帧 `ee_states.single.pose` 计算每帧相机位姿，并生成 `data_with_rgbd_extrinsics.json`。
 
@@ -82,7 +139,7 @@ data/train_episode/Ft_test_data/data_with_rgbd_extrinsics.json
 
 注意：`Ft_test_data` 中的 `ee_states.single.pose` 是绝对位姿，可以直接用于腕部相机外参计算。
 
-## 3. 修改重建配置
+## 4. 修改重建配置
 
 点云重建脚本只通过 config 控制参数。默认配置文件是：
 
@@ -156,7 +213,7 @@ visualization.view_existing:
   指向已有 .ply 时，只打开已有点云并退出，不重新重建。
 ```
 
-## 4. 执行点云重建
+## 5. 分步执行：点云重建
 
 使用默认配置：
 
@@ -178,7 +235,7 @@ outputs/rgbd_pointcloud/Ft_test_data/episode_fused_stride8.ply
 outputs/rgbd_pointcloud/Ft_test_data/summary.json
 ```
 
-## 5. 打开可移动视角点云
+## 6. 打开可移动视角点云
 
 方式 A：重建完成后自动打开窗口。
 
@@ -226,7 +283,7 @@ Open3D 窗口操作：
 右键或中键拖动：平移
 ```
 
-## 6. 快速调试建议
+## 7. 快速调试建议
 
 第一次调参数时，建议先只重建少量帧：
 
@@ -245,12 +302,12 @@ projection:
 
 确认点云方向和位置正常后，再把 `frames.max` 改回 `null` 重建全量 episode。
 
-## 7. 常见问题
+## 8. 常见问题
 
 如果提示找不到 `data_with_rgbd_extrinsics.json`：
 
 ```text
-先执行第 2 步 add_rgbd_extrinsics.py。
+先执行第 3 步 add_rgbd_extrinsics.py。
 ```
 
 如果点云很大或可视化卡顿：

@@ -1,0 +1,73 @@
+# All sim inference controls live here. Path fields set to null use the
+# script's auto-detection order: environment variable, common Docker paths,
+# then the host paths discovered during setup.
+
+paths:
+  ckpt:  "data/0627/latest.ckpt"              # env: DP_CKPT
+  dp_root: null            # env: DP_HIROL_ROOT
+  image_dataset: null      # env: DP_IMAGE_DATASET
+  ft_dataset: null         # env: DP_FT_DATASET
+  image_model: null        # env: DP_DINO_MODEL
+  sim_config: null         # env: SIM_CONFIG
+  save_q: null
+  save_ee: null
+
+inference:
+  # Zero-based episode index in the image LeRobot v3 dataset. You can also set
+  # episode_index: all as a shorthand for all episodes.
+  episode_index: 0
+  # If episode_indices is null, episode_index is used. Set this to all to loop
+  # over the whole dataset, or a list like [0, 3, 5].
+  episode_indices: all
+  start_frame: 0
+  # Set to null to use each selected episode until its end.
+  max_frames: null
+
+  # Run policy every N image frames.
+  # first: execute action[0]; chunk: append all predicted poses; mean: execute
+  # the averaged pose of the predicted action chunk.
+  policy_stride: 1
+  append_mode: mean       # first | chunk | mean
+
+  # checkpoint keeps the scheduler stored in the ckpt. Use ddim or ddpm to
+  # force a sampler at runtime. DDIM usually uses fewer steps, DDPM usually
+  # uses the training timesteps such as 80 or 100.
+  sampler: ddpm            # checkpoint | ddim | ddpm
+
+  # dp_hirol checkpoint state_dict to use.
+  state_dict: ema_model    # ema_model | model
+  device: auto             # auto | cuda | cpu
+  num_inference_steps: 8
+  # Extra kwargs passed to scheduler.step after filtering by the active sampler.
+  # DDIM supports eta; DDPM will ignore it here.
+  sampler_step_kwargs:
+    eta: 0.0
+  seed: 42
+
+data:
+  # Keep this true for the current push_cube LeRobot v3 video dataset. The
+  # official LeRobotDataset + torchcodec path can compute invalid video indices
+  # for this converted dataset.
+  force_local_lerobot_reader: true
+
+execution:
+  # online: data frame -> policy action -> IK -> MuJoCo command -> next frame.
+  # offline: precompute all actions/q first, then replay.
+  mode: offline             # online | offline
+  no_play: false
+  unchecked_ik: false
+  ik_failure_policy: clip  # clip | hold
+  use_dataset_initial_q: true
+  # The policy predicts only 7D EE pose and has no gripper output, so keep the
+  # simulated gripper fixed unless you explicitly control it elsewhere.
+  fix_gripper: true
+  # null uses teleop_gripper_open_ctrl from config/sim_cfg/replay_test.yaml.
+  fixed_gripper_ctrl: null
+  # null uses q_reset_gripper from config/sim_cfg/replay_test.yaml.
+  fixed_gripper_q: null
+  # Offline replay frequency. 50 Hz matches the real robot control rate.
+  # Set to null to fall back to dataset fps.
+  offline_playback_fps: 50.0
+
+logging:
+  level: INFO
