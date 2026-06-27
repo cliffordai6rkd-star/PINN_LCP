@@ -11,6 +11,7 @@ paths:
   sim_config: null         # env: SIM_CONFIG
   save_q: null
   save_ee: null
+  save_tau: null
 
 inference:
   # Zero-based episode index in the image LeRobot v3 dataset. You can also set
@@ -51,9 +52,11 @@ data:
   force_local_lerobot_reader: true
 
 execution:
-  # online: data frame -> policy action -> IK -> MuJoCo command -> next frame.
+  # online: data frame -> policy action -> controller -> MuJoCo command -> next frame.
   # offline: precompute all actions/q first, then replay.
+  # torque_qp requires online and no_play: false because it is a torque feedback loop.
   mode: offline             # online | offline
+  controller: ik             # ik | torque_qp
   no_play: false
   unchecked_ik: false
   ik_failure_policy: clip  # clip | hold

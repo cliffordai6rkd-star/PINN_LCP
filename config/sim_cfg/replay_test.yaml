@@ -3,6 +3,7 @@
 # model_path: sim_mesh/franka_fr3/fr3_pika_ati_torque.xml
 # model_path: sim_mesh/scene/fr3_pika_gripper_ati_world.xml
 model_path: sim_mesh/franka_fr3/fr3_pika_ati_scene.xml
+torque_model_path: sim_mesh/franka_fr3/fr3_pika_ati_torque_scene.xml
 output_path: sim_mesh/franka_fr3/mjcf/fr3_pika_gripper_ati.compiled.xml
 print_info: false
 save_mjcf: false
@@ -110,6 +111,50 @@ teleop_pose_quat_order: wxyz
 ik_follow_test_axis: z
 ik_follow_test_amplitude: 0.03
 ik_follow_test_frequency: 0.15
+
+# Torque-level contact inverse dynamics QP. These settings are used when
+# inference/sim_inference.yaml sets execution.controller: torque_qp.
+qp_urdf_path: sim_mesh/franka_fr3/fr3_pika_gripper_ati.urdf
+qp_ee_frame_name: pika_gripper_ee
+qp_lock_joint_names:
+  - gripper_left_joint
+  - gripper_right_joint
+qp_arm_joint_names:
+  - fr3_joint1
+  - fr3_joint2
+  - fr3_joint3
+  - fr3_joint4
+  - fr3_joint5
+  - fr3_joint6
+  - fr3_joint7
+qp_reference_frame: LOCAL
+# Keep this aligned with torque_model_path. fr3_pika_ati_torque_scene.xml uses
+# zero gravity; set this to [0.0, 0.0, -9.81] if the torque XML is changed.
+qp_gravity: [0.0, 0.0, 0.0]
+qp_task_kp: [120.0, 120.0, 120.0, 50.0, 50.0, 50.0]
+qp_task_kd: [24.0, 24.0, 24.0, 10.0, 10.0, 10.0]
+qp_motion_weight: [1.0, 1.0, 1.0, 0.4, 0.4, 0.4]
+# Set non-zero values here after PINN/ATI force targets are wired in.
+qp_force_weight: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+qp_qddot_weight: 1.0e-4
+qp_torque_weight: 1.0e-5
+qp_wrench_regularization: 1.0e-6
+qp_lock_wrench_without_target: true
+qp_posture_weight: 1.0e-3
+qp_posture_kp: 8.0
+qp_posture_kd: 2.0
+qp_regularization: 1.0e-9
+qp_torque_limit: [40.0, 40.0, 40.0, 40.0, 12.0, 12.0, 12.0]
+qp_qddot_limit: [30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0]
+qp_max_slsqp_iter: 80
+qp_slsqp_ftol: 1.0e-6
+# Optional contact constraints. Keep null until the wrench frame/normal is
+# calibrated with the ATI frame used by the force predictor.
+qp_contact_normal: null
+qp_friction_mu: 0.0
+qp_min_normal_force: null
+qp_max_normal_force: null
+qp_desired_wrench: null
 
 # q: [0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785]
 q_reset: [0.0, -0.185, 0.0, -2.355, 0.0, 1.57079, 0.785]

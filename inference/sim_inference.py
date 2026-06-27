@@ -6,9 +6,11 @@ locations discovered on this machine:
   - image dataset: /home/hirol/code/dp_hirol-main/data/zml_data/push_cube_ada_29ep_lerobot_v3_img
   - FT dataset: /home/hirol/code/data/push_cube_ada_29ep_lerobot_v3_ft
 
-The policy predicts action.ee_pose_7d as [x, y, z, qx, qy, qz, qw]. This script
-converts each predicted EE pose to a FR3 arm q via Pinocchio IK, then sends the q
-sequence to the existing MuJoCo replay interface.
+The policy predicts action.ee_pose_7d as [x, y, z, qx, qy, qz, qw]. By default
+this script converts each predicted EE pose to a FR3 arm q via Pinocchio IK, then
+sends the q sequence to the existing MuJoCo replay interface. It can also run an
+online torque-level contact inverse dynamics QP controller with
+execution.controller=torque_qp.
 """
 
 from __future__ import annotations
@@ -106,6 +108,7 @@ def default_runtime_config() -> dict:
             "sim_config": DEFAULT_SIM_CONFIG,
             "save_q": None,
             "save_ee": None,
+            "save_tau": None,
         },
         "inference": {
             "episode_index": 0,
@@ -126,6 +129,7 @@ def default_runtime_config() -> dict:
         },
         "execution": {
             "mode": "online",
+            "controller": "ik",
             "no_play": False,
             "unchecked_ik": False,
             "ik_failure_policy": "clip",
@@ -246,6 +250,7 @@ def load_runtime_config(path: Path) -> argparse.Namespace:
         sim_config=config_path(paths.get("sim_config"), DEFAULT_SIM_CONFIG),
         save_q=config_path(paths.get("save_q"), None),
         save_ee=config_path(paths.get("save_ee"), None),
+        save_tau=config_path(paths.get("save_tau"), None),
         episode_index=episode_index,
         episode_indices=episode_indices,
         start_frame=int(inference.get("start_frame", 0)),
@@ -275,6 +280,11 @@ def load_runtime_config(path: Path) -> argparse.Namespace:
             "execution.mode",
             str(execution.get("mode", "online")),
             ("online", "offline"),
+        ),
+        controller=validate_choice(
+            "execution.controller",
+            str(execution.get("controller", "ik")),
+            ("ik", "torque_qp"),
         ),
         no_play=bool(execution.get("no_play", False)),
         unchecked_ik=bool(execution.get("unchecked_ik", False)),
@@ -693,7 +703,7 @@ def read_initial_joint(dataset, frame_idx: int) -> np.ndarray | None:
 
 def make_sim_config(path: Path) -> dict:
     config = load_yaml(path)
-    for key in ("model_path", "output_path", "ik_urdf_path"):
+    for key in ("model_path", "torque_model_path", "output_path", "ik_urdf_path", "qp_urdf_path"):
         if key in config and config[key] is not None:
             config[key] = resolve_repo_path(config[key])
     return config
@@ -925,6 +935,138 @@ def run_online_follow(policy, dataset, frame_indices: np.ndarray, device: str, s
     return np.asarray(ee_poses, dtype=np.float64), np.asarray(q_seq, dtype=np.float64)
 
 
+def desired_wrench_from_config(sim_config: dict) -> np.ndarray | None:
+    value = sim_config.get("qp_desired_wrench", None)
+    if value is None:
+        return None
+    return np.asarray(value, dtype=np.float64).reshape(6)
+
+
+def run_online_torque_qp_follow(
+    policy,
+    dataset,
+    frame_indices: np.ndarray,
+    device: str,
+    sim_config: dict,
+    args: argparse.Namespace,
+):
+    import mujoco
+    import mujoco.viewer
+
+    from sim_mujoco.contact_qp_controller import ContactInverseDynamicsQPController
+    from sim_mujoco.mujocosim_inteface import MujocoSim_interface_fr3
+
+    sim_config = dict(sim_config)
+    torque_model_path = sim_config.get("torque_model_path")
+    if torque_model_path:
+        sim_config["model_path"] = torque_model_path
+
+    sim = MujocoSim_interface_fr3(sim_config)
+    sim.load_model()
+    sim.print_model_info()
+    sim.save_compiled_mjcf()
+    sim_config.setdefault("qp_dt", float(sim.model.opt.timestep))
+    controller = ContactInverseDynamicsQPController(sim_config)
+
+    initial_arm_q = None
+    if args.use_dataset_initial_q:
+        initial_arm_q = read_initial_joint(dataset, int(frame_indices[0]))
+        if initial_arm_q is not None and initial_arm_q.shape[0] != controller.nv:
+            log.warning(
+                "Ignoring dataset initial q with length %d; torque QP expects %d.",
+                initial_arm_q.shape[0],
+                controller.nv,
+            )
+            initial_arm_q = None
+    if initial_arm_q is None:
+        initial_arm_q = np.asarray(sim_config.get("q_reset"), dtype=np.float64).reshape(-1)
+        log.info("Using sim_config q_reset as torque QP initial q.")
+    else:
+        log.info("Using dataset observation.joint at frame %d as torque QP initial q.", int(frame_indices[0]))
+
+    sim.reset_arm_to_q(initial_arm_q)
+    apply_fixed_gripper(sim, sim_config, args, set_q=True)
+
+    fps = float(dataset.lerobot_dataset.fps) / max(1, int(args.policy_stride))
+    control_dt = 1.0 / fps
+    sim_dt = float(sim.model.opt.timestep)
+    steps_per_frame = max(1, int(round(control_dt / sim_dt)))
+    actual_dt = steps_per_frame * sim_dt
+    selected_frames = frame_indices[:: max(1, int(args.policy_stride))]
+    desired_wrench = desired_wrench_from_config(sim_config)
+
+    log.info(
+        "Online torque QP follow: fps=%.2f, control_dt=%.4f, sim_dt=%.4f, "
+        "steps_per_frame=%d, model=%s",
+        fps,
+        control_dt,
+        sim_dt,
+        steps_per_frame,
+        sim_config["model_path"],
+    )
+
+    ee_poses = []
+    q_seq = []
+    tau_seq = []
+    status_counts: dict[str, int] = {}
+
+    with mujoco.viewer.launch_passive(sim.model, sim.data) as viewer:
+        for step_idx, frame_idx in enumerate(selected_frames):
+            if not viewer.is_running():
+                break
+
+            action = predict_action_for_frame(policy, dataset, int(frame_idx), device)
+            ee_pose = action_pose_for_online(action, args.append_mode)
+            last_command = None
+
+            for _ in range(steps_per_frame):
+                apply_fixed_gripper(sim, sim_config, args, set_q=False)
+                q, v = sim.get_arm_state()
+                command = controller.solve(
+                    q=q,
+                    v=v,
+                    target_pose=ee_pose,
+                    desired_wrench=desired_wrench,
+                )
+                sim.command_joint_torque(command.tau)
+                last_command = command
+                status_counts[command.status] = status_counts.get(command.status, 0) + 1
+
+            q_now, _ = sim.get_arm_state()
+            ee_poses.append(ee_pose)
+            q_seq.append(q_now)
+            if last_command is not None:
+                tau_seq.append(last_command.tau)
+
+            apply_fixed_gripper(sim, sim_config, args, set_q=True)
+            viewer.sync()
+            if sim.quick_replay is False:
+                time.sleep(actual_dt)
+
+            if (step_idx + 1) % 10 == 0:
+                if last_command is not None:
+                    pose_err = float(np.linalg.norm(last_command.pose_error))
+                    tau_norm = float(np.linalg.norm(last_command.tau))
+                    log.info(
+                        "Torque QP followed %d/%d data frames, pose_err=%.4f, |tau|=%.3f",
+                        step_idx + 1,
+                        len(selected_frames),
+                        pose_err,
+                        tau_norm,
+                    )
+                else:
+                    log.info("Torque QP followed %d/%d data frames", step_idx + 1, len(selected_frames))
+
+    if status_counts:
+        log.info("Torque QP solver statuses: %s", status_counts)
+    log.info("Online torque QP follow finished %d/%d selected frames.", len(q_seq), len(selected_frames))
+    return (
+        np.asarray(ee_poses, dtype=np.float64),
+        np.asarray(q_seq, dtype=np.float64),
+        np.asarray(tau_seq, dtype=np.float64),
+    )
+
+
 def play_q_sequence(q_seq: np.ndarray, sim_config: dict, fps: float, args: argparse.Namespace) -> None:
     from sim_mujoco.mujocosim_inteface import MujocoSim_interface_fr3
 
@@ -994,6 +1136,11 @@ def main() -> None:
 
     policy, dataset, _cfg, device = build_policy_and_dataset(args)
     sim_config = make_sim_config(args.sim_config)
+    if args.controller == "torque_qp" and (args.execution_mode != "online" or args.no_play):
+        raise ValueError(
+            "execution.controller=torque_qp requires execution.mode=online and no_play=false "
+            "because torque control needs closed-loop simulator state feedback."
+        )
     episode_outputs = []
     episode_indices = selected_episode_indices(dataset, args)
     log.info("Selected episode indices: %s", episode_indices)
@@ -1022,8 +1169,19 @@ def main() -> None:
             len(frame_indices),
             device,
         )
-        if args.execution_mode == "online" and not args.no_play:
+        if args.controller == "torque_qp":
+            ee_poses, q_seq, tau_seq = run_online_torque_qp_follow(
+                policy,
+                dataset,
+                frame_indices,
+                device,
+                sim_config,
+                args,
+            )
+            expected_steps = len(frame_indices[:: max(1, int(args.policy_stride))])
+        elif args.execution_mode == "online" and not args.no_play:
             ee_poses, q_seq = run_online_follow(policy, dataset, frame_indices, device, sim_config, args)
+            tau_seq = np.empty((len(q_seq), 0), dtype=np.float64)
             expected_steps = len(frame_indices[:: max(1, int(args.policy_stride))])
         else:
             ee_poses = predict_ee_poses(policy, dataset, frame_indices, device, args)
@@ -1034,10 +1192,16 @@ def main() -> None:
                 sim_config=sim_config,
                 args=args,
             )
+            tau_seq = np.empty((len(q_seq), 0), dtype=np.float64)
             expected_steps = len(q_seq)
 
-        episode_outputs.append((episode_index, ee_poses, q_seq))
-        log.info("Prepared q sequence for episode %d with shape %s", episode_index, q_seq.shape)
+        episode_outputs.append((episode_index, ee_poses, q_seq, tau_seq))
+        log.info(
+            "Prepared q sequence for episode %d with shape %s, tau shape %s",
+            episode_index,
+            q_seq.shape,
+            tau_seq.shape,
+        )
 
         if not args.no_play and args.execution_mode == "offline":
             if args.offline_playback_fps is None:
@@ -1053,7 +1217,8 @@ def main() -> None:
             break
 
     save_episode_arrays(args.save_ee, episode_outputs, 1, "predicted EE poses")
-    save_episode_arrays(args.save_q, episode_outputs, 2, "IK q sequence")
+    save_episode_arrays(args.save_q, episode_outputs, 2, "arm q sequence")
+    save_episode_arrays(args.save_tau, episode_outputs, 3, "torque QP tau sequence")
 
 
 if __name__ == "__main__":

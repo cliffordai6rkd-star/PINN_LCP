@@ -6,6 +6,8 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import numpy as np
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -186,6 +188,27 @@ class MujocoSim_interface_fr3:
         if step:
             mujoco.mj_step(self.model, self.data)
 
+    def command_joint_torque(self, tau, actuator_names=None, step=True, clip=True):
+        self.ensure_loaded()
+
+        if actuator_names is None:
+            actuator_names = self.arm_actuator_names
+
+        if len(tau) != len(actuator_names):
+            raise ValueError(f"tau length {len(tau)} != actuator_names length {len(actuator_names)}")
+
+        actuator_ids = self.actuator_ids(actuator_names)
+
+        for value, actuator_id in zip(tau, actuator_ids):
+            value = float(value)
+            if clip and self.model.actuator_ctrllimited[actuator_id]:
+                low, high = self.model.actuator_ctrlrange[actuator_id]
+                value = min(max(value, float(low)), float(high))
+            self.data.ctrl[actuator_id] = value
+
+        if step:
+            mujoco.mj_step(self.model, self.data)
+
     def command_gripper(self, value, actuator_name=None, step=False):
         self.ensure_loaded()
 
@@ -195,6 +218,9 @@ class MujocoSim_interface_fr3:
         actuator_id = self.actuator_ids([actuator_name])[0]
         low, high = self.gripper_ctrl_range
         value = min(max(float(value), float(low)), float(high))
+        if self.model.actuator_ctrllimited[actuator_id]:
+            model_low, model_high = self.model.actuator_ctrlrange[actuator_id]
+            value = min(max(value, float(model_low)), float(model_high))
         self.data.ctrl[actuator_id] = value
 
         if step:
@@ -284,6 +310,33 @@ class MujocoSim_interface_fr3:
             q.append(self.data.qpos[qpos_addr])
 
         return q
+
+    def get_arm_qvel(self, joint_names=None):
+        self.ensure_loaded()
+
+        if joint_names is None:
+            joint_names = self.arm_joint_names
+
+        v = []
+        for joint_name in joint_names:
+            joint_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_JOINT,
+                joint_name,
+            )
+            if joint_id < 0:
+                raise ValueError(f"joint not found: {joint_name}")
+
+            dof_addr = self.model.jnt_dofadr[joint_id]
+            v.append(self.data.qvel[dof_addr])
+
+        return v
+
+    def get_arm_state(self, joint_names=None):
+        return (
+            np.asarray(self.get_arm_qpos(joint_names=joint_names), dtype=np.float64),
+            np.asarray(self.get_arm_qvel(joint_names=joint_names), dtype=np.float64),
+        )
 
     def run_joint_position_control(self, target_fn, control_dt=None, real_time=True, reset_fn=None):
         self.ensure_loaded()
