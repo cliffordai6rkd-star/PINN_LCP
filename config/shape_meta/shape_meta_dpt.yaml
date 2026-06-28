@@ -1,0 +1,111 @@
+io:
+  input: data/dynamic_test_new
+  output: data/dynamic_test__new_lerobotv3
+  repo_id: test
+  max_episodes: 100
+  no_videos: true
+  push_to_hub: false
+
+fps: 30
+task: wrench_bg
+master_timestamp_path: cameras/side_1/timestamp_us
+
+# index:直接拿
+# nearest:从主时间轴对应的最近的timestamp
+# nearest_past_window 
+
+features:
+  # observation.images.side_1:
+  #   dtype: video
+  #   shape: [192, 256, 3]
+  #   h5_path: cameras/side_1/frames
+  #   timestamp_path: cameras/side_1/timestamp_us
+  #   align: nearest
+
+  # observation.images.side_2:
+  #   dtype: video
+  #   shape: [192, 256, 3]
+  #   h5_path: cameras/side_2/frames
+  #   timestamp_path: cameras/side_2/timestamp_us
+  #   align: nearest
+
+  # observation.images.wrist:
+  #   dtype: video
+  #   shape: [192, 256, 3]
+  #   h5_path: cameras/wrist/frames
+  #   timestamp_path: cameras/wrist/timestamp_us
+  #   align: nearest
+
+  observation.ee_state.ee_pose:
+    dtype: float32
+    shape: [4, 4]
+    h5_path: teleop/ee_pose
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+  observation.ee_state.gripper:
+    dtype: int8
+    shape: [1]
+    h5_path: teleop/gripper_state
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+  observation.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+  observation.velocity:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/dq_follower
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+  observation.acceleration:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/a_follower
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+
+  observation.ft:
+    dtype: float32
+    shape: [6]
+    h5_path: force_sensor/wrench_filtered
+    timestamp_path: force_sensor/timestamp_us
+    align: nearest
+    # align: nearest_past_window
+    window_size: 1
+
+  observation.torque:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_follower
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+  observation.tau_ext:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_ext
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+  action.ee_pose:
+    dtype: float32
+    shape: [4, 4]
+    h5_path: teleop/ee_pose
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+
+  action.gripper_state:
+    dtype: int8
+    shape: [1]
+    h5_path: teleop/gripper_state
+    timestamp_path: teleop/timestamp_us
+    align: nearest
+        

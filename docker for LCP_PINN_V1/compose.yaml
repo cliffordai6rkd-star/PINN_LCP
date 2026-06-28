@@ -12,8 +12,8 @@ services:
     image: st-pinn:v2
     container_name: st-pinn
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
-    working_dir: /workspace/PINN_LCP
-    command: sleep infinity
+    working_dir: /workspace
+    command: bash -lc "cd /workspace && exec sleep infinity"
     stdin_open: true
     tty: true
     ipc: host
@@ -32,7 +32,7 @@ services:
     environment:
       HOME: /home/${CONTAINER_USER:-teleophost}
       MPLCONFIGDIR: /tmp/matplotlib
-      PYTHONPATH: /workspace/PINN_LCP:/workspace/dp_hirol-main
+      PYTHONPATH: /workspace:/workspace/train:/workspace/train/trainer:/workspace/data_process:/workspace/sim_mujoco:/workspace/dp_hirol-main
       MUJOCO_GL: ${MUJOCO_GL:-glfw}
       DISPLAY: ${DISPLAY}
       XAUTHORITY: /tmp/.docker.xauth
@@ -57,11 +57,11 @@ services:
       DP_IMAGE_DATASET: /workspace/dp_hirol-main/data/zml_data/push_cube_ada_29ep_lerobot_v3_img
       DP_FT_DATASET: /workspace/data/push_cube_ada_29ep_lerobot_v3_ft
       DP_DINO_MODEL: /workspace/dp_hirol-main/data/models/dinov2-base
-      SIM_CONFIG: /workspace/PINN_LCP/config/sim_cfg/replay_test.yaml
-      SIM_INFERENCE_CONFIG: /workspace/PINN_LCP/inference/sim_inference.yaml
+      SIM_CONFIG: /workspace/config/sim_cfg/replay_test.yaml
+      SIM_INFERENCE_CONFIG: /workspace/inference/sim_inference.yaml
     volumes:
-      - ..:/workspace/PINN_LCP
+      - ..:/workspace
       - ../../data:/workspace/data
-      - ../../dp_hirol-main:/workspace/dp_hirol-main
+      # - ../../dp_hirol-main:/workspace/dp_hirol-main
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ${XAUTHORITY:-$HOME/.Xauthority}:/tmp/.docker.xauth:ro

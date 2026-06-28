@@ -69,7 +69,7 @@ class Sim_replayer:
         viewer.play_joint_sequences(all_q_seqs, dt=1.0 / fps)
 
 if __name__ == "__main__":
-    with open("config/sim_cfg/test.yaml", "r") as f:
+    with open("config/sim_cfg/replay_test.yaml", "r") as f:
                 config = yaml.safe_load(f)
     replayer = Sim_replayer(config)
     replayer.replayer(config)

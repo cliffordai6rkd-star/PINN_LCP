@@ -2,7 +2,8 @@
 # model_path: sim_mesh/franka_fr3/fr3_pika_gripper_ati.urdf
 # model_path: sim_mesh/franka_fr3/fr3_pika_ati_torque.xml
 # model_path: sim_mesh/scene/fr3_pika_gripper_ati_world.xml
-model_path: sim_mesh/franka_fr3/fr3_pika_ati_scene.xml
+# model_path: sim_mesh/franka_fr3/fr3_pika_ati_scene.xml
+model_path: sim_mesh/franka_fr3/franka_hand.xml
 torque_model_path: sim_mesh/franka_fr3/fr3_pika_ati_torque_scene.xml
 output_path: sim_mesh/franka_fr3/mjcf/fr3_pika_gripper_ati.compiled.xml
 print_info: false
