@@ -295,38 +295,9 @@
     </collision>
   </link>
 
-  <joint name="ft_ati_m8_joint" type="fixed">
-    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.03"/>
-    <parent link="ft_ati_m8_link"/>
-    <child link="ati_hand_adapter_link"/>
-  </joint>
-
-  <link name="ati_hand_adapter_link">
-    <inertial>
-      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
-      <mass value="0.0325"/>
-      <inertia ixx="3e-05" ixy="0.0" ixz="0.0" iyy="3e-05" iyz="0.0" izz="6.86e-05"/>
-    </inertial>
-    <visual>
-      <origin rpy="0 0 1.5707963" xyz="0.01 -0.076 -0.045"/>
-      <geometry>
-        <mesh filename="assets/ati_pika_new.STL" scale="0.001 0.001 0.001"/>
-      </geometry>
-      <material name="">
-        <color rgba="1 1 1 1"/>
-      </material>
-    </visual>
-    <collision>
-      <origin rpy="0 0 1.5707963" xyz="0.01 -0.076 -0.045"/>
-      <geometry>
-        <mesh filename="assets/ati_pika_new.STL" scale="0.001 0.001 0.001"/>
-      </geometry>
-    </collision>
-  </link>
-
   <joint name="fr3_hand_joint" type="fixed">
-    <origin rpy="0 0 -0.7853981633974483" xyz="0 0 0"/>
-    <parent link="ati_hand_adapter_link"/>
+    <origin rpy="0 0 -0.7853981633974483" xyz="0 0 0.03"/>
+    <parent link="ft_ati_m8_link"/>
     <child link="fr3_hand"/>
   </joint>
   <!-- sub-link defining detailed meshes for collision with environment -->

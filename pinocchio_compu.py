@@ -22,8 +22,8 @@ log = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare ATI wrench with Pinocchio equivalent endpoint wrench.")
     parser.add_argument("--config", type=Path, default=Path("config/pinocchio.yaml"))
-    parser.add_argument("--urdf", type=Path, default=Path("sim_mesh/franka_fr3/fr3_franka_hand.urdf"))
-    parser.add_argument("--frame-name", default="fr3_hand")
+    parser.add_argument("--urdf", type=Path, default=Path("sim_mesh/franka_fr3/franka_ati_hand.urdf"))
+    parser.add_argument("--frame-name", default="ft_ati_m8_link")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/pinocchio_check"))
     return parser.parse_args()
 
@@ -234,6 +234,7 @@ def main():
         tau_list = []
         a_list = []
         contact_wrench_c_list = []
+        tau_id_wrench_list = []
 
         for q, v, a, tau, tau_ext, wrench in zip(
             episode_signals["q"],
@@ -253,7 +254,7 @@ def main():
                 model,
                 data,
                 frame_id,
-                pin.ReferenceFrame.WORLD,
+                pin.ReferenceFrame.LOCAL,
             )
 
             # tau_g = pin.rnea(
@@ -266,10 +267,11 @@ def main():
 
             tau_ext_m = tau_ext
             tau_contact_c = -tau_id + tau
-            # tau_ati = J.T @ wrench
+            tau_ati = J.T @ wrench
 
             # ati = wrench
             contact_wrench_c = np.linalg.lstsq(J.T, tau_contact_c, rcond=None)[0]
+            tau_id_wrench = np.linalg.lstsq(J.T, tau_id, rcond=None)[0]
             # tau_ext_c = np.linalg.lstsq(J.T, tau_ext_c, rcond=None)[0]
 
             tau_ext_m_list.append(tau_ext_m)
@@ -277,8 +279,10 @@ def main():
             tau_id_list.append(tau_id)
             ati_list.append(wrench)
             tau_list.append(tau)
+            tau_ati_list.append(tau_ati)
             a_list.append(a)
             contact_wrench_c_list.append(contact_wrench_c)
+            tau_id_wrench_list.append(tau_id_wrench)
 
         episode_dir = output_dir / f"episode_{episode_index:03d}"
         episode_dir.mkdir(parents=True, exist_ok=True)
@@ -301,6 +305,25 @@ def main():
             a_name="tau",
             b_name="tau_id",
             dim_names=tau_dim_names,
+        )
+        plot_episode_pair(
+            contact_wrench_c_list,
+            ati_list,
+            episode_dir / "contact_c_vs_ati.png",
+            name="contact_c_vs_ati",
+            a_name="contact_c",
+            b_name="ati",
+            dim_names=wrench_dim_names,
+        )
+
+        plot_episode_pair(
+            tau_id_wrench_list,
+            ati_list,
+            episode_dir / "tau_id_wrench_vs_ati.png",
+            name="tau_id_wrench_vs_ati",
+            a_name="tau_id_wrench",
+            b_name="ati",
+            dim_names=wrench_dim_names,
         )
 
         log.info(f"saved episode {episode_index} plots: {episode_dir}")

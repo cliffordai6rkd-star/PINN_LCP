@@ -15,9 +15,14 @@ DEFAULT_FIELDS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replace LeRobot 4x4 ee_pose fields with xyz + quaternion."
+        description="Convert LeRobot ee_pose fields between 4x4 matrix and xyz + quaternion."
     )
     parser.add_argument("--datapath", type=Path, required=True, help="LeRobot dataset folder.")
+    parser.add_argument(
+        "--inverse",
+        action="store_true",
+        help="Convert [x, y, z, qx, qy, qz, qw] back to 4x4 homogeneous matrices.",
+    )
     return parser.parse_args()
 
 
@@ -104,6 +109,54 @@ def matrix_to_xyz_quat_xyzw(pose: Any) -> np.ndarray:
     return np.concatenate([xyz, quat], axis=0).astype(np.float32)
 
 
+def quat_xyzw_to_rotation_matrix(quat: Any) -> np.ndarray:
+    """Convert quaternion in [qx, qy, qz, qw] order to a 3x3 rotation matrix."""
+
+    np = load_numpy()
+    quat = np.asarray(quat, dtype=np.float64).reshape(-1)
+    if quat.shape != (4,):
+        raise ValueError(f"quaternion must have shape (4,), got {quat.shape}")
+
+    norm = np.linalg.norm(quat)
+    if norm <= 0:
+        raise ValueError("quaternion norm must be positive")
+    qx, qy, qz, qw = quat / norm
+
+    xx = qx * qx
+    yy = qy * qy
+    zz = qz * qz
+    xy = qx * qy
+    xz = qx * qz
+    yz = qy * qz
+    wx = qw * qx
+    wy = qw * qy
+    wz = qw * qz
+
+    matrix = np.asarray(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float32,
+    )
+    return matrix
+
+
+def xyz_quat_xyzw_to_matrix(pose7: Any) -> np.ndarray:
+    """Convert [x, y, z, qx, qy, qz, qw] to a 4x4 homogeneous transform."""
+
+    np = load_numpy()
+    flat = to_numpy(pose7).reshape(-1).astype(np.float64)
+    if flat.shape != (7,):
+        raise ValueError(f"quat7 pose must have shape (7,), got {flat.shape}")
+
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = quat_xyzw_to_rotation_matrix(flat[3:7])
+    pose[:3, 3] = flat[:3].astype(np.float32)
+    return pose
+
+
 def pose_to_quat7(value: Any) -> np.ndarray:
     """Accept either a 4x4 matrix pose or an already flattened quat7 pose."""
 
@@ -125,6 +178,20 @@ def pose_to_quat7(value: Any) -> np.ndarray:
     raise ValueError(f"pose must be 4x4 matrix or quat7, got shape {array.shape}")
 
 
+def pose_to_matrix4(value: Any) -> np.ndarray:
+    """Accept either a quat7 pose or an already shaped 4x4 matrix pose."""
+
+    array = to_numpy(value)
+    if array.shape == (4, 4):
+        return array.astype(np.float32)
+
+    flat = array.reshape(-1)
+    if flat.shape == (7,):
+        return xyz_quat_xyzw_to_matrix(flat)
+
+    raise ValueError(f"pose must be quat7 or 4x4 matrix, got shape {array.shape}")
+
+
 def backup_file(path: Path) -> None:
     backup_path = path.with_suffix(path.suffix + ".bak")
     if not backup_path.exists():
@@ -142,7 +209,18 @@ def table_column_to_quat7_array(column) -> list[list[float]]:
     return [pose_to_quat7(value.as_py()).tolist() for value in column]
 
 
-def replace_table_fields(table, fields: list[str]):
+def table_column_to_matrix4_array(column) -> list[list[list[float]]]:
+    return [pose_to_matrix4(value.as_py()).tolist() for value in column]
+
+
+def arrow_pose_type(inverse: bool):
+    pa, _ = load_pyarrow()
+    if inverse:
+        return pa.list_(pa.list_(pa.float32(), list_size=4), list_size=4)
+    return pa.list_(pa.float32(), list_size=7)
+
+
+def replace_table_fields(table, fields: list[str], inverse: bool):
     pa, _ = load_pyarrow()
     updated = table
 
@@ -150,15 +228,43 @@ def replace_table_fields(table, fields: list[str]):
         if field not in updated.column_names:
             raise KeyError(f"{field!r} is missing from parquet columns: {updated.column_names}")
 
-        quat7_values = table_column_to_quat7_array(updated[field])
-        quat7_array = pa.array(quat7_values, type=pa.list_(pa.float32(), list_size=7))
+        pose_values = (
+            table_column_to_matrix4_array(updated[field])
+            if inverse
+            else table_column_to_quat7_array(updated[field])
+        )
+        pose_array = pa.array(pose_values, type=arrow_pose_type(inverse))
         field_index = updated.schema.get_field_index(field)
-        updated = updated.set_column(field_index, field, quat7_array)
+        updated = updated.set_column(field_index, field, pose_array)
 
-    return update_huggingface_schema_metadata(updated, fields)
+    return update_huggingface_schema_metadata(updated, fields, inverse)
 
 
-def update_huggingface_schema_metadata(table, fields: list[str]):
+def huggingface_pose_feature(inverse: bool) -> dict[str, Any]:
+    if inverse:
+        return {
+            "feature": {
+                "feature": {
+                    "dtype": "float32",
+                    "_type": "Value",
+                },
+                "length": 4,
+                "_type": "Sequence",
+            },
+            "length": 4,
+            "_type": "Sequence",
+        }
+    return {
+        "feature": {
+            "dtype": "float32",
+            "_type": "Value",
+        },
+        "length": 7,
+        "_type": "Sequence",
+    }
+
+
+def update_huggingface_schema_metadata(table, fields: list[str], inverse: bool):
     metadata = dict(table.schema.metadata or {})
     raw = metadata.get(b"huggingface")
     if raw is None:
@@ -172,27 +278,20 @@ def update_huggingface_schema_metadata(table, fields: list[str]):
 
     for field in fields:
         if field in features:
-            features[field] = {
-                "feature": {
-                    "dtype": "float32",
-                    "_type": "Sequence",
-                },
-                "length": 7,
-                "_type": "Sequence",
-            }
+            features[field] = huggingface_pose_feature(inverse)
 
     metadata[b"huggingface"] = json.dumps(payload).encode("utf-8")
     return table.replace_schema_metadata(metadata)
 
 
-def replace_parquet_files(root: Path, fields: list[str], backup: bool) -> dict[str, list[float]]:
+def replace_parquet_files(root: Path, fields: list[str], backup: bool, inverse: bool) -> dict[str, list[float]]:
     np = load_numpy()
     _, pq = load_pyarrow()
     collected = {field: [] for field in fields}
 
     for parquet_path in data_parquet_files(root):
         table = pq.read_table(parquet_path)
-        updated = replace_table_fields(table, fields)
+        updated = replace_table_fields(table, fields, inverse)
 
         for field in fields:
             values = np.asarray(updated[field].to_pylist(), dtype=np.float32)
@@ -217,7 +316,7 @@ def compute_stats(values):
         "max": values.max(axis=0).tolist(),
         "mean": values.mean(axis=0).tolist(),
         "std": values.std(axis=0).tolist(),
-        "count": [int(values.shape[0])] * int(values.shape[1]),
+        "count": np.full(values.shape[1:], int(values.shape[0]), dtype=np.int64).tolist(),
         "q01": np.quantile(values, 0.01, axis=0).tolist(),
         "q10": np.quantile(values, 0.10, axis=0).tolist(),
         "q50": np.quantile(values, 0.50, axis=0).tolist(),
@@ -226,7 +325,7 @@ def compute_stats(values):
     }
 
 
-def replace_meta_files(root: Path, fields: list[str], stats: dict[str, Any], backup: bool) -> None:
+def replace_meta_files(root: Path, fields: list[str], stats: dict[str, Any], backup: bool, inverse: bool) -> None:
     info_path = root / "meta" / "info.json"
     stats_path = root / "meta" / "stats.json"
 
@@ -239,7 +338,7 @@ def replace_meta_files(root: Path, fields: list[str], stats: dict[str, Any], bac
         if field not in info["features"]:
             raise KeyError(f"{field!r} is missing from {info_path}")
         info["features"][field]["dtype"] = "float32"
-        info["features"][field]["shape"] = [7]
+        info["features"][field]["shape"] = [4, 4] if inverse else [7]
     info_path.write_text(json.dumps(info, indent=4), encoding="utf-8")
 
     stats_data = json.loads(stats_path.read_text())
@@ -248,7 +347,7 @@ def replace_meta_files(root: Path, fields: list[str], stats: dict[str, Any], bac
     stats_path.write_text(json.dumps(stats_data, indent=4), encoding="utf-8")
 
 
-def replace_lerobot_dataset(root: Path, fields: list[str], backup: bool) -> None:
+def replace_lerobot_dataset(root: Path, fields: list[str], backup: bool, inverse: bool) -> None:
     if not root.exists():
         raise FileNotFoundError(f"datapath does not exist: {root}")
     if not (root / "meta" / "info.json").exists():
@@ -256,16 +355,18 @@ def replace_lerobot_dataset(root: Path, fields: list[str], backup: bool) -> None
     if not (root / "meta" / "stats.json").exists():
         raise FileNotFoundError(f"missing LeRobot meta/stats.json under: {root}")
 
-    stats = replace_parquet_files(root, fields, backup=backup)
-    replace_meta_files(root, fields, stats, backup=backup)
+    stats = replace_parquet_files(root, fields, backup=backup, inverse=inverse)
+    replace_meta_files(root, fields, stats, backup=backup, inverse=inverse)
 
 
 def main() -> None:
     args = parse_args()
-    replace_lerobot_dataset(args.datapath, list(DEFAULT_FIELDS), backup=False)
+    replace_lerobot_dataset(args.datapath, list(DEFAULT_FIELDS), backup=False, inverse=args.inverse)
     print(f"replaced fields in-place under: {args.datapath}")
+    shape = "[4, 4]" if args.inverse else "[7]"
+    order = "4x4 homogeneous matrix" if args.inverse else "[x, y, z, qx, qy, qz, qw]"
     for field in DEFAULT_FIELDS:
-        print(f"  {field}: shape=[7], order=[x, y, z, qx, qy, qz, qw]")
+        print(f"  {field}: shape={shape}, order={order}")
 
 
 if __name__ == "__main__":

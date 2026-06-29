@@ -1,0 +1,29 @@
+<mujoco model="load_fr3_hand_scene">
+  <include file="fr3_franka_hand.xml"/>
+
+  <option gravity="0 0 -9.81"/>
+
+  <statistic center="0.25 0 0.55" extent="1.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="135" elevation="-25"/>
+    <scale framelength="0.12" framewidth="0.008"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.28 0.36 0.46" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="load_fr3_hand_ground" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+      rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="load_fr3_hand_ground" texture="load_fr3_hand_ground" texuniform="true" texrepeat="5 5"
+      reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="load_fr3_hand_ground"/>
+    <camera name="overview" pos="1.4 -1.2 0.9" xyaxes="0.65 0.76 0 -0.34 0.29 0.89" fovy="45"/>
+    <camera name="front" pos="1.2 0 0.55" euler="0 1.5707963 1.5707963" fovy="45"/>
+  </worldbody>
+</mujoco>
