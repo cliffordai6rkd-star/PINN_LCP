@@ -15,15 +15,34 @@ dataloader:
     # ee_acceleration: observation.ee_acceleration
     # ee_pose: action.ee_pose                  #u             
     wrench: observation.ft            #lambda
-  # image_keys:
-  #   wrist: observation.images.wrist
-  #   side_1: observation.images.side_1p
-  #   side_2: observation.images.side_2
-  # normalize_lowdim_keys:
-    # - q
-    # - v
-    # - a
-    # - wrench
+
+
+lowpass_filter:
+  enabled: true
+  sample_rate_hz: 120
+  order: 2
+  zero_phase: true
+  derive_v_from_q: false
+  derive_a_from_v: false
+  fields:
+    q:
+      enabled: false
+      cutoff_hz: 10.0
+    v:
+      enabled: true
+      cutoff_hz: 20
+    a:
+      enabled: false
+      cutoff_hz: 5.0
+    tau:
+      enabled: true
+      cutoff_hz: 8.0
+    tau_ext:
+      enabled: false
+      cutoff_hz: 8.0
+    wrench:
+      enabled: false
+      cutoff_hz: 8.0
 
 model:
   input_dims:
