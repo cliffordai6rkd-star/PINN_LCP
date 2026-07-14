@@ -2,12 +2,21 @@
 # model_path: sim_mesh/franka_fr3/fr3_pika_gripper_ati.urdf
 # model_path: sim_mesh/franka_fr3/fr3_pika_ati_torque.xml
 # model_path: sim_mesh/scene/fr3_pika_gripper_ati_world.xml
-model_path: sim_mesh/franka_fr3/fr3_pika_ati_scene.xml
+# model_path: sim_mesh/franka_fr3/fr3_pika_ati_scene.xml
+model_path: sim_mesh/nero/nero_with_gripper.urdf
 output_path: sim_mesh/franka_fr3/mjcf/fr3_pika_gripper_ati.compiled.xml
 print_info: false
 save_mjcf: false
 show_sim: true
 quick_replay: true
+arm_joint_names:
+  - joint1
+  - joint2
+  - joint3
+  - joint4
+  - joint5
+  - joint6
+  - joint7
 gripper_actuator_name: pika_gripper_actuator
 gripper_ctrl_range: [-0.11, 0.0]
 

@@ -7,7 +7,7 @@ import yaml
 from pathlib import Path
 from data_process.dataloader import PINNHistoryFutureDataset
 from train.base_trainer import BaseTrainer
-from pinn_model.model.model_v1 import Fhead_transformerv1
+from model.pinn_model.model_v1 import Fhead_transformerv1
 from train.pinn_loss import PinnLossCalculator
 
 logging.basicConfig(level=logging.INFO)

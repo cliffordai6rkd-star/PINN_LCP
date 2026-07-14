@@ -2,7 +2,9 @@
 
 import argparse
 import logging
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
@@ -19,11 +21,8 @@ log = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Compare ATI wrench with Pinocchio equivalent endpoint wrench.")
+    parser = argparse.ArgumentParser(description="Compare real with Pinocchio urdf tau.")
     parser.add_argument("--config", type=Path, default=Path("config/pinocchio.yaml"))
-    parser.add_argument("--urdf", type=Path, default=Path("sim_mesh/franka_fr3/fr3_franka_hand.urdf"))
-    parser.add_argument("--frame-name", default="fr3_hand")
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/pinocchio_check"))
     return parser.parse_args()
 
 
@@ -33,68 +32,90 @@ def to_numpy_1d(value):
     return np.asarray(value, dtype=np.float64).reshape(-1)
 
 
-def plot_episode(ati_list, tau_eq_list, diff_list, save_path):
-    ati = np.asarray(ati_list)
-    tau_eq = np.asarray(tau_eq_list)
-    diff = np.asarray(diff_list)
+def _save_episode_comparison(
+    first,
+    second,
+    quantity_names,
+    component_names,
+    episode_index,
+    save_path,
+):
+    difference = first - second
+    curve_names = (
+        quantity_names[0],
+        quantity_names[1],
+        f"{quantity_names[0]} - {quantity_names[1]}",
+    )
+    curve_values = (first, second, difference)
+    colors = ("tab:blue", "#e6b800", "tab:green")
 
-    names = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+    fig, axes = plt.subplots(
+        len(component_names),
+        1,
+        figsize=(14, max(2.4 * len(component_names), 4)),
+        sharex=True,
+        squeeze=False,
+    )
+    axes = axes[:, 0]
 
-    fig, axes = plt.subplots(6, 1, figsize=(14, 16), sharex=True)
-
-    for i, name in enumerate(names):
-        axes[i].plot(ati[:, i], label="ATI wrench", linewidth=1.2)
-        axes[i].plot(tau_eq[:, i], label="Pinocchio external eq wrench", linewidth=1.2)
-        axes[i].plot(diff[:, i], label="ATI - Pinocchio", linewidth=0.9, alpha=0.75)
-        axes[i].set_ylabel(name)
-        axes[i].grid(True)
-        axes[i].legend(loc="upper right")
+    for component_idx, component_name in enumerate(component_names):
+        axis = axes[component_idx]
+        for curve_name, values, color in zip(curve_names, curve_values, colors):
+            axis.plot(
+                values[:, component_idx],
+                label=curve_name,
+                color=color,
+                linewidth=1.1,
+            )
+        axis.set_ylabel(component_name)
+        axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.5)
+        axis.grid(True, alpha=0.35)
+        axis.legend(loc="upper right", ncol=3)
 
     axes[-1].set_xlabel("frame in episode")
-    fig.tight_layout()
+
+    fig.suptitle(f"Episode {episode_index}")
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
 
-def main():
-    args = parse_args()
-    full_model = pin.buildModelFromUrdf(str(args.urdf))
-    locked_joint_names = ["fr3_finger_joint1", "fr3_finger_joint2"]
-    locked_joint_ids = [full_model.getJointId(name) for name in locked_joint_names]
-    model = pin.buildReducedModel(
-        full_model,
-        locked_joint_ids,
-        pin.neutral(full_model),
-    )
-    data = model.createData()
+def plot_two_quantities_by_episode(
+    dataset: PINNDataset,
+    calculate_quantities: Callable[[dict[str, Any]], tuple[Any, Any]],
+    *,
+    quantity_names: Sequence[str],
+    component_names: Sequence[str],
+    output_dir: Path,
+    filename_suffix: str = "compare",
+) -> list[Path]:
+    """Read every episode, calculate two quantities, and save A/B/A-B plots."""
+    quantity_names = tuple(quantity_names)
+    component_names = tuple(component_names)
+    if len(quantity_names) != 2:
+        raise ValueError(
+            f"quantity_names must contain exactly two names, got {len(quantity_names)}"
+        )
+    if not component_names:
+        raise ValueError("component_names must not be empty")
 
-    frame_id = model.getFrameId(args.frame_name)
-    if frame_id == len(model.frames):
-        raise ValueError(f"frame not found: {args.frame_name}")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    with args.config.open("r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    dataset = PINNDataset(config)
     raw_to_sample_idx = {
         raw_idx: sample_idx
         for sample_idx, raw_idx in enumerate(dataset.valid_indices)
     }
-
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     episodes = list(dataset.dataset.meta.episodes)
+    saved_paths = []
     log.info(f"num episodes: {len(episodes)}")
 
-    for ep_i, ep in enumerate(episodes):
-        episode_index = int(ep.get("episode_index", ep_i))
-        start_raw = int(ep["dataset_from_index"])
-        end_raw = int(ep["dataset_to_index"])
-
-        ati_list = []
-        tau_eq_list = []
-        diff_list = []
+    for episode_position, episode in enumerate(episodes):
+        episode_index = int(episode.get("episode_index", episode_position))
+        start_raw = int(episode["dataset_from_index"])
+        end_raw = int(episode["dataset_to_index"])
+        first_values = []
+        second_values = []
 
         for raw_idx in range(start_raw, end_raw):
             sample_idx = raw_to_sample_idx.get(raw_idx)
@@ -102,48 +123,134 @@ def main():
                 continue
 
             sample = dataset[sample_idx]
+            first, second = calculate_quantities(sample)
+            first = to_numpy_1d(first)
+            second = to_numpy_1d(second)
 
-            q = to_numpy_1d(sample["q"][0])
-            v = to_numpy_1d(sample["v"][0])
-            a = to_numpy_1d(sample["a"][0])
-            tau = to_numpy_1d(sample["tau"][0])
-            wrench = to_numpy_1d(sample["wrench"][0])
+            if first.shape != second.shape:
+                raise ValueError(
+                    f"episode {episode_index}, raw index {raw_idx}: "
+                    f"quantity shapes do not match: {first.shape} != {second.shape}"
+                )
+            if first.size != len(component_names):
+                raise ValueError(
+                    f"episode {episode_index}, raw index {raw_idx}: got {first.size} components, "
+                    f"but component_names contains {len(component_names)} names"
+                )
 
-            tau_id = pin.rnea(model, data, q, v, a)
+            first_values.append(first)
+            second_values.append(second)
 
-            pin.computeJointJacobians(model, data, q)
-            pin.framesForwardKinematics(model, data, q)
-
-            J = pin.getFrameJacobian(
-                model,
-                data,
-                frame_id,
-                pin.ReferenceFrame.LOCAL,
-            )
-
-            # tau_g = pin.rnea(
-            #     model,
-            #     data,
-            #     q,
-            #     np.zeros(model.nv),
-            #     np.zeros(model.nv),
-            # )
-
-            tau_ext = tau_id - tau
-            tau_eq_wrench = np.linalg.lstsq(J.T, tau_ext, rcond=None)[0]
-            diff = wrench - tau_eq_wrench
-
-            ati_list.append(wrench)
-            tau_eq_list.append(tau_eq_wrench)
-            diff_list.append(diff)
-
-        if not ati_list:
+        if not first_values:
             log.warning(f"episode {episode_index} has no samples, skip")
             continue
 
-        save_path = output_dir / f"episode_{episode_index:03d}_wrench_compare.png"
-        plot_episode(ati_list, tau_eq_list, diff_list, save_path)
+        first = np.stack(first_values, axis=0)
+        second = np.stack(second_values, axis=0)
+        save_path = output_dir / f"episode_{episode_index:03d}_{filename_suffix}.png"
+        _save_episode_comparison(
+            first,
+            second,
+            quantity_names,
+            component_names,
+            episode_index,
+            save_path,
+        )
+        saved_paths.append(save_path)
         log.info(f"saved episode {episode_index} plot: {save_path}")
+
+    return saved_paths
+
+
+def main():
+    args = parse_args()
+
+    with args.config.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    pinocchio_config = config.get("pinocchio")
+    plot_config = config.get("plot")
+    if not isinstance(pinocchio_config, dict):
+        raise ValueError("config must contain a 'pinocchio' mapping")
+    if not isinstance(plot_config, dict):
+        raise ValueError("config must contain a 'plot' mapping")
+
+    try:
+        urdf_path = Path(pinocchio_config["urdf_path"])
+        frame_name = str(pinocchio_config["frame_name"])
+        locked_joint_names = list(pinocchio_config["locked_joint_names"])
+        output_dir = Path(plot_config["output_dir"])
+    except KeyError as error:
+        raise ValueError(f"missing required config key: {error.args[0]}") from error
+
+    if not urdf_path.is_file():
+        raise FileNotFoundError(f"URDF file not found: {urdf_path}")
+    if not all(isinstance(name, str) and name for name in locked_joint_names):
+        raise ValueError("pinocchio.locked_joint_names must be a list of joint names")
+
+    dataset = PINNDataset(config)
+
+    full_model = pin.buildModelFromUrdf(str(urdf_path))
+    missing_joint_names = [
+        name for name in locked_joint_names if not full_model.existJointName(name)
+    ]
+    if missing_joint_names:
+        raise ValueError(f"joints not found in URDF: {missing_joint_names}")
+
+    locked_joint_ids = [full_model.getJointId(name) for name in locked_joint_names]
+    if locked_joint_ids:
+        model = pin.buildReducedModel(
+            full_model,
+            locked_joint_ids,
+            pin.neutral(full_model),
+        )
+    else:
+        model = full_model
+    data = model.createData()
+
+    frame_id = model.getFrameId(frame_name)
+    if frame_id == len(model.frames):
+        raise ValueError(f"frame not found: {frame_name}")
+
+    def calculate_wrenches(sample):
+        q = to_numpy_1d(sample["q"][-1])
+        v = to_numpy_1d(sample["v"][-1])
+        a = to_numpy_1d(sample["a"][-1])
+        tau = to_numpy_1d(sample["tau"][-1])
+        # wrench = to_numpy_1d(sample["wrench"][-1])
+
+        tau_id = pin.rnea(model, data, q, v, a)
+        tau_g = pin.computeGeneralizedGravity(model, data, q).copy()
+        # tau_id -= tau_g
+        pin.computeJointJacobians(model, data, q)
+        pin.framesForwardKinematics(model, data, q)
+        jacobian = pin.getFrameJacobian(
+            model,
+            data,
+            frame_id,
+            pin.ReferenceFrame.LOCAL,
+        )
+
+        # tau_id_wrench = np.linalg.lstsq(jacobian.T, tau_id, rcond=None)[0]
+        # tau_wrench = np.linalg.lstsq(jacobian.T, tau, rcond=None)[0]
+        return tau, tau_id
+
+    # plot_two_quantities_by_episode(
+    #     dataset,
+    #     calculate_wrenches,
+    #     quantity_names=("ext_comu", "external sim in wrench space"),
+    #     component_names=("Fx", "Fy", "Fz", "Tx", "Ty", "Tz"),
+    #     output_dir=output_dir,
+    #     filename_suffix="wrench_compare",
+    # )
+    plot_two_quantities_by_episode(
+        dataset,
+        calculate_wrenches,
+        quantity_names=("tau", "tau_id"),
+        component_names=("1", "2", "3", "4", "5", "6", "7"),
+        output_dir=output_dir,
+        filename_suffix="tau_compare",
+    )
 
 
 if __name__ == "__main__":

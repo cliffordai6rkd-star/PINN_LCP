@@ -14,22 +14,32 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _project_path(path):
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
 
 
 
 class MujocoSim_interface_fr3:
     def __init__(self,config):
         model_path = config.get("model_path", "sim_mesh/franka_fr3/fr3_pika_gripper_ati.urdf")
-        self.model_path = Path(model_path).expanduser().resolve()
+        self.model_path = _project_path(model_path)
         output_path = config.get("output_path", None)
         self.output_path = (
-            Path(output_path).expanduser().resolve()
+            _project_path(output_path)
             if output_path is not None
             else None
         )
         self.print_info = config.get("print_info", True)
         self.save_mjcf = config.get("save_mjcf", False)
         self.show_sim = config.get("show_sim", True)
+        self.pause_between_episodes = config.get("pause_between_episodes", True)
         
         self.model = None
         self.data = None
@@ -204,15 +214,7 @@ class MujocoSim_interface_fr3:
         self.ensure_loaded()
         # log.info(f"joint command::{q}")
         if joint_names is None:
-            joint_names = [
-                "fr3_joint1",
-                "fr3_joint2",
-                "fr3_joint3",
-                "fr3_joint4",
-                "fr3_joint5",
-                "fr3_joint6",
-                "fr3_joint7",
-            ]
+            joint_names = self.arm_joint_names
     
         if len(q) != len(joint_names):
             raise ValueError(f"q length {len(q)} != joint_names length {len(joint_names)}")
@@ -340,6 +342,21 @@ class MujocoSim_interface_fr3:
     def play_joint_sequences(self, all_q_seqs, dt):
         self.ensure_loaded()
 
+        dt = float(dt)
+        if dt <= 0:
+            raise ValueError(f"replay dt must be positive, got {dt}")
+        if not all_q_seqs:
+            raise ValueError("no joint sequences to replay")
+
+        if not self.show_sim:
+            for ep_idx, q_seq in enumerate(all_q_seqs):
+                log.info(f"playing episode {ep_idx + 1}/{len(all_q_seqs)} without viewer")
+                for q in q_seq:
+                    self.set_joint_positions(q)
+                    if not self.quick_replay:
+                        time.sleep(dt)
+            return
+
         go_next = {"value": False}
 
         def key_callback(keycode):
@@ -355,7 +372,7 @@ class MujocoSim_interface_fr3:
                 if not viewer.is_running():
                     break
 
-                log.info(f"playing episode {ep_idx}")
+                log.info(f"playing episode {ep_idx + 1}/{len(all_q_seqs)}")
 
                 # 播放当前 episode
                 for q in q_seq:
@@ -367,8 +384,12 @@ class MujocoSim_interface_fr3:
 
                     if self.quick_replay is False:
                         time.sleep(dt)
-                log.info(f"press enter to continue")
-                    # 停在当前 episode 最后一帧，等待按 n
+
+                is_last_episode = ep_idx == len(all_q_seqs) - 1
+                if is_last_episode or not self.pause_between_episodes:
+                    continue
+
+                log.info("press Enter to continue")
                 go_next["value"] = False
                 while viewer.is_running() and not go_next["value"]:
                     viewer.sync()
