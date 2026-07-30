@@ -1,0 +1,89 @@
+dataloader:
+  repo_id: nero_refinement_lerobotv3
+  root: data/train_episode/nero_refinement_lerobotv3
+  load_images: false
+  video_backend: torchcodec
+
+  # FACTR 2/NEXT uses a stateless 50-step rolling history at 100 Hz.
+  horizon: 50
+  pad_history: false
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    # ddq: observation.acceleration
+    tau: observation.torque
+    tau_f: observation.tau_f
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys:
+    - q
+    - dq
+    # - ddq
+    - tau
+    - tau_f
+
+model:
+  # Supported values: lstm, gru.
+  architecture: lstm
+
+  # Remove entries here to run input ablations without changing code.
+  inputs:
+    - q
+    - dq
+    # - ddq
+    - tau
+
+  input_dims:
+    q: 7
+    dq: 7
+    # ddq: 7
+    tau: 7
+  output_dim: 7
+  target_key: tau_f
+
+  # FACTR 2/NEXT recurrent backbone and prediction-head defaults.
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 128
+  head_num_layers: 2
+  activation: relu
+  dropout: 0.1
+
+loss:
+  # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
+  joint_weights: null
+
+train:
+  device: cuda:0
+  # The low-dimensional cache is device-resident; workers only emit indices.
+  batch_size: 1024
+  num_workers: 0
+  val_ratio: 0.2
+
+  # Chronological tail validation with H-1 target samples purged at each
+  # boundary, so train/validation windows never share an underlying frame.
+  # With multiple independent episodes, split_mode: episode is also valid.
+  split_mode: purged_temporal
+  seed: 42
+
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  num_epochs: 500
+  gradient_clip_norm: 1.0
+
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 15
+    min_lr: 1.0e-6
+
+  early_stopping:
+    enabled: false
+    patience: 20
+    warmup_epochs: 10
+    min_delta: 1.0e-5
+
+  output_dir: outputs/tau_f_sequence/lstm_h50_v2
+  monitor_key: val_loss
+  top_k: 5

@@ -42,9 +42,24 @@ class BaseTrainer:
         self.lr = float(self.train_config.get("lr", 1e-4))
         self.weight_decay = float(self.train_config.get("weight_decay", 1e-4))
         self.num_epochs = int(self.train_config.get("num_epochs", 20))
+        gradient_clip_norm = self.train_config.get(
+            "gradient_clip_norm",
+            self.train_config.get("max_grad_norm"),
+        )
+        self.gradient_clip_norm = (
+            float(gradient_clip_norm) if gradient_clip_norm is not None else None
+        )
         self.monitor_key = self.train_config.get("monitor_key", "val_loss")
         self.top_k = int(self.train_config.get("top_k", 3))
         self.best_checkpoints = []
+
+        early_stopping = self.train_config.get("early_stopping") or {}
+        self.early_stopping_enabled = bool(early_stopping.get("enabled", False))
+        self.early_stopping_patience = int(early_stopping.get("patience", 20))
+        self.early_stopping_warmup = int(early_stopping.get("warmup_epochs", 0))
+        self.early_stopping_min_delta = float(early_stopping.get("min_delta", 0.0))
+        self.early_stopping_best = float("inf")
+        self.early_stopping_bad_epochs = 0
 
         self.dataset = None
         self.loader = None
@@ -97,6 +112,10 @@ class BaseTrainer:
 
     def compute_loss(self, batch):
         raise NotImplementedError
+
+    def fit_dataset_normalizer(self, train_dataset):
+        """Hook for datasets that must fit normalization after the split."""
+        return None
     
     def build_scheduler(self):
         if self.scheduler_config is None:
@@ -126,6 +145,11 @@ class BaseTrainer:
 
     def split_dataset_by_episode(self):
         episodes = list(self.dataset.dataset.meta.episodes)
+        if len(episodes) < 2:
+            raise ValueError(
+                "episode split requires at least two episodes; use "
+                "split_mode=purged_temporal for a single time-series episode."
+            )
 
         num_val_episodes = int(len(episodes) * self.val_ratio)
         num_val_episodes = max(1, num_val_episodes)
@@ -166,6 +190,58 @@ class BaseTrainer:
 
         return train_dataset, val_dataset
 
+    def split_dataset_purged_temporal(self):
+        """Chronological split with disjoint raw-frame windows on both sides."""
+        horizon = int(getattr(self.dataset, "horizon", 1))
+        train_indices = []
+        val_indices = []
+        purged_samples = 0
+        samples_by_episode_start = {}
+        for sample_idx, raw_idx in enumerate(self.dataset.valid_indices):
+            episode_start = self.dataset.raw_idx_to_episode_start[raw_idx]
+            samples_by_episode_start.setdefault(episode_start, []).append(
+                (sample_idx, raw_idx)
+            )
+
+        for episode in self.dataset.dataset.meta.episodes:
+            episode_start = int(episode["dataset_from_index"])
+            episode_samples = samples_by_episode_start.get(episode_start, [])
+            if len(episode_samples) < 2:
+                continue
+
+            num_val = max(1, int(len(episode_samples) * self.val_ratio))
+            num_val = min(num_val, len(episode_samples) - 1)
+            first_val_position = len(episode_samples) - num_val
+            first_val_raw_idx = episode_samples[first_val_position][1]
+            last_train_raw_idx = first_val_raw_idx - horizon
+
+            for sample_idx, raw_idx in episode_samples:
+                if raw_idx <= last_train_raw_idx:
+                    train_indices.append(sample_idx)
+                elif raw_idx >= first_val_raw_idx:
+                    val_indices.append(sample_idx)
+                else:
+                    purged_samples += 1
+
+        if not train_indices or not val_indices:
+            raise ValueError(
+                "purged_temporal split produced an empty train or validation set; "
+                "reduce dataloader.horizon or train.val_ratio, or collect a longer episode."
+            )
+
+        log.info(
+            "purged temporal split: train_samples=%d val_samples=%d "
+            "purged_samples=%d horizon=%d",
+            len(train_indices),
+            len(val_indices),
+            purged_samples,
+            horizon,
+        )
+        return (
+            torch.utils.data.Subset(self.dataset, train_indices),
+            torch.utils.data.Subset(self.dataset, val_indices),
+        )
+
     def setup(self):
         self.set_seed()
         self.dataset = self.build_dataset()
@@ -174,6 +250,11 @@ class BaseTrainer:
             if self.split_mode == "episode":
                 train_dataset, val_dataset = self.split_dataset_by_episode()
             elif self.split_mode == "sample":
+                if int(getattr(self.dataset, "horizon", 1)) > 1:
+                    log.warning(
+                        "sample split leaks overlapping temporal windows across train and "
+                        "validation; use split_mode=episode or purged_temporal."
+                    )
                 val_size = int(len(self.dataset) * self.val_ratio)
                 train_size = len(self.dataset) - val_size
         
@@ -183,11 +264,15 @@ class BaseTrainer:
                     [train_size, val_size],
                     generator=generator,
                 )
+            elif self.split_mode == "purged_temporal":
+                train_dataset, val_dataset = self.split_dataset_purged_temporal()
             else:
                 raise ValueError(f"unknown split_mode: {self.split_mode}")
         else:
             train_dataset = self.dataset
             val_dataset = None
+
+        self.fit_dataset_normalizer(train_dataset)
 
         self.loader = torch.utils.data.DataLoader(
             train_dataset,
@@ -233,6 +318,11 @@ class BaseTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if self.gradient_clip_norm is not None and self.gradient_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=self.gradient_clip_norm,
+                )
             self.optimizer.step()
             self.global_step += 1
 
@@ -316,8 +406,18 @@ class BaseTrainer:
 
             self.save_topk_checkpoint(epoch, metrics)
 
+            if self.should_stop_early(epoch, metrics):
+                log.info(
+                    "early stopping at epoch=%d: monitor=%s best=%.6f patience=%d",
+                    epoch,
+                    self.monitor_key,
+                    self.early_stopping_best,
+                    self.early_stopping_patience,
+                )
+                break
+
         self.last_summary = {
-            "num_epochs": self.num_epochs,
+            "num_epochs": len(self.loss_history),
             "global_step": self.global_step,
             "last_loss": self.loss_history[-1]["avg_loss"] if self.loss_history else None,
             "last_val_loss": self.loss_history[-1]["val_loss"] if self.loss_history else None,
@@ -329,6 +429,25 @@ class BaseTrainer:
         }
 
         return self.last_summary
+
+    def should_stop_early(self, epoch, metrics):
+        if not self.early_stopping_enabled:
+            return False
+
+        score = metrics.get(self.monitor_key)
+        if score is None:
+            return False
+
+        if score < self.early_stopping_best - self.early_stopping_min_delta:
+            self.early_stopping_best = score
+            self.early_stopping_bad_epochs = 0
+            return False
+
+        if epoch + 1 < self.early_stopping_warmup:
+            return False
+
+        self.early_stopping_bad_epochs += 1
+        return self.early_stopping_bad_epochs >= self.early_stopping_patience
         
     
     def save_loss_plot(self):

@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 EXAMPLE_SHAPE_META = {
     "task": "your_task_name",
+    "fps": 15,
     "master_timestamp_path": "TODO/path/to/master_timestamp",
     "features": {
         "observation.images.wrist": {
@@ -99,7 +100,7 @@ def load_conversion_deps() -> tuple[Any, Any, Any]:
 
 
 def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
-  
+    fps = normalize_fps(shape_meta.get("fps"))
     raw_features = shape_meta.get("features")
     if not isinstance(raw_features, Mapping):
         raise ValueError("shape_meta must contain a 'features' mapping.")
@@ -115,12 +116,27 @@ def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
         timestamp_path = raw_spec.get("timestamp_path")
         align = raw_spec.get("align", "index")
         window_size = int(raw_spec.get("window_size", 1))
-        validate_mapping(str(lerobot_key), h5_paths, timestamp_path, align, window_size)
+        transform = raw_spec.get("transform")
+        validate_mapping(
+            str(lerobot_key),
+            h5_paths,
+            timestamp_path,
+            align,
+            window_size,
+            transform,
+        )
 
         feature_spec = {
             key: value
             for key, value in raw_spec.items()
-            if key not in ("h5_path", "h5_paths", "timestamp_path", "align", "window_size")}
+            if key not in (
+                "h5_path",
+                "h5_paths",
+                "timestamp_path",
+                "align",
+                "window_size",
+                "transform",
+            )}
         normalize_feature_spec(feature_spec)
 
         lerobot_features[str(lerobot_key)] = feature_spec
@@ -131,6 +147,7 @@ def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
                 "timestamp_path": timestamp_path,
                 "align": align,
                 "window_size": window_size,
+                "transform": transform,
                 "feature_spec": feature_spec,
             }
         )
@@ -140,8 +157,21 @@ def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
         "task": str(shape_meta.get("task", "default_task")),
         "mappings": mappings,
         "lerobot_features": lerobot_features,
-        "master_timestamp_path": shape_meta["master_timestamp_path"]
+        "master_timestamp_path": shape_meta["master_timestamp_path"],
+        "fps": fps,
     }
+
+
+def normalize_fps(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("shape_meta must define a positive integer 'fps'.")
+    try:
+        fps = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("shape_meta 'fps' must be a positive integer.") from exc
+    if fps <= 0 or float(value) != fps:
+        raise ValueError("shape_meta 'fps' must be a positive integer.")
+    return fps
 
 
 def config_path(config: Mapping[str, Any], key: str, required: bool = True) -> Path | None:
@@ -224,19 +254,29 @@ def validate_mapping(
     timestamp_path: Any,
     align: Any,
     window_size: int,
+    transform: Any = None,
 ) -> None:
-    if align not in ("index", "nearest", "nearest_past_window"):
+    if align not in (
+        "index",
+        "nearest",
+        "nearest_past_window",
+        "nearest_future_window",
+    ):
         raise ValueError(f"Feature {lerobot_key!r} has unknown align mode: {align!r}")
 
-    if align in ("nearest", "nearest_past_window"):
+    if align in ("nearest", "nearest_past_window", "nearest_future_window"):
         if not isinstance(timestamp_path, str) or not timestamp_path:
             raise ValueError(f"Feature {lerobot_key!r} align={align!r} needs timestamp_path.")
 
-    if align == "nearest_past_window":
+    if align in ("nearest_past_window", "nearest_future_window"):
         if len(h5_paths) != 1:
-            raise ValueError(f"Feature {lerobot_key!r} nearest_past_window supports one h5_path only.")
+            raise ValueError(f"Feature {lerobot_key!r} align={align!r} supports one h5_path only.")
         if window_size <= 0:
             raise ValueError(f"Feature {lerobot_key!r} window_size must be positive.")
+
+    supported_transforms = (None, "ee_pose_matrix_to_quaternion")
+    if transform not in supported_transforms:
+        raise ValueError(f"Feature {lerobot_key!r} has unknown transform: {transform!r}")
 
 class H5Dataset:
     def __init__(
@@ -281,7 +321,7 @@ class H5Dataset:
 
         return self.h5py.File(h5_path, "r")
 
-    def build_episode_cache(self, h5_file, mappings, master_timestamp_path, h5_path):
+    def build_episode_cache(self, h5_file, mappings, master_timestamp_path, fps, h5_path):
         """Cache dataset handles and timestamp arrays for one opened episode."""
 
         dataset_cache = {}
@@ -301,9 +341,16 @@ class H5Dataset:
         for timestamp_path in all_timestamp_paths:
             timestamp_cache[timestamp_path] = dataset_cache[timestamp_path][:]
 
+        target_timestamps = self.uniform_timestamps(
+            timestamp_cache[master_timestamp_path],
+            master_timestamp_path,
+            fps,
+        )
+
         return {
             "datasets": dataset_cache,
             "timestamps": timestamp_cache,
+            "target_timestamps": target_timestamps,
         }
 
     def clear_episode_cache(self, cache) -> None:
@@ -313,12 +360,40 @@ class H5Dataset:
             return
         cache.get("datasets", {}).clear()
         cache.get("timestamps", {}).clear()
+        cache.pop("target_timestamps", None)
         cache.clear()
 
     def episode_length(self, h5_file, master_timestamp_path, h5_path, cache=None):
-        # 主timestamp长度即为episode长度
+        if cache is not None and "target_timestamps" in cache:
+            return int(cache["target_timestamps"].shape[0])
         master_ts = self._timestamp_array(h5_file, master_timestamp_path, h5_path, cache)
         return int(master_ts.shape[0])
+
+    def uniform_timestamps(self, master_timestamps, master_timestamp_path: str, fps: int):
+        if self.np is None:
+            raise RuntimeError("numpy is required to generate a uniform timeline.")
+
+        timestamps = self.np.asarray(master_timestamps).reshape(-1)
+        if timestamps.size == 0:
+            raise ValueError("Cannot generate a uniform timeline from empty master timestamps.")
+        if not self.np.isfinite(timestamps).all():
+            raise ValueError("Master timestamps must be finite.")
+        if timestamps.size > 1 and self.np.any(self.np.diff(timestamps) <= 0):
+            raise ValueError("Master timestamps must be strictly increasing.")
+
+        scale = self._timestamp_seconds_scale(master_timestamp_path)
+        duration_seconds = float(timestamps[-1] - timestamps[0]) * scale
+        frame_count = int(self.np.floor(duration_seconds * fps + 1e-9)) + 1
+        offsets = self.np.arange(frame_count, dtype=self.np.float64) / (fps * scale)
+        target = float(timestamps[0]) + offsets
+
+        if self.np.issubdtype(timestamps.dtype, self.np.integer):
+            target = self.np.rint(target).astype(timestamps.dtype)
+        else:
+            target = target.astype(timestamps.dtype, copy=False)
+        if target.size > 1 and self.np.any(self.np.diff(target) <= 0):
+            raise ValueError("Configured fps is too high for the master timestamp resolution.")
+        return target
 
     def estimate_fps_from_master_timestamps(self, master_timestamp_path: str) -> int:
         if self.np is None:
@@ -374,8 +449,11 @@ class H5Dataset:
 
     def read_frame(self, h5_file, frame_idx, mappings, h5_path, master_timestamp_path, cache=None):
         # 从 H5 里读出一帧，返回 LeRobotDataset.add_frame 需要的字典
-        master_ts = self._timestamp_array(h5_file, master_timestamp_path, h5_path, cache)
-        target_t = master_ts[frame_idx]
+        if cache is not None and "target_timestamps" in cache:
+            target_t = cache["target_timestamps"][frame_idx]
+        else:
+            master_ts = self._timestamp_array(h5_file, master_timestamp_path, h5_path, cache)
+            target_t = master_ts[frame_idx]
 
         frame = {}
 
@@ -394,8 +472,13 @@ class H5Dataset:
 
 
     def _nearest_past_window_indices(self, timestamps, target_t, window_size):
-        nearest_idx = int(self.np.argmin(self.np.abs(timestamps - target_t)))
-        indices = self.np.arange(nearest_idx - window_size + 1, nearest_idx + 1)
+        history_idx = self._history_index_from_timestamps(timestamps, target_t)
+        indices = self.np.arange(history_idx - window_size + 1, history_idx + 1)
+        return self.np.clip(indices, 0, len(timestamps) - 1)
+
+    def _nearest_future_window_indices(self, timestamps, target_t, window_size):
+        anchor_idx = self._history_index_from_timestamps(timestamps, target_t)
+        indices = self.np.arange(anchor_idx, anchor_idx + window_size)
         return self.np.clip(indices, 0, len(timestamps) - 1)
 
     def _read_nearest_past_window(self, h5_file, h5_field_path, timestamp_path, target_t, h5_path, window_size, cache=None):
@@ -408,6 +491,15 @@ class H5Dataset:
         window = [values[int(index)] for index in indices]
         return self.np.asarray(window).astype("float32")
 
+    def _read_nearest_future_window(self, h5_file, h5_field_path, timestamp_path, target_t, h5_path, window_size, cache=None):
+        timestamps = self._timestamp_array(h5_file, timestamp_path, h5_path, cache)
+        values = self._dataset_cached(h5_file, h5_field_path, h5_path, cache)
+
+        indices = self._nearest_future_window_indices(timestamps, target_t, window_size)
+        # Right-padding intentionally creates duplicate indices near the episode end.
+        window = [values[int(index)] for index in indices]
+        return self.np.asarray(window).astype("float32")
+
 
 
 
@@ -415,20 +507,18 @@ class H5Dataset:
         align = mapping.get("align", "index")
 
         if align == "index":
-            return self._read_paths_at_index(
+            value = self._read_paths_at_index(
                 h5_file, mapping["h5_paths"], frame_idx, h5_path, mapping["feature_spec"], cache
             )
-    
-        if align == "nearest":
+        elif align == "nearest":
             source_idx = self._nearest_index(
                 h5_file, mapping["timestamp_path"], target_t, h5_path, cache
             )
-            return self._read_paths_at_index(
+            value = self._read_paths_at_index(
                 h5_file, mapping["h5_paths"], source_idx, h5_path, mapping["feature_spec"], cache
             )
-    
-        if align == "nearest_past_window":
-            return self._read_nearest_past_window(
+        elif align == "nearest_past_window":
+            value = self._read_nearest_past_window(
                 h5_file=h5_file,
                 h5_field_path=mapping["h5_paths"][0],
                 timestamp_path=mapping["timestamp_path"],
@@ -437,13 +527,102 @@ class H5Dataset:
                 h5_path=h5_path,
                 cache=cache,
             )
-    
-        raise ValueError(f"Unknown align mode: {align}")
+        elif align == "nearest_future_window":
+            value = self._read_nearest_future_window(
+                h5_file=h5_file,
+                h5_field_path=mapping["h5_paths"][0],
+                timestamp_path=mapping["timestamp_path"],
+                target_t=target_t,
+                window_size=mapping["window_size"],
+                h5_path=h5_path,
+                cache=cache,
+            )
+        else:
+            raise ValueError(f"Unknown align mode: {align}")
+
+        return self._apply_transform(value, mapping.get("transform"))
+
+    def _apply_transform(self, value, transform):
+        if transform is None:
+            return value
+        if transform == "ee_pose_matrix_to_quaternion":
+            return self._ee_pose_matrix_to_quaternion(value)
+        raise ValueError(f"Unknown transform: {transform!r}")
+
+    def _ee_pose_matrix_to_quaternion(self, value):
+        """Convert (..., 4, 4) poses to (..., 7) xyz + quaternion in xyzw order."""
+        if self.np is None:
+            raise RuntimeError("numpy is required to convert ee_pose matrices.")
+
+        poses = self.np.asarray(value, dtype=self.np.float64)
+        if poses.shape[-2:] != (4, 4):
+            raise ValueError(
+                "ee_pose_matrix_to_quaternion expects shape (..., 4, 4), "
+                f"got {poses.shape}"
+            )
+
+        flat_poses = poses.reshape(-1, 4, 4)
+        converted = self.np.empty((flat_poses.shape[0], 7), dtype=self.np.float32)
+        for index, pose in enumerate(flat_poses):
+            converted[index, :3] = pose[:3, 3]
+            converted[index, 3:] = self._rotation_matrix_to_quaternion_xyzw(pose[:3, :3])
+        return converted.reshape(poses.shape[:-2] + (7,))
+
+    def _rotation_matrix_to_quaternion_xyzw(self, matrix):
+        matrix = self.np.asarray(matrix, dtype=self.np.float64)
+        trace = self.np.trace(matrix)
+        if trace > 0:
+            scale = self.np.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * scale
+            qx = (matrix[2, 1] - matrix[1, 2]) / scale
+            qy = (matrix[0, 2] - matrix[2, 0]) / scale
+            qz = (matrix[1, 0] - matrix[0, 1]) / scale
+        elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+            scale = self.np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+            qw = (matrix[2, 1] - matrix[1, 2]) / scale
+            qx = 0.25 * scale
+            qy = (matrix[0, 1] + matrix[1, 0]) / scale
+            qz = (matrix[0, 2] + matrix[2, 0]) / scale
+        elif matrix[1, 1] > matrix[2, 2]:
+            scale = self.np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+            qw = (matrix[0, 2] - matrix[2, 0]) / scale
+            qx = (matrix[0, 1] + matrix[1, 0]) / scale
+            qy = 0.25 * scale
+            qz = (matrix[1, 2] + matrix[2, 1]) / scale
+        else:
+            scale = self.np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+            qw = (matrix[1, 0] - matrix[0, 1]) / scale
+            qx = (matrix[0, 2] + matrix[2, 0]) / scale
+            qy = (matrix[1, 2] + matrix[2, 1]) / scale
+            qz = 0.25 * scale
+
+        quaternion = self.np.asarray([qx, qy, qz, qw], dtype=self.np.float64)
+        norm = self.np.linalg.norm(quaternion)
+        if norm == 0:
+            raise ValueError("rotation matrix produced a zero-norm quaternion")
+        quaternion /= norm
+        if quaternion[3] < 0:
+            quaternion = -quaternion
+        return quaternion.astype(self.np.float32)
     
 
     def _nearest_index(self, h5_file, timestamp_path, target_t, h5_path, cache=None):
         timestamps = self._timestamp_array(h5_file, timestamp_path, h5_path, cache)
-        return int(self.np.argmin(self.np.abs(timestamps - target_t)))
+        return self._history_index_from_timestamps(timestamps, target_t)
+
+    def _history_index_from_timestamps(self, timestamps, target_t):
+        timestamps = self.np.asarray(timestamps).reshape(-1)
+        if timestamps.size == 0:
+            raise ValueError("Cannot align against an empty timestamp array.")
+        if timestamps.size > 1 and self.np.any(self.np.diff(timestamps) < 0):
+            raise ValueError("Alignment timestamps must be sorted in ascending order.")
+        history_idx = int(self.np.searchsorted(timestamps, target_t, side="right") - 1)
+        if history_idx < 0:
+            raise ValueError(
+                f"No historical sample exists at or before target timestamp {target_t!r}; "
+                f"first source timestamp is {timestamps[0]!r}."
+            )
+        return history_idx
 
     def _read_paths_at_index(self, h5_file, h5_paths, source_idx, h5_path, feature_spec, cache=None):
         values = [
@@ -656,7 +835,7 @@ def run_conversion(args: argparse.Namespace) -> None:
         np=np,
         max_episodes=config_int(config, "max_episodes"),
     )
-    fps = h5_dataset.estimate_fps_from_master_timestamps(spec["master_timestamp_path"])
+    fps = spec["fps"]
     lerobot_dataset = LeRobotV3Dataset(
         LeRobotDataset,
         repo_id=config_str(config, "repo_id", "local/h5_to_lerobot_v3"),
@@ -677,6 +856,7 @@ def run_conversion(args: argparse.Namespace) -> None:
                     h5_file,
                     spec["mappings"],
                     spec["master_timestamp_path"],
+                    spec["fps"],
                     h5_path,
                 )
                 episode_length = h5_dataset.episode_length(

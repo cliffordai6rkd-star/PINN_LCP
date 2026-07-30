@@ -57,6 +57,7 @@ class PINNDataset(torch.utils.data.Dataset):
         self.horizon = int(self.data_config.get("horizon", 1))
         self.history_horizon = int(self.data_config.get("history_horizon", self.horizon))
         self.future_horizon = int(self.data_config.get("future_horizon", self.horizon))
+        self.pad_history = bool(self.data_config.get("pad_history", True))
 
         self.valid_indices = []
         self.raw_idx_to_episode_start = {}
@@ -82,28 +83,47 @@ class PINNDataset(torch.utils.data.Dataset):
             self.normalize_mode = self.data_config.get("normalize_mode", "gaussian")
 
         if self.normalize_mode is not None:
-            self.is_normalize = True
-
             if normalizer is not None:
-                self.normalizer = normalizer
+                self.set_normalizer(normalizer)
             elif compute_normalizer:
-                self.normalizer = Normalizer.stats_from_dataset(
-                    dataset = self.stats_dataset,
-                    valid_indices = self.valid_indices,
-                    lowdim_keys = self.lowdim_keys,
-                    normalize_keys = self.normalize_lowdim_keys,
-                )
-            else:
-                raise ValueError("normalizer is required when compute_normalizer=False")
+                self.fit_normalizer(self.valid_indices)
 
-            if self.normalize_mode == "gaussian":
-                self.normalize_fuc = self.normalizer.gaussian_normalize
-            elif self.normalize_mode == "limit":
-                self.normalize_fuc = self.normalizer.limit_normalize
-            elif self.normalize_mode == "quantile":
-                self.normalize_fuc = self.normalizer.quantile_normalize
-            else:
-                raise ValueError(f"unknown normalize mode: {self.normalize_mode}")
+    def set_normalizer(self, normalizer):
+        self.normalizer = normalizer
+        self.is_normalize = True
+        if self.normalize_mode == "gaussian":
+            self.normalize_fuc = self.normalizer.gaussian_normalize
+        elif self.normalize_mode == "limit":
+            self.normalize_fuc = self.normalizer.limit_normalize
+        elif self.normalize_mode == "quantile":
+            self.normalize_fuc = self.normalizer.quantile_normalize
+        else:
+            raise ValueError(f"unknown normalize mode: {self.normalize_mode}")
+
+    def fit_normalizer(self, raw_indices):
+        if self.normalize_mode is None:
+            return
+        raw_indices = sorted(set(int(index) for index in raw_indices))
+        if not raw_indices:
+            raise ValueError("cannot fit normalizer with no training frames")
+        normalizer = Normalizer.stats_from_dataset(
+            dataset=self.stats_dataset,
+            valid_indices=raw_indices,
+            lowdim_keys=self.lowdim_keys,
+            normalize_keys=self.normalize_lowdim_keys,
+        )
+        self.set_normalizer(normalizer)
+
+    def covered_raw_indices(self, sample_indices):
+        covered = set()
+        for sample_idx in sample_indices:
+            raw_idx = self.valid_indices[int(sample_idx)]
+            episode_start = self.raw_idx_to_episode_start[raw_idx]
+            covered.update(
+                max(episode_start, raw_idx - self.horizon + 1 + offset)
+                for offset in range(self.horizon)
+            )
+        return sorted(covered)
 
     def _build_valid_indices(self):
         episodes = self.dataset.meta.episodes
@@ -111,8 +131,11 @@ class PINNDataset(torch.utils.data.Dataset):
         for ep in episodes:
             start_idx = int(ep["dataset_from_index"])
             end_idx = int(ep["dataset_to_index"])
+            valid_start = start_idx
+            if not self.pad_history:
+                valid_start = start_idx + self.horizon - 1
 
-            for idx in range(start_idx, end_idx):
+            for idx in range(valid_start, end_idx):
                 self.valid_indices.append(idx)
                 self.raw_idx_to_episode_start[idx] = start_idx
                 self.raw_idx_to_episode_end[idx] = end_idx
