@@ -37,7 +37,7 @@ description: 用于本 LCP-PINN 项目内的所有工作。默认用中文沟通
 不要：
 
 - 编辑 Python 文件。
-- 编辑 YAML、Docker、配置或数据集文件。
+- 编辑 YAML、环境、配置或数据集文件。
 - 新增实现文件。
 - 删除项目文件。
 - 应用 patch。

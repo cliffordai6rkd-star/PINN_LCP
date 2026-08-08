@@ -1,14 +1,14 @@
 io:
-  input: data/train_episode/nero_refinement
-  output: data/train_episode/nero_refinement_lerobotv3
-  repo_id: nero_tau_f_lerobotv3
+  input: data/train_episode/tau_refinement_rts_labels
+  output: data/train_episode/tau_refinement_ped_lerobotv3
+  repo_id: tau_refinement_ped_lerobotv3
   max_episodes: 100
   no_videos: True
   push_to_hub: false
 
 task: nero_tau_f
 master_timestamp_path: teleop/timestamp_us
-
+fps: 100
 
 # index:直接拿
 # nearest:从主时间轴对应的最近的timestamp
@@ -56,35 +56,58 @@ features:
     shape: [7]
     h5_path: teleop/q_follower
     timestamp_path: teleop/timestamp_us
-    align: nearest
+    align: pchip
+    max_gap_s: 0.05
 
   observation.velocity:
     dtype: float32
     shape: [7]
     h5_path: teleop/dq_follower
     timestamp_path: teleop/timestamp_us
-    align: nearest
+    align: pchip
+    max_gap_s: 0.05
 
   observation.acceleration:
     dtype: float32
     shape: [7]
     h5_path: teleop/ddq_follower
     timestamp_path: teleop/timestamp_us
-    align: nearest
+    align: pchip
+    max_gap_s: 0.05
+
+  # Desired joint displacement used by the low-level position controller.
+  # Resample command/state independently, then subtract on the shared 100 Hz grid.
+  observation.delta_q:
+    dtype: float32
+    shape: [7]
+    sources:
+      # q_cmd is an event/hold signal: use the latest command at or before t.
+      - h5_path: teleop/q_cmd
+        timestamp_path: teleop/timestamp_us
+        align: previous
+        allow_stale: true
+      # q_follower is a continuous physical trajectory.
+      - h5_path: teleop/q_follower
+        timestamp_path: teleop/timestamp_us
+        align: pchip
+        max_gap_s: 0.05
+    combine: subtract
 
   observation.torque:
     dtype: float32
     shape: [7]
     h5_path: teleop/tau_follower
     timestamp_path: teleop/timestamp_us
-    align: nearest
+    align: pchip
+    max_gap_s: 0.05
 
   observation.tau_f:
     dtype: float32
     shape: [7]
     h5_path: teleop/tau_f_cal
     timestamp_path: teleop/timestamp_us
-    align: nearest
+    align: pchip
+    max_gap_s: 0.05
 
 
   # action.ee_pose:

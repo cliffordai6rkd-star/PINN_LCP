@@ -3,12 +3,13 @@ import torch.nn as nn
 
 
 class TauFSequenceRegressor(nn.Module):
-    """Causal recurrent regressor for free-space joint torque."""
+    """NEXT-style regressor over independent fixed-length history windows."""
 
     DEFAULT_INPUT_DIMS = {
         "q": 7,
         "dq": 7,
         "ddq": 7,
+        "delta_q": 7,
         "tau": 7,
     }
 
@@ -17,7 +18,7 @@ class TauFSequenceRegressor(nn.Module):
         model_config = config.get("model") or {}
 
         self.active_inputs = list(
-            model_config.get("inputs") or ["q", "dq", "ddq", "tau"]
+            model_config.get("inputs") or ["q", "dq", "delta_q"]
         )
         if not self.active_inputs:
             raise ValueError("model.inputs must contain at least one input key.")
@@ -35,6 +36,15 @@ class TauFSequenceRegressor(nn.Module):
         ]
         if unknown_inputs:
             raise ValueError(f"Missing model.input_dims for inputs: {unknown_inputs}")
+
+        self.history_mode = str(
+            model_config.get("history_mode", "stateless_sliding_window")
+        ).lower()
+        if self.history_mode != "stateless_sliding_window":
+            raise ValueError(
+                "model.history_mode must be 'stateless_sliding_window'; "
+                "tau_f windows do not carry recurrent state between samples."
+            )
 
         self.architecture = str(model_config.get("architecture", "lstm")).lower()
         recurrent_types = {
@@ -135,39 +145,6 @@ class TauFSequenceRegressor(nn.Module):
 
         return torch.cat(sequences, dim=-1)
 
-    def _prepare_step_inputs(self, batch):
-        step_inputs = []
-        batch_size = None
-
-        for key in self.active_inputs:
-            if key not in batch:
-                raise KeyError(f"Missing model input {key!r} in batch.")
-
-            value = batch[key]
-            if value.ndim != 2:
-                raise ValueError(
-                    f"Step input {key!r} must have shape [B, D], "
-                    f"got {tuple(value.shape)}."
-                )
-
-            expected_dim = int(self.input_dims[key])
-            if value.shape[-1] != expected_dim:
-                raise ValueError(
-                    f"Step input {key!r} has last dimension {value.shape[-1]}, "
-                    f"expected {expected_dim}."
-                )
-
-            if batch_size is None:
-                batch_size = value.shape[0]
-            elif value.shape[0] != batch_size:
-                raise ValueError(
-                    f"All step inputs must share batch size; {key!r} has "
-                    f"{value.shape[0]}, expected {batch_size}."
-                )
-            step_inputs.append(value)
-
-        return torch.cat(step_inputs, dim=-1).unsqueeze(1)
-
     @staticmethod
     def _last_target(value):
         if value.ndim == 3:
@@ -178,72 +155,14 @@ class TauFSequenceRegressor(nn.Module):
             f"tau_f target must have shape [B, H, D] or [B, D], got {tuple(value.shape)}."
         )
 
-    def init_recurrent_state(self, batch_size, device=None, dtype=None):
-        """Create a zero recurrent state for a new episode or control stream."""
-        parameter = next(self.parameters())
-        device = parameter.device if device is None else device
-        dtype = parameter.dtype if dtype is None else dtype
-        shape = (self.num_layers, int(batch_size), self.hidden_dim)
-        hidden = torch.zeros(shape, device=device, dtype=dtype)
-        if self.architecture == "lstm":
-            return hidden, torch.zeros_like(hidden)
-        return hidden
-
-    @staticmethod
-    def detach_recurrent_state(recurrent_state):
-        """Detach a carried state at a truncated-BPTT or inference boundary."""
-        if recurrent_state is None:
-            return None
-        if isinstance(recurrent_state, tuple):
-            return tuple(state.detach() for state in recurrent_state)
-        return recurrent_state.detach()
-
-    def _run_recurrent(self, sequence, recurrent_state=None):
-        if recurrent_state is None:
-            return self.recurrent(sequence)
-        return self.recurrent(sequence, recurrent_state)
-
-    def forward(self, batch, recurrent_state=None):
+    def forward(self, batch):
         sequence = self._prepare_inputs(batch)
-        recurrent_output, recurrent_state = self._run_recurrent(
-            sequence,
-            recurrent_state,
-        )
+        # Omitting hx gives every independent history window a fresh zero state.
+        recurrent_output, _ = self.recurrent(sequence)
         tau_f_pred = self.head(recurrent_output[:, -1])
 
         out = {
             "tau_f_pred": tau_f_pred,
-            "sequence_features": recurrent_output,
-            "recurrent_state": recurrent_state,
-        }
-        if self.target_key in batch:
-            tau_f_target = self._last_target(batch[self.target_key])
-            if tau_f_target.shape != tau_f_pred.shape:
-                raise ValueError(
-                    f"Prediction shape {tuple(tau_f_pred.shape)} does not match "
-                    f"target shape {tuple(tau_f_target.shape)}."
-                )
-            out["tau_f_target"] = tau_f_target
-        return out
-
-    def forward_step(self, batch, recurrent_state=None):
-        """Predict one control step while carrying GRU/LSTM state explicitly.
-
-        Each configured input must have shape [B, D]. The returned
-        ``recurrent_state`` should be passed into the next call and reset when an
-        episode, robot session, or other independent stream starts.
-        """
-        sequence = self._prepare_step_inputs(batch)
-        recurrent_output, recurrent_state = self._run_recurrent(
-            sequence,
-            recurrent_state,
-        )
-        tau_f_pred = self.head(recurrent_output[:, -1])
-
-        out = {
-            "tau_f_pred": tau_f_pred,
-            "sequence_features": recurrent_output,
-            "recurrent_state": recurrent_state,
         }
         if self.target_key in batch:
             tau_f_target = self._last_target(batch[self.target_key])

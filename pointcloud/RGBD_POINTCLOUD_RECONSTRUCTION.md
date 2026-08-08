@@ -2,22 +2,17 @@
 
 本文档说明如何使用 D455 固定相机和 D435 腕部相机的 RGBD 数据进行点云重建，并用 Open3D 打开可移动视角的三维点云。
 
-## 0. 进入容器
+## 0. 激活环境
 
-在项目根目录启动容器：
-
-```bash
-docker compose -f "docker for LCP_PINN_V1/docker_compose.yaml" up -d v2
-```
-
-进入容器：
+在项目根目录执行：
 
 ```bash
-docker exec -it st-pinn bash
-cd /workspace
+./setup.sh
+conda activate pinn
+python -m pip install -e ".[vision]"
 ```
 
-数据路径在容器内为：
+数据路径为：
 
 ```text
 data/train_episode/Ft_test_data
@@ -271,8 +266,7 @@ projection:
 如果 Open3D 窗口打不开：
 
 ```text
-确认已经在支持 GUI 的容器里运行。
-确认 docker compose 中 DISPLAY 和 XAUTHORITY 已正确映射。
+确认当前桌面会话支持 GUI，并且 DISPLAY 环境变量设置正确。
 ```
 
 如果双相机点云明显错位：

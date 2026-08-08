@@ -52,8 +52,8 @@ def load_numpy_cv2():
         import numpy as np
     except ModuleNotFoundError as exc:
         raise SystemExit(
-            "Missing dependency. Run this script in the project Docker environment "
-            "or install numpy and opencv-python in the active Python environment."
+            "Missing dependency. Install the project vision extras with "
+            "`python -m pip install -e \".[vision]\"`."
         ) from exc
     return np, cv2
 

@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import torch
 
 from model.tau_f_sequence import TauFSequenceRegressor
-from train.base_trainer import BaseTrainer
+from train.base_trainer import BaseTrainer, ModelEMA
+from train.nomalizer import Normalizer
 from train.trainer.tau_f_sequence_train import SampleIndexDataset, TauFTrainer
 
 
@@ -35,6 +36,25 @@ def make_batch(batch_size=4, horizon=8):
 
 
 class TauFSequenceRegressorTest(unittest.TestCase):
+    def test_model_ema_smooths_parameters_and_copies_buffers(self):
+        model = torch.nn.BatchNorm1d(2)
+        ema = ModelEMA(model, decay=0.5)
+
+        with torch.no_grad():
+            model.weight.fill_(3.0)
+            model.running_mean.fill_(4.0)
+        ema.update(model, step=1)
+
+        torch.testing.assert_close(
+            ema.model.weight,
+            torch.full_like(ema.model.weight, 2.0),
+        )
+        torch.testing.assert_close(
+            ema.model.running_mean,
+            model.running_mean,
+        )
+        self.assertFalse(any(p.requires_grad for p in ema.model.parameters()))
+
     def test_lstm_and_gru_forward_backward(self):
         for architecture in ("lstm", "gru"):
             with self.subTest(architecture=architecture):
@@ -68,7 +88,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
 
         torch.testing.assert_close(out["tau_f_target"], batch["tau_f"][:, -1])
 
-    def test_trainer_computes_mse_and_mae(self):
+    def test_trainer_computes_normalized_and_physical_mae(self):
         trainer = TauFTrainer(make_config())
         trainer.model = trainer.build_model()
 
@@ -76,61 +96,171 @@ class TauFSequenceRegressorTest(unittest.TestCase):
 
         self.assertEqual(loss.ndim, 0)
         self.assertGreaterEqual(loss.item(), 0.0)
-        self.assertEqual(set(out["loss_dict"]), {"mse", "mae"})
+        self.assertEqual(
+            set(out["loss_dict"]),
+            {
+                "mse",
+                "mae",
+                "mae_nm",
+                "mae_nm_j1",
+                "mae_nm_j2",
+                "mae_nm_j3",
+                "mae_nm_j4",
+                "mae_nm_j5",
+                "mae_nm_j6",
+                "mae_nm_j7",
+            },
+        )
+
+    def test_physical_mae_uses_target_denormalization(self):
+        trainer = TauFTrainer(make_config())
+        std = torch.arange(1, 8, dtype=torch.float32)
+        trainer.dataset = SimpleNamespace(
+            normalize_mode="gaussian",
+            normalize_lowdim_keys=["tau_f"],
+            normalizer=Normalizer(
+                {
+                    "tau_f": {
+                        "mean": torch.arange(7, dtype=torch.float32),
+                        "std": std,
+                    }
+                }
+            ),
+        )
+        target = torch.zeros(2, 7)
+        prediction = torch.ones(2, 7)
+
+        metrics = trainer._physical_mae_metrics(prediction, target)
+
+        expected_joint_mae = std + trainer.dataset.normalizer.eps
+        for joint_index, expected in enumerate(expected_joint_mae, start=1):
+            torch.testing.assert_close(
+                metrics[f"mae_nm_j{joint_index}"],
+                expected,
+            )
+        torch.testing.assert_close(metrics["mae_nm"], expected_joint_mae.mean())
+
+    def test_validation_mae_is_weighted_by_sample_count(self):
+        class FixedPredictionModel(torch.nn.Module):
+            def forward(self, batch):
+                return {
+                    "tau_f_pred": batch["prediction"],
+                    "tau_f_target": batch["target"],
+                }
+
+        samples = [
+            {
+                "prediction": torch.full((7,), error),
+                "target": torch.zeros(7),
+            }
+            for error in (1.0, 1.0, 3.0)
+        ]
+        trainer = TauFTrainer(make_config())
+        trainer.device = "cpu"
+        trainer.dataset = SimpleNamespace(
+            normalize_mode=None,
+            normalize_lowdim_keys=[],
+        )
+        trainer.model = FixedPredictionModel()
+        trainer.val_loader = torch.utils.data.DataLoader(samples, batch_size=2)
+
+        val_loss = trainer.validate_one_epoch(epoch=0)
+
+        self.assertAlmostEqual(val_loss, 11.0 / 3.0)
+        self.assertAlmostEqual(
+            trainer.last_val_epoch_metrics["mae_nm"],
+            5.0 / 3.0,
+        )
+        for joint_index in range(1, 8):
+            self.assertAlmostEqual(
+                trainer.last_val_epoch_metrics[f"mae_nm_j{joint_index}"],
+                5.0 / 3.0,
+            )
+
+    def test_train_eval_disables_training_mode_noise(self):
+        class ModeAwareModel(torch.nn.Module):
+            def forward(self, batch):
+                prediction = (
+                    torch.ones_like(batch["target"])
+                    if self.training
+                    else torch.zeros_like(batch["target"])
+                )
+                return {
+                    "tau_f_pred": prediction,
+                    "tau_f_target": batch["target"],
+                }
+
+        trainer = TauFTrainer(make_config())
+        trainer.device = "cpu"
+        trainer.train_eval_enabled = True
+        trainer.dataset = SimpleNamespace(
+            normalize_mode=None,
+            normalize_lowdim_keys=[],
+        )
+        trainer.model = ModeAwareModel().train()
+        trainer.loader = torch.utils.data.DataLoader(
+            [{"target": torch.zeros(7)} for _ in range(3)],
+            batch_size=2,
+        )
+
+        train_eval_loss = trainer.evaluate_train_one_epoch(epoch=0)
+
+        self.assertEqual(train_eval_loss, 0.0)
+        self.assertEqual(trainer.last_train_eval_epoch_metrics["mae_nm"], 0.0)
 
     def test_invalid_architecture_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "architecture"):
             TauFSequenceRegressor(make_config(architecture="transformer"))
 
-    def test_streaming_steps_match_full_sequence(self):
-        batch = make_batch(batch_size=3, horizon=6)
-
+    def test_each_window_starts_from_a_fresh_recurrent_state(self):
         for architecture in ("lstm", "gru"):
             with self.subTest(architecture=architecture):
                 model = TauFSequenceRegressor(make_config(architecture))
                 model.eval()
+                batch = make_batch(batch_size=3, horizon=6)
 
-                full_out = model(batch)
-                state = model.init_recurrent_state(batch_size=3)
-                step_features = []
-                for step in range(6):
-                    step_batch = {
-                        key: batch[key][:, step]
-                        for key in model.active_inputs
-                    }
-                    step_out = model.forward_step(step_batch, state)
-                    state = step_out["recurrent_state"]
-                    step_features.append(step_out["sequence_features"])
+                first = model(batch)["tau_f_pred"]
+                model(make_batch(batch_size=3, horizon=6))
+                second = model(batch)["tau_f_pred"]
 
-                torch.testing.assert_close(
-                    torch.cat(step_features, dim=1),
-                    full_out["sequence_features"],
-                )
-                torch.testing.assert_close(
-                    step_out["tau_f_pred"],
-                    full_out["tau_f_pred"],
-                )
+                torch.testing.assert_close(first, second)
 
-    def test_recurrent_state_shape_and_detach(self):
+    def test_model_does_not_expose_a_streaming_hidden_state_api(self):
         for architecture in ("lstm", "gru"):
             with self.subTest(architecture=architecture):
                 model = TauFSequenceRegressor(make_config(architecture))
-                state = model.init_recurrent_state(batch_size=4)
-                states = state if isinstance(state, tuple) else (state,)
+                out = model(make_batch())
 
-                self.assertEqual(len(states), 2 if architecture == "lstm" else 1)
-                for tensor in states:
-                    self.assertEqual(tensor.shape, (2, 4, 16))
+                self.assertFalse(hasattr(model, "forward_step"))
+                self.assertFalse(hasattr(model, "init_recurrent_state"))
+                self.assertNotIn("recurrent_state", out)
+                self.assertNotIn("sequence_features", out)
 
-                step_batch = {
-                    key: value[:, 0]
-                    for key, value in make_batch().items()
-                    if key in model.active_inputs
-                }
-                next_state = model.forward_step(step_batch, state)["recurrent_state"]
-                detached = model.detach_recurrent_state(next_state)
-                detached_states = detached if isinstance(detached, tuple) else (detached,)
-                self.assertTrue(all(not tensor.requires_grad for tensor in detached_states))
+    def test_next_topology_uses_two_recurrent_and_two_mlp_layers(self):
+        config = make_config("lstm")
+        config["model"].update(
+            hidden_dim=128,
+            num_layers=2,
+            head_hidden_dim=256,
+            head_num_layers=2,
+        )
+
+        model = TauFSequenceRegressor(config)
+
+        self.assertIsInstance(model.recurrent, torch.nn.LSTM)
+        self.assertEqual(model.recurrent.num_layers, 2)
+        self.assertEqual(model.recurrent.hidden_size, 128)
+        self.assertEqual(model.head[0].in_features, 128)
+        self.assertEqual(model.head[0].out_features, 256)
+        self.assertEqual(model.head[-1].in_features, 256)
+        self.assertEqual(model.head[-1].out_features, 7)
+
+    def test_invalid_history_mode_fails_fast(self):
+        config = make_config()
+        config["model"]["history_mode"] = "stateful_stream"
+
+        with self.assertRaisesRegex(ValueError, "stateless_sliding_window"):
+            TauFSequenceRegressor(config)
 
 
 class FakeWindowDataset(torch.utils.data.Dataset):
@@ -212,6 +342,31 @@ class DeviceCacheTest(unittest.TestCase):
         torch.testing.assert_close(
             batch["tau_f"],
             torch.stack([values[2] + 200, values[4] + 200]),
+        )
+
+    def test_cached_batch_left_pads_early_history_with_zeros(self):
+        config = make_config(inputs=["q"])
+        config["dataloader"] = {"horizon": 3}
+        trainer = TauFTrainer(config)
+        trainer.dataset = SimpleNamespace(horizon=3)
+        values = torch.arange(28, dtype=torch.float32).reshape(4, 7)
+        trainer.tensor_cache = {"q": values, "tau_f": values + 100}
+        trainer.valid_raw_indices_device = torch.tensor([0, 1])
+        trainer.episode_starts_device = torch.tensor([0, 0])
+
+        batch = trainer._cached_batch(torch.tensor([0, 1]))
+
+        torch.testing.assert_close(
+            batch["q"][0],
+            torch.stack([torch.zeros(7), torch.zeros(7), values[0]]),
+        )
+        torch.testing.assert_close(
+            batch["q"][1],
+            torch.stack([torch.zeros(7), values[0], values[1]]),
+        )
+        torch.testing.assert_close(
+            batch["tau_f"],
+            torch.stack([values[0] + 100, values[1] + 100]),
         )
 
     def test_normalizer_stats_use_training_frames_only(self):

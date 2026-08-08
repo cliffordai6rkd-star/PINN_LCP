@@ -1,58 +1,57 @@
+# 直接端到端预测tau、wrench
+
+
 dataloader:
-  repo_id: tau_refinement_ped_lerobotv3
-  root: data/train_episode/tau_refinement_ped_lerobotv3
+  repo_id: nero_refinement_lerobotv3
+  root: data/train_episode/nero_refinement_lerobotv3/nero_refinement_lerobotv3
   load_images: false
   video_backend: torchcodec
 
   # FACTR 2/NEXT uses a 50-step history at 100 Hz.
   horizon: 50
-  # NEXT-style samples contain 50 real frames; do not train on zero-padded starts.
-  pad_history: false
+  # Early windows are left-padded with normalized zeros.
+  pad_history: true
 
   lowdim_keys:
     q: observation.joint
     dq: observation.velocity
-    ddq: observation.acceleration
-    delta_q: observation.delta_q
+    # ddq: observation.acceleration
     tau: observation.torque
     tau_f: observation.tau_f
+    # wrench: observation.wrench
 
-  normalize_mode: quantile
+  normalize_mode: gaussian
   normalize_lowdim_keys:
     - q
     - dq
-    - delta_q
+    # - ddq
     - tau_f
+    # - wrench
 
 model:
-  # Every window starts from zero recurrent state. Set this to lstm or gru;
-  # use distinct output_dir/W&B names when running both experiments.
-  history_mode: stateless_sliding_window
+  # Supported values: lstm, gru.
   architecture: gru
 
   # Remove entries here to run input ablations without changing code.
   inputs:
     - q
     - dq
-    - delta_q
-
+    # - ddq
 
   input_dims:
     q: 7
     dq: 7
-    delta_q: 7
-
+    # ddq: 7
   output_dim: 7
   target_key: tau_f
 
 
   hidden_dim: 128
   num_layers: 2
-  # NEXT head: recurrent hidden 128 -> MLP hidden 256 -> 7 torques.
-  head_hidden_dim: 256
+  head_hidden_dim: 128
   head_num_layers: 2
   activation: relu
-  dropout: 0.2
+  dropout: 0.1
 
 loss:
   # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
@@ -72,36 +71,29 @@ train:
   seed: 42
 
   lr: 1.0e-4
-  weight_decay: 1.0e-4
-  num_epochs: 1000
+  weight_decay: 1.0e-6
+  num_epochs: 500
   gradient_clip_norm: 1.0
-
-  # Re-run the final epoch model in eval mode on the train split. This roughly
-  # doubles epoch inference work, but separates dropout noise from split bias.
-  train_eval:
-    enabled: true
 
   scheduler:
     name: reduce_on_plateau
     factor: 0.5
-    patience: 5
+    patience: 15
     min_lr: 1.0e-6
 
   early_stopping:
-    enabled: true
+    enabled: false
     patience: 20
     warmup_epochs: 10
     min_delta: 1.0e-5
 
-  output_dir: outputs/tau_f_sequence/next_gru_h50
-  # val_loss is normalized MSE. val_mae_nm is also available for checkpoint
-  # ranking and early stopping when a physical-unit threshold is preferred.
+  output_dir: outputs/tau_f_sequence/gru_h50_qv2tau_f
   monitor_key: val_loss
   top_k: 5
 
   ema:
     enabled: true
-    decay: 0.999
+    decay: 0.99
     update_after_step: 0
     update_every: 1
     use_for_validation: true
@@ -109,6 +101,6 @@ train:
   wandb:
     enabled: true
     project: lcp-pinn
-    name: tau-f-next-lstm-h50-qdq-deltaq-rts-labels
+    name: tau-f-sequence-lstm-h50-v2
     mode: online
     log_every_steps: 10

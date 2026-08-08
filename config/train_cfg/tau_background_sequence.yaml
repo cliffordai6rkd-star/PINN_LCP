@@ -1,0 +1,102 @@
+dataloader:
+  repo_id: tau_refinement_lerobotv3
+  root: data/train_episode/tau_refinement_lerobotv3
+  load_images: false
+  video_backend: torchcodec
+
+  # FACTR 2/NEXT uses a 50-step history at 100 Hz.
+  horizon: 50
+  # Early windows are left-padded with normalized zeros.
+  pad_history: true
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    ddq: observation.acceleration
+    delta_q: observation.delta_q
+    tau: observation.torque
+    tau_f: observation.tau_f
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys:
+    - q
+    - dq
+    - ddq
+    - delta_q
+    - tau
+
+model:
+  # Supported values: lstm, gru.
+  architecture: gru
+
+  # Remove entries here to run input ablations without changing code.
+  inputs:
+    - q
+    - dq
+    - ddq
+    - delta_q
+
+  input_dims:
+    q: 7
+    dq: 7
+    ddq: 7
+    delta_q: 7   
+  output_dim: 7
+  target_key: tau
+
+
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 128
+  dropout: 0.1
+
+loss:
+  # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
+  joint_weights: null
+
+train:
+  device: cuda:0
+  # The low-dimensional cache is device-resident; workers only emit indices.
+  batch_size: 512
+  num_workers: 2
+  val_ratio: 0.1
+
+  # Randomly sample validation targets from all episodes. With horizon > 1,
+  # neighboring train/validation windows can share historical frames.
+  split_mode: sample
+  seed: 42
+
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 15
+    min_lr: 1.0e-6
+
+  early_stopping:
+    enabled: false
+    patience: 20
+    warmup_epochs: 10
+    min_delta: 1.0e-5
+
+  output_dir: outputs/tau_bg_sequence/gru_h50_qva2t
+  monitor_key: val_loss
+  top_k: 5
+
+  ema:
+    enabled: true
+    decay: 0.999
+    update_after_step: 0
+    update_every: 1
+    use_for_validation: true
+
+  wandb:
+    enabled: true
+    project: lcp-pinn
+    name: tau-f-sequence-lstm-h50-v2
+    mode: online
+    log_every_steps: 10

@@ -78,11 +78,7 @@ xbox_device: /dev/input/js0
 ls /dev/input/js*
 ```
 
-如果在 Docker 里运行，需要把设备传进容器，例如：
-
-```bash
---device=/dev/input/js0
-```
+当前用户需要拥有该设备的读取权限；必要时将用户加入系统的 `input` 组。
 
 ## Xbox 参数说明
 
@@ -316,7 +312,7 @@ python sim_mujoco/teleoperation.py
 
 - 检查 `ls /dev/input/js*`。
 - 修改 `xbox_device`。
-- Docker 里运行时确认传入了 `--device=/dev/input/js0`。
+- 检查当前用户是否拥有 `/dev/input/js0` 的读取权限。
 
 摇杆居中时机器人仍然移动
 

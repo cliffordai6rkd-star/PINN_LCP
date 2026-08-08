@@ -17,25 +17,14 @@ python pointcloud/single_frame_reconstruct.py --help
 
 ## 0. 安装依赖与下载 SAM3 权重
 
-### 0.1 构建带依赖的 Docker 镜像
+### 0.1 安装点云依赖
 
-本项目的 `docker for LCP_PINN_V1/Dockerfile` 已经加入 RealSense、SAM3/Ultralytics、Hugging Face CLI 和 Open3D 相关依赖。
-
-重新构建镜像：
+先完成项目根目录的基础环境安装，再安装点云与视觉依赖：
 
 ```bash
-docker compose -f "docker for LCP_PINN_V1/docker_compose.yaml" build v2
-docker compose -f "docker for LCP_PINN_V1/docker_compose.yaml" up -d v2
-```
-
-如果你只是临时给当前容器安装依赖，也可以在宿主机执行：
-
-```bash
-docker exec -u root -it st-pinn /opt/venv/bin/python -m pip install \
-  pyrealsense2 opencv-python numpy ultralytics open3d \
-  "huggingface-hub[cli,hf-transfer]>=0.34.2,<0.36.0" \
-  "fsspec[http]>=2023.1.0,<=2025.3.0" \
-  "packaging>=24.2,<26.0" \
+./setup.sh
+conda activate pinn
+python -m pip install -e ".[vision]" \
   git+https://github.com/ultralytics/CLIP.git
 ```
 
@@ -64,12 +53,10 @@ https://huggingface.co/facebook/sam3
 4. 到 https://huggingface.co/settings/tokens 创建 Read 权限 token
 ```
 
-### 0.3 在容器里登录 Hugging Face
-
-进入容器：
+### 0.3 登录 Hugging Face
 
 ```bash
-docker exec -it st-pinn bash
+conda activate pinn
 ```
 
 登录：
@@ -102,7 +89,7 @@ hf auth whoami
 
 ### 0.4 下载 SAM3 权重
 
-在容器的 `/workspace` 下执行：
+在项目根目录执行：
 
 ```bash
 mkdir -p weights
@@ -112,13 +99,7 @@ hf download facebook/sam3 sam3.pt --local-dir weights
 下载成功后应该有：
 
 ```text
-/workspace/weights/sam3.pt
-```
-
-宿主机对应路径是：
-
-```text
-/home/hirol/code/lcx/PINN/weights/sam3.pt
+weights/sam3.pt
 ```
 
 之后脚本中使用：
@@ -129,7 +110,7 @@ python pointcloud/single_frame_reconstruct.py \
   --box 100 120 420 460
 ```
 
-### 0.5 如果容器无法访问 Hugging Face
+### 0.5 如果无法访问 Hugging Face
 
 如果登录或下载时报：
 
@@ -137,36 +118,17 @@ python pointcloud/single_frame_reconstruct.py \
 Network is unreachable
 ```
 
-说明容器没有外网。最简单的处理方式是：
+可在浏览器或其他能访问 Hugging Face 的机器下载 `sam3.pt`，然后放到项目的
+`weights/sam3.pt`。
 
-```text
-在宿主机浏览器或其他能访问 Hugging Face 的机器下载 sam3.pt
-然后放到 /home/hirol/code/lcx/PINN/weights/sam3.pt
-```
-
-容器里会自动看到：
-
-```text
-/workspace/weights/sam3.pt
-```
-
-如果你一定要在容器内下载，需要给容器配置代理。比如宿主机代理端口是 `7897` 时，可以尝试：
+如需使用代理，可在当前终端设置：
 
 ```bash
-docker exec -it \
-  -e HTTP_PROXY=http://host.docker.internal:7897 \
-  -e HTTPS_PROXY=http://host.docker.internal:7897 \
-  st-pinn bash
-```
-
-然后再执行：
-
-```bash
+export HTTP_PROXY=http://127.0.0.1:7897
+export HTTPS_PROXY=http://127.0.0.1:7897
 hf auth login
 hf download facebook/sam3 sam3.pt --local-dir weights
 ```
-
-Linux 上如果 `host.docker.internal` 不通，需要改用宿主机网关 IP。
 
 ### 0.6 依赖冲突修复
 
@@ -181,7 +143,7 @@ lerobot requires packaging <26.0, >=24.2
 执行：
 
 ```bash
-docker exec -u root -it st-pinn /opt/venv/bin/python -m pip install --force-reinstall \
+python -m pip install --force-reinstall \
   "huggingface-hub[cli,hf-transfer]>=0.34.2,<0.36.0" \
   "fsspec[http]>=2023.1.0,<=2025.3.0" \
   "packaging>=24.2,<26.0"
@@ -190,7 +152,7 @@ docker exec -u root -it st-pinn /opt/venv/bin/python -m pip install --force-rein
 然后检查：
 
 ```bash
-docker exec -it st-pinn /opt/venv/bin/python -m pip check
+python -m pip check
 ```
 
 ## 1. 先用手工 mask 验证几何链路
@@ -209,7 +171,7 @@ python pointcloud/single_frame_reconstruct.py \
 
 ## 2. 使用 SAM3 框选目标
 
-如果容器里已经安装了支持 SAM3 的 `ultralytics`，可以用 box prompt：
+如果已经安装了支持 SAM3 的 `ultralytics`，可以用 box prompt：
 
 ```bash
 python pointcloud/single_frame_reconstruct.py \

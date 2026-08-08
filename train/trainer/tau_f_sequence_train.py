@@ -30,7 +30,7 @@ class SampleIndexDataset(torch.utils.data.Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a causal LSTM/GRU regressor for tau_f."
+        description="Train a NEXT-style stateless-window LSTM/GRU for tau_f."
     )
     parser.add_argument(
         "--config",
@@ -98,7 +98,7 @@ class TauFTrainer(BaseTrainer):
 
     def _build_device_cache(self, training_frames):
         model_config = self.config.get("model") or {}
-        active_inputs = list(model_config.get("inputs") or ["q", "dq", "ddq", "tau"])
+        active_inputs = list(model_config.get("inputs") or ["q", "dq", "delta_q"])
         cache_keys = list(
             dict.fromkeys(
                 active_inputs
@@ -259,17 +259,73 @@ class TauFTrainer(BaseTrainer):
             device=raw_indices.device,
         )
         window_indices = raw_indices[:, None] + offsets[None, :]
+        padding_mask = window_indices < episode_starts[:, None]
         window_indices = torch.maximum(window_indices, episode_starts[:, None])
 
         model = self.config.get("model") or {}
-        active_inputs = list(model.get("inputs") or ["q", "dq", "ddq", "tau"])
+        active_inputs = list(model.get("inputs") or ["q", "dq", "delta_q"])
         target_key = str(model.get("target_key", "tau_f"))
-        batch = {key: self.tensor_cache[key][window_indices] for key in active_inputs}
+        batch = {
+            key: self.tensor_cache[key][window_indices].masked_fill(
+                padding_mask.unsqueeze(-1),
+                0.0,
+            )
+            for key in active_inputs
+        }
         batch[target_key] = self.tensor_cache[target_key].index_select(0, raw_indices)
         return batch
 
     def build_model(self):
         return TauFSequenceRegressor(self.config)
+
+    def _denormalize_target(self, value):
+        """Convert the configured torque target back to its physical unit."""
+        dataset = getattr(self, "dataset", None)
+        if dataset is None:
+            return value
+
+        target_key = str(
+            (self.config.get("model") or {}).get("target_key", "tau_f")
+        )
+        normalize_mode = getattr(dataset, "normalize_mode", None)
+        normalized_keys = getattr(dataset, "normalize_lowdim_keys", ())
+        if normalize_mode is None or target_key not in normalized_keys:
+            return value
+
+        normalizer = getattr(dataset, "normalizer", None)
+        if normalizer is None:
+            raise RuntimeError(
+                f"Target {target_key!r} is configured as normalized, but the "
+                "dataset normalizer has not been fitted."
+            )
+
+        denormalize = getattr(
+            normalizer,
+            f"{normalize_mode}_denormalize",
+            None,
+        )
+        if denormalize is None:
+            raise ValueError(f"unknown normalize mode: {normalize_mode}")
+        return denormalize(target_key, value)
+
+    def _physical_mae_metrics(self, prediction, target):
+        with torch.no_grad():
+            prediction_nm = self._denormalize_target(prediction.detach())
+            target_nm = self._denormalize_target(target.detach())
+            absolute_error_nm = (prediction_nm - target_nm).abs()
+            joint_mae_nm = absolute_error_nm.reshape(
+                -1,
+                absolute_error_nm.shape[-1],
+            ).mean(dim=0)
+
+        metrics = {"mae_nm": joint_mae_nm.mean()}
+        metrics.update(
+            {
+                f"mae_nm_j{joint_index}": joint_mae
+                for joint_index, joint_mae in enumerate(joint_mae_nm, start=1)
+            }
+        )
+        return metrics
 
     def compute_loss(self, batch):
         if "sample_idx" in batch:
@@ -297,9 +353,9 @@ class TauFTrainer(BaseTrainer):
         out["loss_dict"] = {
             "mse": loss.detach(),
             "mae": F.l1_loss(prediction, target).detach(),
+            **self._physical_mae_metrics(prediction, target),
         }
         return loss, out
-
 
 def main():
     args = parse_args()

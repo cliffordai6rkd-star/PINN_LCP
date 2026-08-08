@@ -5,8 +5,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
 
 # Virtual environments and local env files
+.conda-env/
 .venv/
 venv/
 env/
@@ -35,9 +37,6 @@ data/train_episode/
 *.hdf5
 *.parquet
 *.mp4
-
-# Local Docker setup
-docker for LCP_PINN_V1/
 
 # Plots and generated reports
 loss_epoch.png
