@@ -1,16 +1,31 @@
+import copy
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
-from model.tau_f_sequence import TauFSequenceRegressor
+from model.tau_f_gru import TauFGRURegressor
+from model.tau_f_lstm import TauFLSTMRegressor
+from model.tau_f_sequence import (
+    TauFSequenceRegressor,
+    build_tau_f_sequence_model,
+)
+from model.tau_f_tcn import TauFTCNRegressor
 from train.base_trainer import BaseTrainer, ModelEMA
 from train.nomalizer import Normalizer
-from train.trainer.tau_f_sequence_train import SampleIndexDataset, TauFTrainer
+from train.torque_sequence_peak_loss import TorqueSequencePeakLoss
+from train.trainer.tau_f_sequence_train import (
+    SampleIndexDataset,
+    TauFTrainer,
+    run_purged_kfold_workflow,
+)
 
 
 def make_config(architecture="lstm", inputs=None):
     return {
+        "dataloader": {"horizon": 8},
         "model": {
             "architecture": architecture,
             "inputs": inputs or ["q", "dq", "ddq", "tau"],
@@ -23,7 +38,13 @@ def make_config(architecture="lstm", inputs=None):
             "head_num_layers": 2,
             "dropout": 0.0,
         },
-        "loss": {"joint_weights": None},
+        "loss": {
+            "type": "peak_cvar",
+            "tail_fraction": 0.02,
+            "peak_weight": 0.9,
+            "mean_weight": 0.1,
+            "joint_weights": None,
+        },
         "train": {},
     }
 
@@ -36,6 +57,49 @@ def make_batch(batch_size=4, horizon=8):
 
 
 class TauFSequenceRegressorTest(unittest.TestCase):
+    def test_trainer_rejects_conflicting_cudnn_modes(self):
+        config = make_config()
+        config["train"].update(deterministic=True, cudnn_benchmark=True)
+
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            TauFTrainer(config)
+
+    def test_trainer_accepts_fast_seeded_cudnn_mode(self):
+        config = make_config()
+        config["train"].update(deterministic=False, cudnn_benchmark=True)
+
+        trainer = TauFTrainer(config)
+
+        self.assertFalse(trainer.deterministic)
+        self.assertTrue(trainer.cudnn_benchmark)
+
+    def test_early_stopping_can_use_a_different_metric_than_checkpoints(self):
+        config = make_config()
+        config["train"].update(
+            monitor_key="val_wrench_force_norm_p95_n",
+            early_stopping_monitor_key="val_loss",
+            early_stopping={
+                "enabled": True,
+                "patience": 1,
+                "warmup_epochs": 0,
+                "min_delta": 0.0,
+            },
+        )
+        trainer = TauFTrainer(config)
+
+        self.assertFalse(
+            trainer.should_stop_early(
+                0,
+                {"val_loss": 1.0, "val_wrench_force_norm_p95_n": 10.0},
+            )
+        )
+        self.assertTrue(
+            trainer.should_stop_early(
+                1,
+                {"val_loss": 1.1, "val_wrench_force_norm_p95_n": 0.1},
+            )
+        )
+
     def test_model_ema_smooths_parameters_and_copies_buffers(self):
         model = torch.nn.BatchNorm1d(2)
         ema = ModelEMA(model, decay=0.5)
@@ -55,8 +119,8 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         )
         self.assertFalse(any(p.requires_grad for p in ema.model.parameters()))
 
-    def test_lstm_and_gru_forward_backward(self):
-        for architecture in ("lstm", "gru"):
+    def test_supported_architectures_forward_backward(self):
+        for architecture in ("lstm", "gru", "tcn"):
             with self.subTest(architecture=architecture):
                 model = TauFSequenceRegressor(make_config(architecture))
                 out = model(make_batch())
@@ -67,6 +131,35 @@ class TauFSequenceRegressorTest(unittest.TestCase):
                 self.assertTrue(
                     any(parameter.grad is not None for parameter in model.parameters())
                 )
+
+    def test_factory_dispatches_to_three_independent_model_types(self):
+        expected_types = {
+            "lstm": TauFLSTMRegressor,
+            "gru": TauFGRURegressor,
+            "tcn": TauFTCNRegressor,
+        }
+
+        for architecture, expected_type in expected_types.items():
+            with self.subTest(architecture=architecture):
+                model = build_tau_f_sequence_model(make_config(architecture))
+                self.assertIs(type(model), expected_type)
+
+    def test_recurrent_last_prediction_is_bitwise_legacy_compatible(self):
+        batch = make_batch()
+        for architecture in ("lstm", "gru"):
+            with self.subTest(architecture=architecture):
+                model = TauFSequenceRegressor(make_config(architecture)).eval()
+                sequence = torch.cat(
+                    [batch[key] for key in model.active_inputs],
+                    dim=-1,
+                )
+
+                with torch.no_grad():
+                    recurrent_output, _ = model.recurrent(sequence)
+                    legacy_prediction = model.head(recurrent_output[:, -1])
+                    prediction = model(batch)["tau_f_pred"]
+
+                self.assertTrue(torch.equal(prediction, legacy_prediction))
 
     def test_configurable_input_subset_changes_recurrent_input_size(self):
         model = TauFSequenceRegressor(make_config(inputs=["q", "tau"]))
@@ -88,6 +181,41 @@ class TauFSequenceRegressorTest(unittest.TestCase):
 
         torch.testing.assert_close(out["tau_f_target"], batch["tau_f"][:, -1])
 
+    def test_tcn_is_strictly_causal_and_covers_the_configured_history(self):
+        config = make_config("tcn")
+        model = TauFSequenceRegressor(config).eval()
+        batch = make_batch(batch_size=2, horizon=8)
+        changed = {key: value.clone() for key, value in batch.items()}
+        for key in model.active_inputs:
+            changed[key][:, 5:] += 100.0
+
+        with torch.no_grad():
+            baseline = model.forward_sequence(batch)
+            perturbed = model.forward_sequence(changed)
+
+        self.assertEqual(model.temporal_receptive_field, 8)
+        self.assertIsInstance(model.current_state_skip, torch.nn.Linear)
+        torch.testing.assert_close(baseline[:, :5], perturbed[:, :5])
+        self.assertFalse(torch.allclose(baseline[:, 5:], perturbed[:, 5:]))
+
+    def test_tcn_rejects_a_receptive_field_shorter_than_history(self):
+        config = make_config("tcn")
+        config["model"].update(tcn_kernel_size=2, tcn_dilations=[1, 2])
+
+        with self.assertRaisesRegex(ValueError, "receptive field"):
+            TauFSequenceRegressor(config)
+
+    def test_tcn_can_add_causal_first_difference_to_current_skip(self):
+        config = make_config("tcn")
+        config["model"]["current_delta_skip"] = True
+        model = TauFSequenceRegressor(config)
+
+        out = model(make_batch())
+
+        self.assertTrue(model.current_delta_skip)
+        self.assertEqual(model.current_state_skip.in_features, 2 * model.input_dim)
+        self.assertEqual(out["tau_f_pred"].shape, (4, 7))
+
     def test_trainer_computes_normalized_and_physical_mae(self):
         trainer = TauFTrainer(make_config())
         trainer.model = trainer.build_model()
@@ -99,6 +227,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         self.assertEqual(
             set(out["loss_dict"]),
             {
+                "peak_objective_nm2",
                 "mse",
                 "mae",
                 "mae_nm",
@@ -166,7 +295,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
 
         val_loss = trainer.validate_one_epoch(epoch=0)
 
-        self.assertAlmostEqual(val_loss, 11.0 / 3.0)
+        self.assertAlmostEqual(val_loss, 11.0 / 3.0, places=6)
         self.assertAlmostEqual(
             trainer.last_val_epoch_metrics["mae_nm"],
             5.0 / 3.0,
@@ -176,6 +305,77 @@ class TauFSequenceRegressorTest(unittest.TestCase):
                 trainer.last_val_epoch_metrics[f"mae_nm_j{joint_index}"],
                 5.0 / 3.0,
             )
+        self.assertEqual(
+            trainer.last_val_epoch_metrics["peak_cvar_rmse_nm"],
+            3.0,
+        )
+
+    def test_peak_cvar_targets_the_largest_errors(self):
+        objective = TorqueSequencePeakLoss(
+            {
+                "type": "peak_cvar",
+                "tail_fraction": 0.25,
+                "peak_weight": 1.0,
+                "mean_weight": 0.0,
+            }
+        )
+        prediction = torch.tensor(
+            [[0.0, 0.0], [0.0, 4.0]],
+            requires_grad=True,
+        )
+        target = torch.zeros_like(prediction)
+
+        loss = objective(prediction, target)
+        loss.backward()
+
+        self.assertEqual(loss.item(), 16.0)
+        self.assertEqual(prediction.grad[1, 1].item(), 8.0)
+        self.assertEqual(torch.count_nonzero(prediction.grad).item(), 1)
+
+    def test_mse_mode_restores_the_weighted_mean_objective(self):
+        objective = TorqueSequencePeakLoss({"type": "mse"})
+        prediction = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        target = torch.zeros_like(prediction)
+
+        loss = objective(
+            prediction,
+            target,
+            joint_weights=[1.0, 0.5],
+        )
+
+        self.assertEqual(objective.loss_type, "mse")
+        self.assertEqual(loss.item(), (1.0 + 2.0 + 9.0 + 8.0) / 4.0)
+
+    def test_trainer_mse_mode_uses_normalized_values(self):
+        config = make_config()
+        config["loss"] = {"type": "mse", "joint_weights": None}
+        trainer = TauFTrainer(config)
+        trainer.model = trainer.build_model()
+
+        loss, out = trainer.compute_loss(make_batch())
+
+        self.assertEqual(trainer.peak_loss.loss_type, "mse")
+        torch.testing.assert_close(loss, out["loss_dict"]["mse"])
+        self.assertIn("mse_objective", out["loss_dict"])
+        self.assertNotIn("peak_objective_nm2", out["loss_dict"])
+
+    def test_peak_metrics_use_the_complete_error_population(self):
+        objective = TorqueSequencePeakLoss(
+            {
+                "type": "peak_cvar",
+                "tail_fraction": 0.25,
+                "peak_weight": 1.0,
+                "mean_weight": 0.0,
+            }
+        )
+        metrics = objective.metrics_from_absolute_error(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        )
+
+        self.assertEqual(metrics["peak_cvar_rmse_nm"].item(), 4.0)
+        self.assertEqual(metrics["peak_cvar_rmse_nm_j1"].item(), 3.0)
+        self.assertEqual(metrics["peak_cvar_rmse_nm_j2"].item(), 4.0)
+        self.assertEqual(metrics["peak_max_nm"].item(), 4.0)
 
     def test_train_eval_disables_training_mode_noise(self):
         class ModeAwareModel(torch.nn.Module):
@@ -213,7 +413,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
             TauFSequenceRegressor(make_config(architecture="transformer"))
 
     def test_each_window_starts_from_a_fresh_recurrent_state(self):
-        for architecture in ("lstm", "gru"):
+        for architecture in ("lstm", "gru", "tcn"):
             with self.subTest(architecture=architecture):
                 model = TauFSequenceRegressor(make_config(architecture))
                 model.eval()
@@ -226,7 +426,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
                 torch.testing.assert_close(first, second)
 
     def test_model_does_not_expose_a_streaming_hidden_state_api(self):
-        for architecture in ("lstm", "gru"):
+        for architecture in ("lstm", "gru", "tcn"):
             with self.subTest(architecture=architecture):
                 model = TauFSequenceRegressor(make_config(architecture))
                 out = model(make_batch())
@@ -289,6 +489,39 @@ class FakeWindowDataset(torch.utils.data.Dataset):
         return self.valid_indices[index]
 
 
+class FakeMultiEpisodeWindowDataset(torch.utils.data.Dataset):
+    def __init__(self, episode_lengths=(36, 42), horizon=5):
+        self.horizon = horizon
+        self.valid_indices = []
+        self.raw_idx_to_episode_start = {}
+        self.raw_idx_to_episode_end = {}
+        episodes = []
+        episode_start = 0
+        for episode_index, episode_length in enumerate(episode_lengths):
+            episode_end = episode_start + episode_length
+            episodes.append(
+                {
+                    "episode_index": episode_index,
+                    "dataset_from_index": episode_start,
+                    "dataset_to_index": episode_end,
+                }
+            )
+            for raw_idx in range(episode_start + horizon - 1, episode_end):
+                self.valid_indices.append(raw_idx)
+                self.raw_idx_to_episode_start[raw_idx] = episode_start
+                self.raw_idx_to_episode_end[raw_idx] = episode_end
+            episode_start = episode_end
+        self.dataset = SimpleNamespace(
+            meta=SimpleNamespace(episodes=episodes)
+        )
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, index):
+        return self.valid_indices[index]
+
+
 class PurgedTemporalSplitTest(unittest.TestCase):
     def test_train_and_validation_windows_share_no_raw_frames(self):
         trainer = BaseTrainer(
@@ -311,6 +544,156 @@ class PurgedTemporalSplitTest(unittest.TestCase):
         self.assertTrue(val_frames)
         self.assertTrue(train_frames.isdisjoint(val_frames))
         self.assertEqual(max(train_frames) + 1, min(val_frames))
+
+
+class PurgedKFoldSplitTest(unittest.TestCase):
+    @staticmethod
+    def covered_frames(dataset, subset):
+        frames = set()
+        for sample_idx in subset.indices:
+            raw_idx = dataset.valid_indices[sample_idx]
+            episode_start = dataset.raw_idx_to_episode_start[raw_idx]
+            frames.update(
+                range(max(episode_start, raw_idx - dataset.horizon + 1), raw_idx + 1)
+            )
+        return frames
+
+    def test_every_fold_has_disjoint_raw_history_and_covers_all_targets(self):
+        dataset = FakeMultiEpisodeWindowDataset()
+        validation_sample_sets = []
+
+        for fold_index in range(3):
+            trainer = BaseTrainer(
+                {
+                    "train": {
+                        "split_mode": "purged_kfold",
+                        "purged_kfold": {
+                            "num_folds": 3,
+                            "fold_index": fold_index,
+                        },
+                    }
+                }
+            )
+            trainer.dataset = dataset
+            train_dataset, val_dataset = trainer.split_dataset_purged_kfold()
+
+            train_frames = self.covered_frames(dataset, train_dataset)
+            val_frames = self.covered_frames(dataset, val_dataset)
+            self.assertTrue(train_frames)
+            self.assertTrue(val_frames)
+            self.assertTrue(train_frames.isdisjoint(val_frames))
+            self.assertEqual(
+                len(trainer.current_split_metadata["episodes"]),
+                2,
+            )
+            self.assertTrue(
+                all(
+                    episode["train_samples"] > 0
+                    and episode["val_samples"] > 0
+                    for episode in trainer.current_split_metadata["episodes"]
+                )
+            )
+            validation_sample_sets.append(set(val_dataset.indices))
+
+        for left_index, left in enumerate(validation_sample_sets):
+            for right in validation_sample_sets[left_index + 1 :]:
+                self.assertTrue(left.isdisjoint(right))
+        self.assertEqual(
+            set().union(*validation_sample_sets),
+            set(range(len(dataset))),
+        )
+
+    def test_short_episode_fails_instead_of_silently_disappearing(self):
+        trainer = BaseTrainer(
+            {
+                "train": {
+                    "split_mode": "purged_kfold",
+                    "purged_kfold": {"num_folds": 3, "fold_index": 1},
+                }
+            }
+        )
+        trainer.dataset = FakeMultiEpisodeWindowDataset(
+            episode_lengths=(11,),
+            horizon=5,
+        )
+
+        with self.assertRaisesRegex(ValueError, "removed all training windows"):
+            trainer.split_dataset_purged_kfold()
+
+
+class PurgedKFoldWorkflowTest(unittest.TestCase):
+    def test_workflow_aggregates_folds_and_retrains_all_data(self):
+        class FakeTrainer:
+            configs = []
+
+            def __init__(self, config):
+                self.config = copy.deepcopy(config)
+                self.__class__.configs.append(self.config)
+
+            def train(self):
+                train_config = self.config["train"]
+                if train_config["split_mode"] == "all":
+                    return {
+                        "num_epochs": train_config["num_epochs"],
+                        "best_checkpoints": [],
+                        "monitor_key": train_config["monitor_key"],
+                    }
+
+                fold_index = train_config["purged_kfold"]["fold_index"]
+                best_epochs = (4, 8, 6)
+                val_losses = (0.03, 0.02, 0.04)
+                return {
+                    "monitor_key": "val_loss",
+                    "split": {"fold_index": fold_index},
+                    "best_checkpoints": [
+                        {
+                            "epoch": best_epochs[fold_index],
+                            "score": val_losses[fold_index],
+                            "path": Path(train_config["output_dir"]) / "best.pt",
+                            "metrics": {
+                                "val_loss": val_losses[fold_index],
+                                "val_mae_nm": 0.1 + 0.01 * fold_index,
+                            },
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = {
+                "train": {
+                    "split_mode": "purged_kfold",
+                    "output_dir": tmp_dir,
+                    "monitor_key": "val_loss",
+                    "train_eval": {"enabled": True},
+                    "early_stopping": {"enabled": True},
+                    "purged_kfold": {
+                        "num_folds": 3,
+                        "production_retrain": True,
+                    },
+                }
+            }
+
+            report = run_purged_kfold_workflow(
+                config,
+                trainer_class=FakeTrainer,
+            )
+
+            self.assertEqual(len(report["folds"]), 3)
+            self.assertEqual(report["production"]["num_epochs"], 7)
+            self.assertAlmostEqual(
+                report["aggregate"]["val_loss"]["mean"],
+                0.03,
+            )
+            self.assertEqual(
+                report["aggregate"]["val_loss"]["worst"],
+                0.04,
+            )
+            production_config = FakeTrainer.configs[-1]["train"]
+            self.assertEqual(production_config["split_mode"], "all")
+            self.assertEqual(production_config["val_ratio"], 0.0)
+            self.assertEqual(production_config["monitor_key"], "train_eval_loss")
+            self.assertFalse(production_config["early_stopping"]["enabled"])
+            self.assertTrue(Path(report["report_path"]).is_file())
 
 
 class DeviceCacheTest(unittest.TestCase):

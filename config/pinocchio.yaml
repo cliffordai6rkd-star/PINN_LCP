@@ -1,6 +1,6 @@
 pinocchio:
   urdf_path: sim_mesh/nero/nero_with_gripper.urdf
-  frame_name: gripper_base
+  frame_name: gripper_tcp
   locked_joint_names:
     - gripper
     - gripper_joint1
@@ -25,4 +25,3 @@ dataloader:
     # ee_acceleration: observation.ee_acceleration
     # ee_pose: action.ee_pose                  #u             
     # wrench: observation.ft_window            #lambda
-

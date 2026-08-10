@@ -1,7 +1,7 @@
 io:
-  input: data/train_episode/tau_refinement_rts_labels
-  output: data/train_episode/tau_refinement_ped_lerobotv3
-  repo_id: tau_refinement_ped_lerobotv3
+  input: data/train_episode/tau_refinement_rts_matched_labels
+  output: data/train_episode/tau_refinement_matched_lerobotv3
+  repo_id: tau_refinement_matched_lerobotv3
   max_episodes: 100
   no_videos: True
   push_to_hub: false

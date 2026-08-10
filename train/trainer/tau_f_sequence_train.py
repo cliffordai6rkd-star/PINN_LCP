@@ -1,14 +1,26 @@
 import argparse
+import copy
+import json
 import logging
+import math
+import statistics
+import sys
 from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 import torch.nn.functional as F
 import yaml
+from tqdm.auto import tqdm
 
-from model.tau_f_sequence import TauFSequenceRegressor
+from model.tau_f_sequence import build_tau_f_sequence_model
 from train.base_trainer import BaseTrainer
 from train.nomalizer import Normalizer
+from train.torque_sequence_peak_loss import TorqueSequencePeakLoss
 
 
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +42,9 @@ class SampleIndexDataset(torch.utils.data.Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a NEXT-style stateless-window LSTM/GRU for tau_f."
+        description=(
+            "Train a NEXT-style stateless-window LSTM, GRU, or TCN for tau_f."
+        )
     )
     parser.add_argument(
         "--config",
@@ -52,6 +66,7 @@ class TauFTrainer(BaseTrainer):
             if joint_weights is not None
             else None
         )
+        self.peak_loss = TorqueSequencePeakLoss(loss_config)
         self.tensor_cache = None
         self.valid_raw_indices_device = None
         self.episode_starts_device = None
@@ -276,7 +291,7 @@ class TauFTrainer(BaseTrainer):
         return batch
 
     def build_model(self):
-        return TauFSequenceRegressor(self.config)
+        return build_tau_f_sequence_model(self.config)
 
     def _denormalize_target(self, value):
         """Convert the configured torque target back to its physical unit."""
@@ -337,25 +352,330 @@ class TauFTrainer(BaseTrainer):
             raise KeyError("Batch is missing the configured tau_f supervision target.")
 
         squared_error = F.mse_loss(prediction, target, reduction="none")
-        if self.joint_weights is not None:
-            weights = self.joint_weights.to(
-                device=squared_error.device,
-                dtype=squared_error.dtype,
-            )
-            if weights.numel() != squared_error.shape[-1]:
-                raise ValueError(
-                    f"loss.joint_weights has {weights.numel()} entries, "
-                    f"expected {squared_error.shape[-1]}."
-                )
-            squared_error = squared_error * weights
-
-        loss = squared_error.mean()
+        prediction_nm = self._denormalize_target(prediction)
+        target_nm = self._denormalize_target(target)
+        absolute_error_nm = (prediction_nm - target_nm).abs()
+        objective_prediction, objective_target = (
+            (prediction, target)
+            if self.peak_loss.loss_type == "mse"
+            else (prediction_nm, target_nm)
+        )
+        loss = self.peak_loss(
+            objective_prediction,
+            objective_target,
+            joint_weights=self.joint_weights,
+        )
         out["loss_dict"] = {
-            "mse": loss.detach(),
+            (
+                "mse_objective"
+                if self.peak_loss.loss_type == "mse"
+                else "peak_objective_nm2"
+            ): loss.detach(),
+            "mse": squared_error.mean().detach(),
             "mae": F.l1_loss(prediction, target).detach(),
             **self._physical_mae_metrics(prediction, target),
         }
+        out["_absolute_error_nm"] = absolute_error_nm.detach()
         return loss, out
+
+    @torch.no_grad()
+    def evaluate_loader(self, loader, epoch, description):
+        """Aggregate peak metrics over the full split, not per mini-batch."""
+        training_model = self.model
+        if self.ema is not None and self.ema_use_for_validation:
+            self.model = self.ema.model
+        self.model.eval()
+
+        total_loss = 0.0
+        num_samples = 0
+        metric_sums = {}
+        metric_counts = {}
+        absolute_errors_nm = []
+        wrench_predictions = []
+        pbar = tqdm(
+            loader,
+            desc=f"{description} epoch {epoch}",
+            unit="batch",
+            leave=False,
+        )
+
+        try:
+            for batch in pbar:
+                batch = self.batch_to_device(batch)
+                loss, out = self.compute_loss(batch)
+                batch_size = self._batch_size(batch)
+                total_loss += loss.item() * batch_size
+                num_samples += batch_size
+                self._accumulate_scalar_metrics(
+                    metric_sums,
+                    metric_counts,
+                    out.get("loss_dict") or {},
+                    batch_size,
+                )
+                absolute_errors_nm.append(out["_absolute_error_nm"].cpu())
+                if "_wrench_pred" in out:
+                    wrench_predictions.append(out["_wrench_pred"].cpu())
+                pbar.set_postfix({"loss": f"{loss.item():.6f}"})
+        finally:
+            self.model = training_model
+
+        metrics = self._average_scalar_metrics(metric_sums, metric_counts)
+        if absolute_errors_nm:
+            global_peak_metrics = self.peak_loss.metrics_from_absolute_error(
+                torch.cat(absolute_errors_nm, dim=0)
+            )
+            metrics.update(
+                {
+                    key: float(value.item())
+                    for key, value in global_peak_metrics.items()
+                }
+            )
+        if wrench_predictions:
+            wrench = torch.cat(wrench_predictions, dim=0)
+            force_norm = torch.linalg.vector_norm(wrench[:, :3], dim=-1)
+            moment_norm = torch.linalg.vector_norm(wrench[:, 3:], dim=-1)
+            metrics.update(
+                {
+                    "wrench_force_norm_mean_n": float(force_norm.mean().item()),
+                    "wrench_force_norm_p95_n": float(
+                        torch.quantile(force_norm, 0.95).item()
+                    ),
+                    "wrench_force_norm_max_n": float(force_norm.max().item()),
+                    "wrench_moment_norm_mean_nm": float(moment_norm.mean().item()),
+                    "wrench_moment_norm_p95_nm": float(
+                        torch.quantile(moment_norm, 0.95).item()
+                    ),
+                    "wrench_moment_norm_max_nm": float(moment_norm.max().item()),
+                }
+            )
+        loss = total_loss / max(num_samples, 1)
+        return loss, metrics
+
+    def validate_one_epoch(self, epoch):
+        val_loss = super().validate_one_epoch(epoch)
+        if val_loss is not None:
+            metrics = self.last_val_epoch_metrics
+            log.info(
+                "validation peak torque: cvar_rmse=%.6f Nm p95=%.6f Nm "
+                "p99=%.6f Nm max=%.6f Nm",
+                metrics["peak_cvar_rmse_nm"],
+                metrics["peak_p95_nm"],
+                metrics["peak_p99_nm"],
+                metrics["peak_max_nm"],
+            )
+        return val_loss
+
+
+def _json_compatible(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    return value
+
+
+def _configure_stage_wandb(config, stage_name, group_name):
+    wandb_config = config["train"].get("wandb") or {}
+    if not wandb_config:
+        return
+    wandb_config = dict(wandb_config)
+    base_name = wandb_config.get("name") or "tau-sequence"
+    wandb_config["name"] = f"{base_name}-{stage_name}"
+    wandb_config.setdefault("group", group_name)
+    config["train"]["wandb"] = wandb_config
+
+
+def _aggregate_fold_metrics(fold_results):
+    metric_names = sorted(
+        {
+            key
+            for fold in fold_results
+            for key, value in fold["best_metrics"].items()
+            if key.startswith("val_") and isinstance(value, (int, float))
+        }
+    )
+    aggregate = {}
+    for metric_name in metric_names:
+        values = [
+            float(fold["best_metrics"][metric_name])
+            for fold in fold_results
+            if metric_name in fold["best_metrics"]
+        ]
+        if len(values) != len(fold_results):
+            continue
+        aggregate[metric_name] = {
+            "mean": statistics.fmean(values),
+            "std": statistics.pstdev(values),
+            "worst": max(values),
+            "values": values,
+        }
+    return aggregate
+
+
+def _write_cross_validation_report(output_dir, report):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "purged_kfold_summary.json"
+    with report_path.open("w", encoding="utf-8") as report_file:
+        json.dump(
+            _json_compatible(report),
+            report_file,
+            indent=2,
+            sort_keys=True,
+        )
+        report_file.write("\n")
+    return report_path
+
+
+def run_purged_kfold_workflow(config, trainer_class=TauFTrainer):
+    """Run all purged folds, aggregate them, then fit one full-data model."""
+    train_config = config.get("train") or {}
+    fold_config = train_config.get("purged_kfold") or {}
+    num_folds = int(fold_config.get("num_folds", 3))
+    if num_folds < 2:
+        raise ValueError("train.purged_kfold.num_folds must be at least 2")
+    output_dir = Path(
+        train_config.get("output_dir", "outputs/tau_f_sequence")
+    )
+    group_name = str(
+        (train_config.get("wandb") or {}).get("group")
+        or (train_config.get("wandb") or {}).get("name")
+        or output_dir.name
+    )
+
+    fold_results = []
+    for fold_index in range(num_folds):
+        current_config = copy.deepcopy(config)
+        current_train = current_config["train"]
+        current_fold = dict(current_train.get("purged_kfold") or {})
+        current_fold["fold_index"] = fold_index
+        current_fold["workflow_stage"] = "cross_validation"
+        current_train["purged_kfold"] = current_fold
+        current_train["output_dir"] = str(
+            output_dir
+            / "cross_validation"
+            / f"fold_{fold_index + 1:02d}_of_{num_folds:02d}"
+        )
+        _configure_stage_wandb(
+            current_config,
+            f"cv-fold-{fold_index + 1}-of-{num_folds}",
+            group_name,
+        )
+
+        log.info("starting purged K-fold %d/%d", fold_index + 1, num_folds)
+        trainer = trainer_class(current_config)
+        summary = trainer.train()
+        if not summary["best_checkpoints"]:
+            raise RuntimeError(
+                f"fold {fold_index + 1} produced no checkpoint for "
+                f"monitor_key={summary['monitor_key']!r}"
+            )
+        best_checkpoint = summary["best_checkpoints"][0]
+        fold_results.append(
+            {
+                "fold_index": fold_index,
+                "best_epoch": int(best_checkpoint["epoch"]),
+                "best_epoch_count": int(best_checkpoint["epoch"]) + 1,
+                "best_monitor_score": float(best_checkpoint["score"]),
+                "best_checkpoint": str(best_checkpoint["path"]),
+                "best_metrics": dict(best_checkpoint.get("metrics") or {}),
+                "split": summary.get("split"),
+            }
+        )
+        del trainer
+
+    aggregate = _aggregate_fold_metrics(fold_results)
+    best_epoch_counts = [fold["best_epoch_count"] for fold in fold_results]
+    configured_production_epochs = fold_config.get("production_epochs")
+    if (
+        configured_production_epochs is not None
+        and int(configured_production_epochs) < 1
+    ):
+        raise ValueError(
+            "train.purged_kfold.production_epochs must be positive or null"
+        )
+    production_epochs = (
+        int(configured_production_epochs)
+        if configured_production_epochs is not None
+        else max(1, math.ceil(statistics.median(best_epoch_counts)))
+    )
+
+    report = {
+        "workflow": "purged_kfold",
+        "num_folds": num_folds,
+        "monitor_key": train_config.get("monitor_key", "val_loss"),
+        "folds": fold_results,
+        "aggregate": aggregate,
+        "production": {
+            "enabled": bool(fold_config.get("production_retrain", True)),
+            "epoch_selection": (
+                "configured"
+                if configured_production_epochs is not None
+                else "median_fold_best_epoch_count"
+            ),
+            "num_epochs": production_epochs,
+            "output_dir": str(output_dir),
+        },
+    }
+    report_path = _write_cross_validation_report(output_dir, report)
+    log.info("purged K-fold report written before production: %s", report_path)
+
+    if report["production"]["enabled"]:
+        production_config = copy.deepcopy(config)
+        production_train = production_config["train"]
+        production_train["split_mode"] = "all"
+        production_train["val_ratio"] = 0.0
+        production_train["num_epochs"] = production_epochs
+        production_train["output_dir"] = str(output_dir)
+        production_train["early_stopping"] = {
+            **(production_train.get("early_stopping") or {}),
+            "enabled": False,
+        }
+        train_eval_enabled = bool(
+            (production_train.get("train_eval") or {}).get("enabled", False)
+        )
+        production_train["monitor_key"] = (
+            "train_eval_loss" if train_eval_enabled else "avg_loss"
+        )
+        production_fold_config = dict(
+            production_train.get("purged_kfold") or {}
+        )
+        production_fold_config["workflow_stage"] = "production_full_data"
+        production_fold_config["selected_num_epochs"] = production_epochs
+        production_train["purged_kfold"] = production_fold_config
+        _configure_stage_wandb(
+            production_config,
+            "production-full-data",
+            group_name,
+        )
+
+        log.info(
+            "starting full-data production retraining for %d epochs",
+            production_epochs,
+        )
+        production_trainer = trainer_class(production_config)
+        production_summary = production_trainer.train()
+        report["production"]["summary"] = production_summary
+        report_path = _write_cross_validation_report(output_dir, report)
+
+    report["report_path"] = str(report_path)
+    return report
+
+
+def run_tau_sequence_training(config, trainer_class=TauFTrainer):
+    train_config = config.get("train") or {}
+    fold_config = train_config.get("purged_kfold") or {}
+    if (
+        train_config.get("split_mode") == "purged_kfold"
+        and bool(fold_config.get("run_all_folds", True))
+    ):
+        return run_purged_kfold_workflow(config, trainer_class=trainer_class)
+
+    trainer = trainer_class(config)
+    summary = trainer.train()
+    log.info("\n%s", trainer.format_summary(summary))
+    return summary
 
 def main():
     args = parse_args()
@@ -363,9 +683,13 @@ def main():
         config = yaml.safe_load(config_file)
 
     log.info("tau_f sequence train config: %s", config)
-    trainer = TauFTrainer(config)
-    summary = trainer.train()
-    log.info("\n%s", trainer.format_summary(summary))
+    result = run_tau_sequence_training(config)
+    if result.get("workflow") == "purged_kfold":
+        log.info(
+            "purged K-fold workflow finished: report=%s production_epochs=%d",
+            result["report_path"],
+            result["production"]["num_epochs"],
+        )
 
 
 if __name__ == "__main__":

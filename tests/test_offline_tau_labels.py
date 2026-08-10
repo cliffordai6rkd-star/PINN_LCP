@@ -5,6 +5,7 @@ import numpy as np
 
 from data_process.offline_tau_labels import (
     KalmanRTSConfig,
+    causal_median_one_pole_filter,
     estimate_joint_states_rts,
     fill_missing_measurements,
     residual_torque,
@@ -76,6 +77,24 @@ def test_residual_torque_uses_measured_minus_inverse_dynamics():
     )
 
 
+def test_causal_torque_filter_uses_measured_dt_and_first_sample_initialization():
+    timestamps = np.asarray([0.0, 0.01, 0.03])
+    values = np.asarray([[0.0], [1.0], [1.0]])
+
+    filtered = causal_median_one_pole_filter(
+        timestamps,
+        values,
+        cutoff_hz=10.0,
+        median_window=1,
+    )
+
+    alpha_1 = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.01)
+    alpha_2 = 1.0 - np.exp(-2.0 * np.pi * 10.0 * 0.02)
+    expected_1 = alpha_1
+    expected_2 = alpha_2 + (1.0 - alpha_2) * expected_1
+    np.testing.assert_allclose(filtered[:, 0], [0.0, expected_1, expected_2])
+
+
 class _FakeModel:
     nq = 2
     nv = 2
@@ -103,6 +122,15 @@ def _write_episode(path: Path):
         teleop.create_dataset("q_follower", data=q)
         teleop.create_dataset("dq_follower", data=dq)
         teleop.create_dataset("tau_follower", data=tau)
+        teleop["tau_follower"].attrs.update(
+            {
+                "causal": True,
+                "lowpass": True,
+                "lowpass_cutoff_hz": 10.0,
+                "median_window": 1,
+                "zero_phase": False,
+            }
+        )
         teleop.create_dataset("ddq_follower", data=np.zeros_like(q))
         teleop.create_dataset("tau_f_cal", data=np.zeros_like(q))
 
@@ -117,6 +145,7 @@ def test_h5_pipeline_copies_source_and_writes_self_describing_labels(tmp_path):
             "timestamp_scale_to_s": 1.0e-6,
             "dq_sign": [1, 1],
             "rnea_state_source": "measured",
+            "torque_filter": {"cutoff_hz": 10.0, "median_window": 1},
         },
         "estimator": {"max_gap_s": 0.1},
     }
@@ -136,11 +165,16 @@ def test_h5_pipeline_copies_source_and_writes_self_describing_labels(tmp_path):
     with h5py.File(destination, "r") as output_h5:
         teleop = output_h5["teleop"]
         tau = np.asarray(teleop["tau_follower"])
-        tau_id = np.asarray(teleop["tau_id_rts"])
+        tau_id = np.asarray(teleop["tau_id_rts_filtered"])
         tau_f = np.asarray(teleop["tau_f_cal"])
         np.testing.assert_allclose(tau_f, tau - tau_id)
-        assert teleop["tau_f_cal"].attrs["formula"].startswith("tau_f=tau-")
+        assert teleop["tau_f_cal"].attrs["formula"].startswith(
+            "tau_f=tau_filtered-tau_id_filtered"
+        )
+        assert bool(teleop["tau_id_rts_filtered"].attrs["lowpass"])
         assert bool(teleop["ddq_follower"].attrs["offline_only"])
-        assert output_h5.attrs["offline_tau_residual_convention"] == "tau_minus_tau_id"
+        assert output_h5.attrs["offline_tau_residual_convention"] == (
+            "tau_filtered_minus_tau_id_filtered"
+        )
     assert result["frames"] == 80
     assert result["segments"] == 1

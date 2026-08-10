@@ -1,6 +1,6 @@
 dataloader:
-  repo_id: tau_refinement_ped_lerobotv3
-  root: data/train_episode/tau_refinement_ped_lerobotv3
+  repo_id: tau_refinement_matched_lerobotv3
+  root: data/train_episode/tau_refinement_matched_lerobotv3
   load_images: false
   video_backend: torchcodec
 
@@ -17,7 +17,7 @@ dataloader:
     tau: observation.torque
     tau_f: observation.tau_f
 
-  normalize_mode: quantile
+  normalize_mode: gaussian
   normalize_lowdim_keys:
     - q
     - dq
@@ -25,10 +25,12 @@ dataloader:
     - tau_f
 
 model:
-  # Every window starts from zero recurrent state. Set this to lstm or gru;
-  # use distinct output_dir/W&B names when running both experiments.
+  # Every window is independent. The causal TCN has an exact 50-frame
+  # receptive field and an explicit current-state skip.
   history_mode: stateless_sliding_window
-  architecture: gru
+  architecture: lstm
+  tcn_kernel_size: 2
+  tcn_dilations: [1, 2, 4, 8, 16, 18]
 
   # Remove entries here to run input ablations without changing code.
   inputs:
@@ -44,9 +46,17 @@ model:
 
   output_dim: 7
   target_key: tau_f
+  # Deployment validates this contract before enabling tau_ext_cal.
+  target_contract: matched_causal_torque_filter_v1
+  # Contract metadata only: do not post-filter tau_f or tau_f_pred. It records
+  # the source filter shared by measured tau and independently computed tau_id.
+  target_filter:
+    cutoff_hz: 10.0
+    median_window: 1
 
 
   hidden_dim: 128
+  # Retained for backward-compatible recurrent ablations; ignored by the TCN.
   num_layers: 2
   # NEXT head: recurrent hidden 128 -> MLP hidden 256 -> 7 torques.
   head_hidden_dim: 256
@@ -55,8 +65,27 @@ model:
   dropout: 0.2
 
 loss:
+  # Ordinary seven-axis MSE in normalized target space. The tau_f rollout below
+  # is visualization-only and does not add a wrench term to this training loss.
+  type: mse
   # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
   joint_weights: null
+
+# Offline visualization replays the same causal state/RNEA/filter chain used by
+# nero_ws before mapping tau_ext to the gripper-frame wrench.
+rollout:
+  measured_tau_already_filtered: true
+  matched_torque_filter:
+    cutoff_hz: 10.0
+    median_window: 1
+
+physics:
+  wrench_damping: 0.02
+  pinocchio:
+    urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+    frame_name: gripper_tcp
+    reference_frame: LOCAL
+    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
 
 train:
   device: cuda:0
@@ -65,10 +94,9 @@ train:
   num_workers: 2
   val_ratio: 0.1
 
-  # Chronological tail validation with H-1 target samples purged at each
-  # boundary, so train/validation windows never share an underlying frame.
-  # With multiple independent episodes, split_mode: episode is also valid.
-  split_mode: purged_temporal
+  # Random windows keep mixed motion regimes represented on both sides. This
+  # is an interpolation/checkpoint-ranking split, not an unbiased generalization test.
+  split_mode: sample
   seed: 42
 
   lr: 1.0e-4
@@ -85,7 +113,7 @@ train:
     name: reduce_on_plateau
     factor: 0.5
     patience: 5
-    min_lr: 1.0e-6
+    min_lr: 1.0e-5
 
   early_stopping:
     enabled: true
@@ -93,22 +121,20 @@ train:
     warmup_epochs: 10
     min_delta: 1.0e-5
 
-  output_dir: outputs/tau_f_sequence/next_gru_h50
-  # val_loss is normalized MSE. val_mae_nm is also available for checkpoint
-  # ranking and early stopping when a physical-unit threshold is preferred.
+  output_dir: outputs/tau_f_sequence/lstm
   monitor_key: val_loss
   top_k: 5
 
   ema:
-    enabled: true
+    enabled: false
     decay: 0.999
     update_after_step: 0
     update_every: 1
     use_for_validation: true
 
   wandb:
-    enabled: true
+    enabled: false
     project: lcp-pinn
-    name: tau-f-next-lstm-h50-qdq-deltaq-rts-labels
+    name: tau-f-tcn-h50-sample-mse
     mode: online
     log_every_steps: 10

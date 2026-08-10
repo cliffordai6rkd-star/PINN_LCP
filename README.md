@@ -1,8 +1,9 @@
 # Torque World Model
 
-当前仓库只保留两条训练链：单独训练并在 WM 中冻结的 `tau_f` 网络，以及唯一的
-`TorqueWorldModel`。本 README 描述的是训练阶段已经实现的真实契约，不把尚未实现
-的在线力矩控制、候选轨迹聚合或安全阈值算进来。
+当前仓库有三类训练任务：FACTR2 风格的自由空间总力矩拟合 `tau_free`、RNEA 后的
+背景 residual 拟合 `tau_f`，以及使用冻结 `tau_f` 的 `TorqueWorldModel`。本 README
+描述训练阶段已经实现的真实契约，不把尚未实现的在线力矩控制、候选轨迹聚合或
+安全阈值算进来。
 
 世界模型要学习的是固定机器人、传感器和数据采集控制链下的条件闭环响应：
 
@@ -16,6 +17,90 @@
 训练完成后，预测的 `tau` 才会进入单独的部署控制链，并通过 Nero 的 MIT `t_ff`
 接口下发。训练标签中的 `tau` 是电流估计的实测关节力矩；把它近似当作未来
 `tau_cmd` 的监督是部署假设，不代表两者在动态过程中严格相等。
+
+## 训练命令速查
+
+所有训练脚本都支持从仓库根目录直接运行，统一使用 `-c/--config`。当前 FACTR2
+自由空间消融的监督合同是：
+
+```text
+[q, dq, delta_q]_(t-49:t) -> tau_t
+sample split + normalized MSE + lr=1e-3 + raw-model early stopping + no EMA
+```
+
+新增的七轴物理 MSE 消融保持输入和网络输出归一化，但在反向传播前将 torque
+恢复为 Nm，分别计算七个关节的 MSE，再等权平均：
+
+```text
+MSE_j = mean_sample((tau_pred_nm[:, j] - tau_target_nm[:, j])^2)
+loss  = mean_j(MSE_j)
+```
+
+LSTM 七轴等权物理 MSE（当前推荐先跑的基线）：
+
+```bash
+python train/trainer/tau_free_sequence_train_v2.py \
+  -c config/train_cfg/tau_free_sequence_v2_sample_lstm_physical_mse_noema.yaml
+```
+
+LSTM（本轮实际训练）：
+
+```bash
+python train/trainer/tau_free_sequence_train_v2.py \
+  -c config/train_cfg/tau_free_sequence_v2_sample_lstm_noema.yaml
+```
+
+GRU（配置已准备，本轮不启动）：
+
+```bash
+python train/trainer/tau_free_sequence_train_v2.py \
+  -c config/train_cfg/tau_free_sequence_v2_sample_gru_noema.yaml
+```
+
+TCN（本轮实际训练）：
+
+```bash
+python train/trainer/tau_free_sequence_train_v2.py \
+  -c config/train_cfg/tau_free_sequence_v2_sample_tcn_noema.yaml
+```
+
+RNEA residual `tau_f`：
+
+```bash
+python train/trainer/tau_f_sequence_train.py \
+  -c config/train_cfg/tau_f_sequence.yaml
+```
+
+Torque world model：
+
+```bash
+python train/trainer/torque_world_model_train.py \
+  -c config/train_cfg/torque_world_model.yaml
+```
+
+需要在终端观察并同时保存完整输出时，在命令末尾增加：
+
+```bash
+2>&1 | tee outputs/<run_name>/train.log
+```
+
+随机 `sample` 划分会让相邻的 50 帧窗口在训练集和验证集间共享原始帧。它适合当前
+“所有运动分布都参与拟合，并用原始 validation loss 找过拟合拐点”的插值消融，但
+不能作为跨 episode 泛化指标。严格泛化评估仍应使用 `episode` 或 purged split。
+
+### 2026-08-10 sample/no-EMA 消融结果
+
+两次训练都使用相同数据、seed、batch size、纯 MSE、`lr=1e-3`、plateau scheduler
+和 `min_delta=1e-5 / patience=20` 的原始模型 early stopping：
+
+| 分支 | 自动停止 | 最佳 epoch | `val_loss` | `val_mae_nm` | torque error P95 | 最佳 checkpoint |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| LSTM | 231 epochs | 212 | 0.008373 | 0.039641 Nm | 0.161367 Nm | `factr2_lstm_h50_sample_mse_lr1e3_noema/checkpoints/epoch_212_val_loss_0.008373.pt` |
+| TCN | 154 epochs | 143 | 0.010779 | 0.045303 Nm | 0.178643 Nm | `factr2_tcn_h50_sample_mse_lr1e3_noema/checkpoints/epoch_143_val_loss_0.010779.pt` |
+
+输出目录均位于 `outputs/tau_free_sequence/`，完整终端输出保存在各 run 的
+`train.log`。在这个同分布插值合同下，LSTM 的整体 MAE 和每个关节 MAE 都优于当前
+TCN；该结论不能外推为跨 episode 泛化结论。GRU 配置已准备，但本轮没有训练。
 
 ## 1. 问题定义
 
@@ -257,8 +342,9 @@ action span     = (K - 1) / expert_fps
 `tau_f` 统一采用以下符号，不再沿用旧数据中的反号定义：
 
 ```text
-tau_id = RNEA(q_measured, dq_measured, ddq_RTS)
-tau_f  = tau_measured - tau_id
+tau_id_raw      = RNEA(q_measured, dq_measured, ddq_RTS)
+tau_id_filtered = causal_lowpass(tau_id_raw)
+tau_f           = tau_measured_filtered - tau_id_filtered
 ```
 
 这个等式只有在无外部接触力矩的数据段上才是摩擦/未建模动力学标签；若把接触段直接
@@ -273,8 +359,9 @@ free-space episode，或在构建前按可靠的接触标注切除接触区间�
 
 ```text
 variable-dt Kalman forward filter -> RTS backward smoother -> ddq_RTS
-q,dq measured + ddq_RTS           -> Pinocchio RNEA       -> tau_id
-tau measured - tau_id              -> tau_f training label
+q,dq measured + ddq_RTS           -> Pinocchio RNEA       -> tau_id_raw
+tau_id_raw                         -> matched causal LPF   -> tau_id_filtered
+tau measured filtered - tau_id filtered                  -> tau_f label
 ```
 
 状态转移和过程噪声都使用相邻实测时间戳的 `dt`，因此时间戳抖动不会被假定为固定
@@ -310,8 +397,9 @@ episode，在临时文件中写完并 flush，最后原子替换到输出目录�
 | HDF5 字段 | 用途 |
 | --- | --- |
 | `teleop/ddq_follower` | RTS 平滑加速度，供 RNEA/监督使用 |
-| `teleop/tau_id_rts` | 使用 `ddq_RTS` 的逆动力学力矩 |
-| `teleop/tau_f_cal` | `tau - tau_id`，供 residual 时序网络训练 |
+| `teleop/tau_id_rts` | 使用 `ddq_RTS` 的原始逆动力学力矩 |
+| `teleop/tau_id_rts_filtered` | 与实测 torque 相同的 10 Hz 因果滤波结果 |
+| `teleop/tau_f_cal` | `tau_filtered - tau_id_filtered`，供 residual 网络训练 |
 | `teleop/q_rts`, `teleop/dq_rts` | 平滑状态诊断，不作为 residual 网络输入 |
 | `teleop/ddq_kf_causal` | forward KF 对照结果，不含 RTS 未来信息 |
 | `teleop/ddq_rts_std` | 后验加速度标准差，用于筛查低置信区间 |
@@ -321,14 +409,34 @@ episode，在临时文件中写完并 flush，最后原子替换到输出目录�
 RTS 后验不确定度和 `tau_f` 分布，不能只按训练 loss 选择。RTS 使用未来帧，只允许
 离线构建标签；部署若需要加速度，只能独立运行因果 KF。
 
-residual 网络采用 NEXT 风格的独立滑动窗口：两层 LSTM/GRU（hidden 128）后接
-`128 -> 256 -> 7` 的两层 MLP。每个 50 帧窗口都从零 recurrent state 开始，窗口或
-batch 之间不传递 hidden state；`model.architecture` 可设为 `lstm` 或 `gru`，默认
-使用 LSTM。输入为 50 步历史 `q,dq,delta_q`，其中
+输入 HDF5 的 `tau_follower` 已经是 10 Hz 因果一阶低通结果。标签构建器会检查其
+`causal/lowpass/zero_phase/cutoff/median_window` 属性，并用同一时间戳和参数独立过滤
+`tau_id_rts`；属性不匹配时直接拒绝构建，防止重新引入滤波相位差。
+
+要量化在线 causal KF 与离线 RTS 的 estimator mismatch，可在已构建的标签目录上运行：
+
+```bash
+python -m data_process.tool.analyze_causal_rts_rnea_gap \
+  --config config/data_process/offline_tau_labels.yaml \
+  --output outputs/diagnostics/causal_rts_rnea_gap.json
+```
+
+脚本同时计算 raw RNEA gap 和实际在线公式对应的 matched-filter gap；后者为
+`LPF(RNEA_causal)-LPF(RNEA_RTS)`，并作为主报告输出逐关节和整体的 bias、MAE、
+RMSE、绝对误差 P95/P99/max，以及超过 `0.05/0.1/0.2 Nm` 的样本比例。
+默认跳过每个 Kalman segment 的前 49 帧，与 50 帧 torque 网络开始有效的时刻一致；
+可用 `--warmup-frames 0` 单独检查 Kalman 启动瞬态。
+
+torque 网络采用 NEXT 风格的独立滑动窗口，并支持 `lstm`、`gru` 和严格左因果
+`tcn`。默认 TCN 使用 kernel 2 和 dilation `[1,2,4,8,16,18]`，感受野精确覆盖
+50 帧，并用 current-state skip 保留快速通道；LSTM/GRU checkpoint 仍保持兼容。
+输入为 50 步历史 `q,dq,delta_q`，其中
 `delta_q=q_cmd-q` 是因果可得的低层控制误差；网络不输入 `ddq` 或瞬时 `tau`。
 若要严格执行只用 `q,dq` 的消融，需同时从 `model.inputs` 和
-`normalize_lowdim_keys` 删除 `delta_q`。由旧的 `tau_id-tau` 标签训练出的 checkpoint
-与新符号不兼容，必须用新标签重训。旧脚本 `repair_nero_dynamics_h5.py` 仍保留用于
+`normalize_lowdim_keys` 删除 `delta_q`。旧 checkpoint 学习的是
+`tau_filtered - tau_id_raw`，与新的 `matched_causal_torque_filter_v1` target contract
+不兼容，必须用新标签重训；nero_ws 会在加载时拒绝缺少该 contract 的 checkpoint。
+旧脚本 `repair_nero_dynamics_h5.py` 仍保留用于
 数据修复，但其因果差分加低通结果不应作为正式离线训练标签。
 
 训练仍以归一化空间的 MSE 为优化目标，同时在 target 反归一化后报告以下 torque
@@ -370,7 +478,7 @@ episode 的运动难度、数据域比例和切分边界。开启该诊断会增
 前向计算，但不会执行反向传播或优化器更新。
 
 标签构建完成后，再把新 HDF5 转为 residual 时序网络使用的 LeRobot v3 数据。转换配置
-已指向 `tau_refinement_rts_labels`：
+已指向 `tau_refinement_rts_matched_labels`：
 
 ```bash
 python -m data_process.tool.h5_2_lerobotev3 \
@@ -378,10 +486,8 @@ python -m data_process.tool.h5_2_lerobotev3 \
 ```
 
 该配置将 `teleop/tau_f_cal` 映射为 `observation.tau_f`，并写入独立的
-`data/train_episode/tau_refinement_ped_lerobotv3`。现有 `tau_f_sequence`、
-`tau_background_sequence` 和 `tau_free_sequence_v2` 配置仍指向旧的
-`data/train_episode/tau_refinement_lerobotv3`，因此不会被这次转换隐式替换；完成数据
-检查后，需要显式修改所需训练配置的 `dataloader.root` 才会使用新数据。
+`data/train_episode/tau_refinement_matched_lerobotv3`。`tau_f_sequence` 已显式指向这份
+新数据；`tau_free_sequence_v2` 的总力矩标签语义没有变化，仍可使用原数据目录。
 
 `observation.delta_q` 不会先在 H5 原始索引上相减。转换器分别把离散控制命令
 `q_cmd` 用 `previous`（物理意义为 ZOH）保持到统一时间轴，把连续状态
@@ -441,19 +547,146 @@ conda activate pinn
 python -m pytest -q tests
 ```
 
-先训练 `tau_f`，或在 WM 配置中填写已有 checkpoint。直接使用 Python 模块入口，
-不依赖 editable install 是否已经注册 console script：
+先训练 `tau_f`，或在 WM 配置中填写已有 checkpoint。训练脚本支持直接入口，不依赖
+editable install 是否已经注册 console script：
 
 ```bash
-python -m train.trainer.tau_f_sequence_train \
-  --config config/train_cfg/tau_f_sequence.yaml
+python train/trainer/tau_f_sequence_train.py \
+  -c config/train_cfg/tau_f_sequence.yaml
 ```
+
+FACTR2 自由空间总力矩拟合与 residual 训练不是同一个 target：
+
+```text
+tau_free_sequence_train_v2.py: target=tau，直接拟合无接触实测总电机力矩
+tau_f_sequence_train.py:       target=tau_f，拟合 RNEA 后背景 residual
+```
+
+当前 `sample_lstm/gru/tcn_noema` 三份配置使用随机 `sample` 划分、纯 MSE、`1e-3`
+学习率和原始模型 early stopping，并显式关闭 EMA。`tau_free_sequence_v2.yaml` 则保留
+完整 episode + Jacobian-aware wrench 辅助项的跨轨迹基线；两类结果不能直接混为同一
+评估合同。
+
+`tau_free_sequence_v2_sample_lstm_physical_mse_noema.yaml` 是单独的物理单位消融，
+只改变 `TauFreeSequenceTrainerV2` 的 torque objective，不修改 `TauFTrainer` 或
+`BaseTrainer`。模型仍预测归一化 torque，但 loss 使用反归一化后的 Nm：
+
+```yaml
+loss:
+  torque_loss_space: physical_nm
+  joint_weight_mode: equal
+  joint_weights: null
+```
+
+`joint_weight_mode` 支持：
+
+| 模式 | 七轴权重 | 用途 |
+| --- | --- | --- |
+| `equal` | 全部为 1 | 推荐第一版；相同绝对 Nm 误差受到相同惩罚 |
+| `mean_abs` | 正比于训练集 `mean(abs(tau_j))` | 更强调长期力矩较大的轴 |
+| `max_abs` | 正比于训练集 `max(abs(tau_j))` | 更强调量程大的轴，但对脏尖峰敏感 |
+| `manual` | 显式 `joint_weights: [w1,...,w7]` | 固定权重消融 |
+
+自动模式只使用 train split 统计，并把七个权重归一化到均值 1；解析后的权重会写入
+checkpoint 配置的 `loss.resolved_joint_weights`。这里不使用带符号
+`mean(tau_j)`，因为正负力矩会抵消。当前完整数据的诊断值约为：
+
+```text
+mean_abs: [0.401, 3.835, 0.305, 2.092, 0.100, 0.115, 0.153]
+max_abs:  [1.028, 3.195, 0.514, 1.690, 0.163, 0.155, 0.255]
+```
+
+因此 `mean_abs` 会强烈偏向 J2/J4，`max_abs` 又可能受边界脏数据影响；建议先以
+`equal` 建立物理 MSE 基线，再根据逐轴 `val_tau_rmse_nm_j1...j7` 做第二轮权重消融。
+
+`tau_f` 使用普通七轴归一化 MSE。带物理辅助项的 `tau_free_sequence_v2.yaml` 仍以
+该 MSE 为主目标，并加入权重 `0.01` 的 Jacobian-aware wrench MSE；实验中的旧
+`0.1` 权重会损害 torque 精度：
+
+```text
+tau_ext_pred = tau_measured - tau_free_pred
+wrench_ext   = damped_solve(J(q).T * wrench_ext = tau_ext_pred)
+
+loss = MSE(tau_free_pred_norm, tau_measured_norm)
+     + 0.01 * MSE(wrench_ext / [1N, 1N, 1N, 0.1Nm, 0.1Nm, 0.1Nm], 0)
+```
+
+辅助项没有引入新的标签，只重排关节误差在 Jacobian 敏感方向上的代价。Jacobian
+使用闭合指尖中心 `gripper_tcp`、LOCAL 坐标系和阻尼 `0.02`，并在训练
+初始化时预计算到现有 tensor cache。训练会记录：
+
+```text
+val_tau_rmse_nm
+val_wrench_rmse_scaled
+val_wrench_force_rmse_n
+val_wrench_moment_rmse_nm
+val_wrench_force_norm_p95_n
+```
+
+带 wrench 辅助项的 `tau_free_sequence_v2.yaml` 使用 `1e-3` 初始学习率，checkpoint
+按完整 validation split 上的
+`val_wrench_force_norm_p95_n` 排序，避免平均 loss 掩盖假接触尖峰；plateau scheduler
+和 early stopping 使用不含辅助项的 `val_tau_mse`。最终结果仍应在新采集的无接触
+轨迹上复核。
+
+### 8.1 Torque 序列推理可视化
+
+`tau_f` 和 `tau_free` 分别有独立入口。脚本直接恢复 checkpoint 中的模型配置、
+history horizon 和 normalizer，不会用可视化数据重新拟合统计量。只有拥有完整 history
+的目标点会参与推理；`H=50` 时 episode 前 49 帧不会以补零方式进入指标。
+
+`tau_f` 从 episode 起点重放与 Nero 一致的因果链路：Kalman `ddq`、RNEA、10 Hz
+因果 `tau_id` 低通、`tau_id_filtered + tau_f_pred - tau_measured`，最后通过阻尼
+Jacobian 求解 `wrench_ext`。`tau_free` 直接使用
+`tau_measured - tau_free_pred` 映射 wrench。即使指定 `--start-frame`，因果状态仍从
+episode 起点预热，绘图才从指定帧开始。
+
+可视化 `tau_f`：
+
+```bash
+python -m data_process.tool.visualize_tau_f_inference \
+  --checkpoint outputs/tau_f_sequence/next_gru_h50_matched_tau_id_filter/checkpoints/epoch_339_train_eval_loss_0.005293.pt \
+  --episode-index 0 \
+  --device cuda:0
+```
+
+可视化 `tau_free`：
+
+```bash
+python -m data_process.tool.visualize_tau_free_inference \
+  --checkpoint outputs/tau_free_sequence/ep4/checkpoints/epoch_189_val_loss_0.046114.pt \
+  --episode-index 0 \
+  --device cuda:0
+```
+
+未指定 `--episode-index` 时默认处理整份数据；该参数可以重复指定以仅处理若干 episode。
+`--all-episodes` 保留为显式处理整份数据的写法。`--start-frame`
+和 `--end-frame` 按 episode 内相对帧号裁剪评估区间。绘图默认保留全部推理点；只有
+显式传入 `--max-plot-points` 时才下采样。默认输出分别位于
+`outputs/inference_visualization/tau_f` 和 `outputs/inference_visualization/tau_free`，
+每个 episode 包含：
+
+```text
+torque_label_vs_prediction.png
+torque_prediction_error.png
+torque_error_summary.png
+tau_ext_rollout.png
+wrench_ext_rollout.png
+inference_data.npz
+metrics.json
+```
+
+`metrics.json` 还记录 `tau_ext` 逐轴误差、末端力/力矩范数的 mean/P95/max。
+`inference_data.npz` 保存 `tau_ext_nm` 和 `wrench_ext`；`tau_f` 额外保存因果 `ddq`、
+raw/filtered `tau_id` 和 rollout 使用的测量力矩。
+`--checkpoint` 也接受目录并选择文件名末尾 score 最低的 checkpoint，但不同 split 或
+不同实验不能共用 checkpoint 目录；存在混合文件时应显式传入 `.pt` 文件。
 
 训练唯一的世界模型：
 
 ```bash
-python -m train.trainer.torque_world_model_train \
-  --config config/train_cfg/torque_world_model.yaml
+python train/trainer/torque_world_model_train.py \
+  -c config/train_cfg/torque_world_model.yaml
 ```
 
 安装项目后也可以使用等价的 console script：
@@ -490,6 +723,10 @@ smoke test；完整的 Pinocchio cache 和正式训练仍建议使用 GPU。
   导数、contact 和 wrench loss；
 - [`physics/nero_dynamics.py`](physics/nero_dynamics.py)：Pinocchio cache、冻结
   `tau_f`、局部 RNEA 和阻尼 wrench 求解；
+- [`model/tau_f_lstm.py`](model/tau_f_lstm.py)、[`model/tau_f_gru.py`](model/tau_f_gru.py)
+  和 [`model/tau_f_tcn.py`](model/tau_f_tcn.py)：三个互相独立的 torque 时序编码分支；
+- [`model/tau_f_sequence.py`](model/tau_f_sequence.py)：只保留公共输入/输出合同和显式
+  模型工厂，不再实现具体时序结构；
 - [`train/trainer/torque_world_model_train.py`](train/trainer/torque_world_model_train.py)：
   episode split、normalizer、physics cache 和训练循环。
 

@@ -1,6 +1,6 @@
 dataloader:
-  repo_id: tau_refinement_lerobotv3
-  root: data/train_episode/tau_refinement_lerobotv3
+  repo_id: tau_refinement_ped_lerobotv3
+  root: data/train_episode/tau_refinement_ped_lerobotv3
   # Dataset contract confirmed during collection: every trajectory is contact-free.
   contact_free: true
   load_images: false
@@ -53,6 +53,18 @@ model:
   dropout: 0.1
 
 loss:
+  # 七轴力矩使用普通归一化 MSE
+  type: mse
+
+  # 总 loss 权重
+  tau_weight: 1.0
+  wrench_weight: 0
+
+  # Wrench 各分量归一化尺度
+  force_scale_n: 1.0
+  moment_scale_nm: 0.1
+
+  # 可选逐关节权重
   joint_weights: null
 
 train:
@@ -61,9 +73,8 @@ train:
   num_workers: 4
   val_ratio: 0.1
 
-  # Randomly hold out 10% of target windows across the complete dataset.
-  # Neighboring windows overlap, so this measures in-distribution interpolation
-  # rather than generalization to an unseen episode.
+  # Random windows keep mixed motion regimes represented on both sides. This
+  # split is only used for in-distribution checkpoint ranking.
   split_mode: sample
   seed: 42
 
@@ -81,16 +92,14 @@ train:
     enabled: true
     patience: 20
     warmup_epochs: 10
-    min_delta: 1.0e-5
+    min_delta: 1.0e-4
 
-  output_dir: outputs/tau_free_sequence/ep4
-  # val_loss is normalized MSE. Set this to val_mae_nm only when checkpoint
-  # selection should be based directly on physical torque error.
-  monitor_key: val_loss
+  output_dir: outputs/tau_free_sequence/ep7
+  monitor_key: val_peak_cvar_rmse_nm
   top_k: 5
 
   ema:
-    enabled: true
+    enabled: false
     decay: 0.999
     update_after_step: 0
     update_every: 1
@@ -99,6 +108,6 @@ train:
   wandb:
     enabled: true
     project: lcp-pinn
-    name: tau-free-lstm-h50-qv2tau-v2
+    name: tau-free-lstm-h50-sample-peak-cvar
     mode: online
     log_every_steps: 10

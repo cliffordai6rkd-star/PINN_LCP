@@ -1,7 +1,7 @@
 io:
   # Inputs are never edited. Each episode is copied and atomically updated.
   input_dir: data/train_episode/tau_refinement
-  output_dir: data/train_episode/tau_refinement_rts_labels
+  output_dir: data/train_episode/tau_refinement_rts_matched_labels
   patterns: ["*.h5", "*.hdf5"]
 
 robot:
@@ -21,6 +21,7 @@ keys:
   ddq_rts: teleop/ddq_follower
   ddq_rts_std: teleop/ddq_rts_std
   tau_id: teleop/tau_id_rts
+  tau_id_filtered: teleop/tau_id_rts_filtered
   tau_f: teleop/tau_f_cal
 
 processing:
@@ -30,6 +31,11 @@ processing:
   dq_sign: [1, 1, 1, 1, 1, 1, 1]
   # Preserve measured q/dq in RNEA and fill only NaN dropouts from RTS state.
   rnea_state_source: measured
+  # tau_follower is already filtered with this causal filter. Apply an
+  # independent filter with identical parameters to tau_id before subtraction.
+  torque_filter:
+    cutoff_hz: 10.0
+    median_window: 1
 
 estimator:
   # Scalar values apply to all joints; a 7-element list tunes joints separately.

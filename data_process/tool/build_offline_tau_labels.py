@@ -16,6 +16,7 @@ import yaml
 
 from data_process.offline_tau_labels import (
     KalmanRTSConfig,
+    causal_median_one_pole_filter,
     estimate_joint_states_rts,
     fill_missing_measurements,
     residual_torque,
@@ -181,6 +182,53 @@ def _joint_sign(value: Any, joint_count: int) -> np.ndarray:
     return sign
 
 
+def _torque_filter_config(processing: Mapping[str, Any]) -> tuple[float, int]:
+    filter_config = processing.get("torque_filter") or {}
+    if not isinstance(filter_config, Mapping):
+        raise ValueError("processing.torque_filter must be a mapping.")
+    unknown = set(filter_config) - {"cutoff_hz", "median_window"}
+    if unknown:
+        raise ValueError(
+            f"Unknown processing.torque_filter options: {sorted(unknown)}"
+        )
+    cutoff_hz = float(filter_config.get("cutoff_hz", 10.0))
+    median_window = int(filter_config.get("median_window", 1))
+    if not np.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+        raise ValueError("processing.torque_filter.cutoff_hz must be positive.")
+    if median_window < 1 or median_window % 2 == 0:
+        raise ValueError(
+            "processing.torque_filter.median_window must be a positive odd integer."
+        )
+    return cutoff_hz, median_window
+
+
+def _validate_measured_torque_filter(
+    dataset: h5py.Dataset,
+    *,
+    cutoff_hz: float,
+    median_window: int,
+) -> None:
+    attrs = dataset.attrs
+    errors = []
+    if not bool(attrs.get("lowpass", False)):
+        errors.append("lowpass=true")
+    if not bool(attrs.get("causal", False)):
+        errors.append("causal=true")
+    if bool(attrs.get("zero_phase", True)):
+        errors.append("zero_phase=false")
+    actual_cutoff = float(attrs.get("lowpass_cutoff_hz", float("nan")))
+    if not np.isclose(actual_cutoff, cutoff_hz, rtol=0.0, atol=1.0e-12):
+        errors.append(f"lowpass_cutoff_hz={cutoff_hz:g}")
+    actual_median = int(attrs.get("median_window", -1))
+    if actual_median != median_window:
+        errors.append(f"median_window={median_window}")
+    if errors:
+        raise ValueError(
+            f"Measured torque dataset {dataset.name} does not match the required "
+            f"causal filter contract ({', '.join(errors)})."
+        )
+
+
 def process_episode(
     source_path: Path,
     destination_path: Path,
@@ -210,6 +258,9 @@ def process_episode(
         "ddq_rts": str(keys.get("ddq_rts", "teleop/ddq_follower")),
         "ddq_rts_std": str(keys.get("ddq_rts_std", "teleop/ddq_rts_std")),
         "tau_id": str(keys.get("tau_id", "teleop/tau_id_rts")),
+        "tau_id_filtered": str(
+            keys.get("tau_id_filtered", "teleop/tau_id_rts_filtered")
+        ),
         "tau_f": str(keys.get("tau_f", "teleop/tau_f_cal")),
     }
     timestamp_scale = float(processing.get("timestamp_scale_to_s", 1.0e-6))
@@ -218,6 +269,7 @@ def process_episode(
     rnea_source = str(processing.get("rnea_state_source", "measured"))
     if rnea_source not in {"measured", "smoothed"}:
         raise ValueError("processing.rnea_state_source must be measured or smoothed.")
+    torque_filter_hz, torque_median_window = _torque_filter_config(processing)
 
     temporary_path = destination_path.with_suffix(destination_path.suffix + ".building")
     destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,7 +285,13 @@ def process_episode(
             )
             q_measured = _read_vector(h5_file, key["q"])
             dq_measured = _read_vector(h5_file, key["dq"])
-            tau_measured = _read_vector(h5_file, key["tau"])
+            tau_dataset = _dataset(h5_file, key["tau"])
+            _validate_measured_torque_filter(
+                tau_dataset,
+                cutoff_hz=torque_filter_hz,
+                median_window=torque_median_window,
+            )
+            tau_measured = np.asarray(tau_dataset, dtype=np.float64)
             if (
                 q_measured.shape != dq_measured.shape
                 or q_measured.shape != tau_measured.shape
@@ -263,7 +321,13 @@ def process_episode(
                 dq_rnea,
                 estimate.ddq_smoothed,
             )
-            tau_f = residual_torque(tau_measured, tau_id)
+            tau_id_filtered = causal_median_one_pole_filter(
+                timestamps_s,
+                tau_id,
+                cutoff_hz=torque_filter_hz,
+                median_window=torque_median_window,
+            )
+            tau_f = residual_torque(tau_measured, tau_id_filtered)
 
             estimator_attrs = {
                 "estimator": "variable_dt_constant_acceleration_kalman_rts",
@@ -328,19 +392,53 @@ def process_episode(
                     "unit": "N*m",
                 },
             )
+            filter_attrs = {
+                "processing_method": "causal_median_then_one_pole_iir",
+                "causal": True,
+                "lowpass": True,
+                "lowpass_cutoff_hz": torque_filter_hz,
+                "median_window": torque_median_window,
+                "zero_phase": False,
+                "filter_timeline": key["timestamp"],
+                "filter_initialization": "first_sample",
+            }
+            _write_dataset(
+                h5_file,
+                key["tau_id_filtered"],
+                tau_id_filtered,
+                {
+                    **label_attrs,
+                    **filter_attrs,
+                    "definition": "causal_lowpass(RNEA(q,dq,ddq_rts))",
+                    "source_dataset": key["tau_id"],
+                    "unit": "N*m",
+                },
+            )
             _write_dataset(
                 h5_file,
                 key["tau_f"],
                 tau_f,
                 {
                     **label_attrs,
-                    "definition": "tau_measured-tau_inverse_dynamics",
-                    "formula": "tau_f=tau-RNEA(q,dq,ddq_rts)",
+                    "definition": "tau_measured_filtered-tau_id_rts_filtered",
+                    "formula": (
+                        "tau_f=tau_filtered-tau_id_filtered; "
+                        "tau_id_filtered=causal_lowpass(RNEA(q,dq,ddq_rts))"
+                    ),
+                    "target_contract": "matched_causal_torque_filter_v1",
+                    "tau_source_dataset": key["tau"],
+                    "tau_id_source_dataset": key["tau_id_filtered"],
+                    **filter_attrs,
                     "unit": "N*m",
                 },
             )
             h5_file.attrs["offline_tau_labels_built"] = True
-            h5_file.attrs["offline_tau_residual_convention"] = "tau_minus_tau_id"
+            h5_file.attrs["offline_tau_residual_convention"] = (
+                "tau_filtered_minus_tau_id_filtered"
+            )
+            h5_file.attrs["offline_tau_target_contract"] = (
+                "matched_causal_torque_filter_v1"
+            )
             h5_file.flush()
         os.replace(temporary_path, destination_path)
     except BaseException:
@@ -362,6 +460,8 @@ def process_episode(
         "ddq_std_p99": float(np.quantile(estimate.ddq_smoothed_std, 0.99)),
         "tau_f_abs_p99": float(np.quantile(np.abs(tau_f), 0.99)),
         "tau_f_abs_max": float(np.max(np.abs(tau_f))),
+        "tau_id_filter_cutoff_hz": torque_filter_hz,
+        "tau_id_filter_median_window": torque_median_window,
     }
 
 
@@ -404,7 +504,8 @@ def main() -> None:
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "urdf_path": str(urdf_path),
-        "residual_convention": "tau_f=tau_measured-tau_inverse_dynamics",
+        "residual_convention": "tau_f=tau_filtered-tau_id_filtered",
+        "target_contract": "matched_causal_torque_filter_v1",
         "results": results,
     }
     manifest_path = output_dir / "offline_tau_label_manifest.json"

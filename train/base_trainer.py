@@ -80,7 +80,40 @@ class BaseTrainer:
         self.val_ratio = float(self.train_config.get("val_ratio", 0.1))
         self.split_mode = self.train_config.get("split_mode", "episode")
         self.seed = int(self.train_config.get("seed", 42))
+        self.deterministic = bool(
+            self.train_config.get("deterministic", True)
+        )
+        self.cudnn_benchmark = bool(
+            self.train_config.get("cudnn_benchmark", False)
+        )
+        if self.deterministic and self.cudnn_benchmark:
+            raise ValueError(
+                "train.deterministic=true is incompatible with "
+                "train.cudnn_benchmark=true"
+            )
         self.val_loader = None
+        purged_kfold_config = self.train_config.get("purged_kfold") or {}
+        if not isinstance(purged_kfold_config, dict):
+            raise ValueError("train.purged_kfold must be a mapping or null")
+        self.purged_kfold_num_folds = int(
+            purged_kfold_config.get("num_folds", 3)
+        )
+        self.purged_kfold_fold_index = int(
+            purged_kfold_config.get("fold_index", 0)
+        )
+        if self.split_mode == "purged_kfold":
+            if self.purged_kfold_num_folds < 2:
+                raise ValueError("train.purged_kfold.num_folds must be at least 2")
+            if not (
+                0
+                <= self.purged_kfold_fold_index
+                < self.purged_kfold_num_folds
+            ):
+                raise ValueError(
+                    "train.purged_kfold.fold_index must be in "
+                    f"[0, {self.purged_kfold_num_folds - 1}]"
+                )
+        self.current_split_metadata = None
 
         self.batch_size = int(self.train_config.get("batch_size", 64))
         self.num_workers = int(self.train_config.get("num_workers", 4))
@@ -95,6 +128,14 @@ class BaseTrainer:
             float(gradient_clip_norm) if gradient_clip_norm is not None else None
         )
         self.monitor_key = self.train_config.get("monitor_key", "val_loss")
+        self.scheduler_monitor_key = self.train_config.get(
+            "scheduler_monitor_key",
+            self.monitor_key,
+        )
+        self.early_stopping_monitor_key = self.train_config.get(
+            "early_stopping_monitor_key",
+            self.monitor_key,
+        )
         self.top_k = int(self.train_config.get("top_k", 3))
         self.best_checkpoints = []
 
@@ -181,8 +222,8 @@ class BaseTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.seed)
 
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = self.cudnn_benchmark
+        torch.backends.cudnn.deterministic = self.deterministic
 
     def batch_to_device(self, batch):
         new_batch = {}
@@ -350,18 +391,150 @@ class BaseTrainer:
             torch.utils.data.Subset(self.dataset, val_indices),
         )
 
+    def split_dataset_purged_kfold(self, fold_index=None, num_folds=None):
+        """Hold out one contiguous block per episode without window overlap."""
+        horizon = int(getattr(self.dataset, "horizon", 1))
+        num_folds = int(
+            self.purged_kfold_num_folds if num_folds is None else num_folds
+        )
+        fold_index = int(
+            self.purged_kfold_fold_index if fold_index is None else fold_index
+        )
+        if num_folds < 2:
+            raise ValueError("purged K-fold requires at least two folds")
+        if not 0 <= fold_index < num_folds:
+            raise ValueError(
+                f"fold_index must be in [0, {num_folds - 1}], got {fold_index}"
+            )
+
+        samples_by_episode_start = {}
+        for sample_idx, raw_idx in enumerate(self.dataset.valid_indices):
+            episode_start = self.dataset.raw_idx_to_episode_start[raw_idx]
+            samples_by_episode_start.setdefault(int(episode_start), []).append(
+                (sample_idx, int(raw_idx))
+            )
+
+        train_indices = []
+        val_indices = []
+        purged_samples = 0
+        episode_metadata = []
+
+        for episode_position, episode in enumerate(
+            self.dataset.dataset.meta.episodes
+        ):
+            episode_start = int(episode["dataset_from_index"])
+            episode_samples = sorted(
+                samples_by_episode_start.get(episode_start, []),
+                key=lambda item: item[1],
+            )
+            sample_count = len(episode_samples)
+            if sample_count < num_folds:
+                raise ValueError(
+                    "purged_kfold requires every episode to contain at least "
+                    f"num_folds valid windows; episode {episode_position} has "
+                    f"{sample_count}, num_folds={num_folds}."
+                )
+
+            val_start_position = sample_count * fold_index // num_folds
+            val_end_position = sample_count * (fold_index + 1) // num_folds
+            validation_samples = episode_samples[
+                val_start_position:val_end_position
+            ]
+            first_val_raw_idx = validation_samples[0][1]
+            last_val_raw_idx = validation_samples[-1][1]
+            first_val_frame = max(
+                episode_start,
+                first_val_raw_idx - horizon + 1,
+            )
+
+            episode_train_count = 0
+            episode_purged_count = 0
+            for sample_position, (sample_idx, raw_idx) in enumerate(
+                episode_samples
+            ):
+                if val_start_position <= sample_position < val_end_position:
+                    val_indices.append(sample_idx)
+                    continue
+
+                first_window_frame = max(
+                    episode_start,
+                    raw_idx - horizon + 1,
+                )
+                if (
+                    raw_idx < first_val_frame
+                    or first_window_frame > last_val_raw_idx
+                ):
+                    train_indices.append(sample_idx)
+                    episode_train_count += 1
+                else:
+                    purged_samples += 1
+                    episode_purged_count += 1
+
+            if episode_train_count == 0:
+                raise ValueError(
+                    "purged_kfold removed all training windows from episode "
+                    f"{episode_position} in fold {fold_index}; reduce "
+                    "dataloader.horizon or train.purged_kfold.num_folds, or "
+                    "collect a longer episode."
+                )
+
+            episode_metadata.append(
+                {
+                    "episode_index": int(
+                        episode.get("episode_index", episode_position)
+                    ),
+                    "train_samples": episode_train_count,
+                    "val_samples": len(validation_samples),
+                    "purged_samples": episode_purged_count,
+                    "val_target_start": first_val_raw_idx,
+                    "val_target_end": last_val_raw_idx,
+                }
+            )
+
+        if not train_indices or not val_indices:
+            raise ValueError(
+                "purged_kfold split produced an empty train or validation set"
+            )
+
+        self.current_split_metadata = {
+            "mode": "purged_kfold",
+            "fold_index": fold_index,
+            "num_folds": num_folds,
+            "horizon": horizon,
+            "train_samples": len(train_indices),
+            "val_samples": len(val_indices),
+            "purged_samples": purged_samples,
+            "episodes": episode_metadata,
+        }
+        log.info(
+            "purged K-fold split: fold=%d/%d train_samples=%d val_samples=%d "
+            "purged_samples=%d horizon=%d episodes=%d",
+            fold_index + 1,
+            num_folds,
+            len(train_indices),
+            len(val_indices),
+            purged_samples,
+            horizon,
+            len(episode_metadata),
+        )
+        return (
+            torch.utils.data.Subset(self.dataset, train_indices),
+            torch.utils.data.Subset(self.dataset, val_indices),
+        )
+
     def setup(self):
         self.set_seed()
         self.dataset = self.build_dataset()
 
-        if self.val_ratio > 0:
+        if self.val_ratio > 0 or self.split_mode == "purged_kfold":
             if self.split_mode == "episode":
                 train_dataset, val_dataset = self.split_dataset_by_episode()
             elif self.split_mode == "sample":
                 if int(getattr(self.dataset, "horizon", 1)) > 1:
                     log.warning(
                         "sample split leaks overlapping temporal windows across train and "
-                        "validation; use split_mode=episode or purged_temporal."
+                        "validation; use split_mode=episode, purged_temporal, or "
+                        "purged_kfold."
                     )
                 val_size = int(len(self.dataset) * self.val_ratio)
                 train_size = len(self.dataset) - val_size
@@ -374,6 +547,8 @@ class BaseTrainer:
                 )
             elif self.split_mode == "purged_temporal":
                 train_dataset, val_dataset = self.split_dataset_purged_temporal()
+            elif self.split_mode == "purged_kfold":
+                train_dataset, val_dataset = self.split_dataset_purged_kfold()
             else:
                 raise ValueError(f"unknown split_mode: {self.split_mode}")
         else:
@@ -660,7 +835,7 @@ class BaseTrainer:
             if self.scheduler is not None:
                 name = self.scheduler_config.get("name", "none")
                 if name == "reduce_on_plateau":
-                    monitor_loss = metrics.get(self.monitor_key)
+                    monitor_loss = metrics.get(self.scheduler_monitor_key)
                     if monitor_loss is None:
                         monitor_loss = val_loss if val_loss is not None else avg_loss
                     self.scheduler.step(monitor_loss)
@@ -756,7 +931,7 @@ class BaseTrainer:
                 log.info(
                     "early stopping at epoch=%d: monitor=%s best=%.6f patience=%d",
                     epoch,
-                    self.monitor_key,
+                    self.early_stopping_monitor_key,
                     self.early_stopping_best,
                     self.early_stopping_patience,
                 )
@@ -775,7 +950,10 @@ class BaseTrainer:
             "last_train_metrics": dict(self.last_train_epoch_metrics),
             "last_train_eval_metrics": dict(self.last_train_eval_epoch_metrics),
             "last_val_metrics": dict(self.last_val_epoch_metrics),
+            "split": self.current_split_metadata,
             "monitor_key": self.monitor_key,
+            "scheduler_monitor_key": self.scheduler_monitor_key,
+            "early_stopping_monitor_key": self.early_stopping_monitor_key,
             "top_k": self.top_k,
             "best_checkpoints": self.best_checkpoints,
             "output_dir": self.output_dir,
@@ -793,7 +971,7 @@ class BaseTrainer:
         if not self.early_stopping_enabled:
             return False
 
-        score = metrics.get(self.monitor_key)
+        score = metrics.get(self.early_stopping_monitor_key)
         if score is None:
             return False
 
@@ -983,6 +1161,7 @@ class BaseTrainer:
             "path": path,
             "epoch": epoch,
             "global_step": self.global_step,
+            "metrics": dict(metrics),
         })
 
         self.best_checkpoints.sort(key=lambda item: item["score"])

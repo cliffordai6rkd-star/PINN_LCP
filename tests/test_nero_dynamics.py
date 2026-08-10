@@ -169,14 +169,43 @@ def test_batched_pinocchio_cache_uses_reduced_model_config(tmp_path):
     )
 
 
-def _tau_f_checkpoint(path: Path):
+def test_batched_inverse_dynamics_skips_derivative_computation(tmp_path):
+    urdf_path = tmp_path / "robot.urdf"
+    urdf_path.touch()
+    dynamics = PinocchioDynamics(
+        {
+            "pinocchio": {
+                "urdf_path": urdf_path,
+                "frame_name": "tool",
+                "locked_joint_names": ["gripper"],
+            }
+        }
+    )
+    q = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    dq = 0.1 * q
+    ddq = 0.01 * q
+    pinocchio = _fake_pinocchio()
+    with patch(
+        "physics.nero_dynamics.importlib.import_module",
+        return_value=pinocchio,
+    ), patch.object(
+        pinocchio,
+        "computeRNEADerivatives",
+    ) as derivatives:
+        tau = dynamics.inverse_dynamics(q, dq, ddq)
+
+    derivatives.assert_not_called()
+    torch.testing.assert_close(tau, q + 2.0 * dq + 3.0 * ddq)
+
+
+def _tau_f_checkpoint(path: Path, architecture="gru"):
     config = {
         "dataloader": {
             "horizon": 3,
             "normalize_mode": "gaussian",
         },
         "model": {
-            "architecture": "gru",
+            "architecture": architecture,
             "inputs": ["q", "dq", "ddq", "tau"],
             "input_dims": {key: 2 for key in ("q", "dq", "ddq", "tau")},
             "hidden_dim": 4,
@@ -213,9 +242,13 @@ def _tau_f_checkpoint(path: Path):
     )
 
 
-def test_frozen_tau_f_checkpoint_uses_caller_histories_and_input_gradients(tmp_path):
+@pytest.mark.parametrize("architecture", ["gru", "tcn"])
+def test_frozen_tau_f_checkpoint_uses_caller_histories_and_input_gradients(
+    tmp_path,
+    architecture,
+):
     checkpoint_path = tmp_path / "tau_f.pt"
-    _tau_f_checkpoint(checkpoint_path)
+    _tau_f_checkpoint(checkpoint_path, architecture=architecture)
     predictor = load_tau_f_predictor(checkpoint_path)
     history = {
         key: torch.randn(2, 4, 2, requires_grad=True)
@@ -237,3 +270,35 @@ def test_frozen_tau_f_checkpoint_uses_caller_histories_and_input_gradients(tmp_p
     incomplete_history.pop("ddq")
     with pytest.raises(KeyError, match="ddq"):
         predictor(incomplete_history, future)
+
+
+@pytest.mark.parametrize("architecture", ["gru", "tcn"])
+def test_frozen_predictor_matches_independent_sliding_windows(
+    tmp_path,
+    architecture,
+):
+    checkpoint_path = tmp_path / "tau_f.pt"
+    _tau_f_checkpoint(checkpoint_path, architecture=architecture)
+    predictor = load_tau_f_predictor(checkpoint_path)
+    history = {
+        key: torch.randn(2, 4, 2)
+        for key in predictor.active_inputs
+    }
+    future = {
+        key: torch.randn(2, 3, 2)
+        for key in predictor.active_inputs
+    }
+
+    prediction = predictor(history, future)
+    manual_batch = {}
+    for key in predictor.active_inputs:
+        complete = torch.cat((history[key][:, -3:], future[key]), dim=1)
+        normalized = predictor.normalizer.normalize(key, complete)
+        manual_batch[key] = torch.stack(
+            [normalized[:, offset + 1 : offset + 4] for offset in range(3)],
+            dim=1,
+        ).reshape(6, 3, 2)
+    expected = predictor.model(manual_batch)["tau_f_pred"].reshape(2, 3, 2)
+    expected = predictor.normalizer.denormalize("tau_f", expected)
+
+    torch.testing.assert_close(prediction, expected)

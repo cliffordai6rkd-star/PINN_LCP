@@ -16,7 +16,10 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from model.tau_f_sequence import TauFSequenceRegressor
+from model.tau_f_sequence import (
+    TauFSequenceModelBase,
+    build_tau_f_sequence_model,
+)
 
 
 def _same_state_shape(named_tensors: Mapping[str, Tensor]) -> tuple[int, ...]:
@@ -116,7 +119,7 @@ class PinocchioDynamics:
                 config,
                 "frame_name",
                 "pinocchio_frame_name",
-                default="gripper_base",
+                default="gripper_tcp",
             )
         )
         self.locked_joint_names = tuple(
@@ -300,6 +303,38 @@ class PinocchioDynamics:
             d_tau_d_ddq=tensor(derivatives[2], matrix_shape),
         )
 
+    def inverse_dynamics(
+        self,
+        q: Tensor,
+        dq: Tensor,
+        ddq: Tensor,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Tensor:
+        """Evaluate batched RNEA without derivative computation."""
+
+        q_np, dq_np, ddq_np, shape = self._validated_numpy_states(q, dq, ddq)
+        tau = np.empty_like(q_np)
+        for index, (q_value, dq_value, ddq_value) in enumerate(
+            zip(q_np, dq_np, ddq_np)
+        ):
+            tau[index] = np.asarray(
+                self._pin.rnea(
+                    self._model,
+                    self._data,
+                    q_value,
+                    dq_value,
+                    ddq_value,
+                ),
+                dtype=np.float64,
+            )
+        return torch.as_tensor(
+            tau.reshape(shape),
+            device=q.device if device is None else device,
+            dtype=q.dtype if dtype is None else dtype,
+        )
+
     def frame_jacobians(
         self,
         q: Tensor,
@@ -429,11 +464,11 @@ class _CheckpointNormalizer(nn.Module):
 
 
 class FrozenTauFPredictor(nn.Module):
-    """Frozen TauFSequenceRegressor that remains differentiable to its inputs."""
+    """Frozen sequence branch that remains differentiable to its inputs."""
 
     def __init__(
         self,
-        model: TauFSequenceRegressor,
+        model: TauFSequenceModelBase,
         *,
         normalizer_payload: Mapping[str, Any] | None = None,
         normalize_mode: str | None = None,
@@ -449,7 +484,8 @@ class FrozenTauFPredictor(nn.Module):
             fallback_mode=normalize_mode,
         )
         self.model.requires_grad_(False)
-        self.model.recurrent.dropout = 0.0
+        if hasattr(self.model, "recurrent"):
+            self.model.recurrent.dropout = 0.0
         self.train(False)
 
     @property
@@ -461,8 +497,9 @@ class FrozenTauFPredictor(nn.Module):
         # for gradients to inputs. Parameters stay frozen and dropout is zero.
         super().train(False)
         self.model.eval()
-        self.model.recurrent.train(True)
-        self.model.recurrent.dropout = 0.0
+        if hasattr(self.model, "recurrent"):
+            self.model.recurrent.train(True)
+            self.model.recurrent.dropout = 0.0
         return self
 
     @staticmethod
@@ -484,7 +521,7 @@ class FrozenTauFPredictor(nn.Module):
         state are consulted inside this helper.
         """
 
-        sequence_parts = []
+        complete_inputs = {}
         batch_size = future_steps = None
         for key in self.active_inputs:
             if key not in history or key not in future:
@@ -526,12 +563,43 @@ class FrozenTauFPredictor(nn.Module):
                 (history_value[:, -self.history_horizon :], future_value),
                 dim=1,
             )
-            sequence_parts.append(self.normalizer.normalize(key, complete))
+            complete_inputs[key] = self.normalizer.normalize(key, complete)
 
-        sequence = torch.cat(sequence_parts, dim=-1)
-        recurrent_output, _ = self.model.recurrent(sequence)
-        future_features = recurrent_output[:, -future_steps:]
-        normalized_tau_f = self.model.head(future_features)
+        if self.model.architecture == "tcn":
+            # An exact-H causal receptive field makes dense TCN execution
+            # identical to independent sliding windows, without materializing
+            # B * F copies of the history.
+            dense_prediction = self.model.forward_sequence(complete_inputs)
+            normalized_tau_f = dense_prediction[:, -future_steps:]
+            return self.normalizer.denormalize("tau_f", normalized_tau_f)
+
+        # Recurrent training treats every H-step window as an independent sample
+        # with a fresh state. Build those same windows for every future target
+        # instead of carrying a hidden state beyond the trained horizon.
+        window_starts = torch.arange(
+            1,
+            future_steps + 1,
+            device=next(iter(complete_inputs.values())).device,
+        )
+        window_offsets = torch.arange(
+            self.history_horizon,
+            device=window_starts.device,
+        )
+        window_indices = window_starts[:, None] + window_offsets[None, :]
+        model_batch = {
+            key: value[:, window_indices]
+            .reshape(
+                batch_size * future_steps,
+                self.history_horizon,
+                value.shape[-1],
+            )
+            for key, value in complete_inputs.items()
+        }
+        normalized_tau_f = self.model(model_batch)["tau_f_pred"].reshape(
+            batch_size,
+            future_steps,
+            -1,
+        )
         return self.normalizer.denormalize("tau_f", normalized_tau_f)
 
 
@@ -550,7 +618,7 @@ def load_tau_f_predictor(
         if key not in checkpoint:
             raise KeyError(f"tau_f checkpoint is missing required key {key!r}.")
     config = checkpoint["config"]
-    model = TauFSequenceRegressor(config)
+    model = build_tau_f_sequence_model(config)
     model.load_state_dict(checkpoint["model"])
     dataloader_config = config.get("dataloader") or {}
     normalizer_payload = checkpoint.get("normalizer")

@@ -7,6 +7,7 @@ is suitable for offline labels but must not be used by an online controller.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -38,6 +39,78 @@ class JointStateEstimate:
     ddq_smoothed: np.ndarray
     ddq_smoothed_std: np.ndarray
     segment_starts: tuple[int, ...]
+
+
+def causal_median_one_pole_filter(
+    timestamps_s: np.ndarray,
+    values: np.ndarray,
+    *,
+    cutoff_hz: float,
+    median_window: int = 1,
+) -> np.ndarray:
+    """Apply the same timestamp-aware causal torque filter used online."""
+    timestamps_s = np.asarray(timestamps_s, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    if timestamps_s.ndim != 1 or values.ndim != 2:
+        raise ValueError("causal filtering expects timestamps [N] and values [N, D].")
+    if len(timestamps_s) != len(values) or len(values) == 0:
+        raise ValueError("causal filter timestamps and values must be non-empty and aligned.")
+    if not np.isfinite(timestamps_s).all() or not np.isfinite(values).all():
+        raise ValueError("causal filter inputs must be finite.")
+    if len(timestamps_s) > 1 and np.any(np.diff(timestamps_s) <= 0.0):
+        raise ValueError("causal filter timestamps must increase strictly.")
+    if not np.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+        raise ValueError("cutoff_hz must be positive and finite.")
+    if median_window < 1 or median_window % 2 == 0:
+        raise ValueError("median_window must be a positive odd integer.")
+
+    median_values = causal_trailing_median_filter(
+        values,
+        median_window=median_window,
+    )
+    filtered = np.empty_like(median_values)
+    state: np.ndarray | None = None
+    previous_timestamp_s: float | None = None
+    for index, (timestamp_s, median_value) in enumerate(
+        zip(timestamps_s, median_values)
+    ):
+        if state is None:
+            state = median_value.copy()
+        else:
+            assert previous_timestamp_s is not None
+            dt = float(timestamp_s - previous_timestamp_s)
+            alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff_hz * dt)
+            state = alpha * median_value + (1.0 - alpha) * state
+        filtered[index] = state
+        previous_timestamp_s = float(timestamp_s)
+    return filtered
+
+
+def causal_trailing_median_filter(
+    values: np.ndarray,
+    *,
+    median_window: int,
+) -> np.ndarray:
+    """Reject isolated spikes with a causal trailing median window."""
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or len(values) == 0:
+        raise ValueError("causal median filtering expects non-empty values [N, D].")
+    if not np.isfinite(values).all():
+        raise ValueError("causal median filter inputs must be finite.")
+    if median_window < 1 or median_window % 2 == 0:
+        raise ValueError("median_window must be a positive odd integer.")
+
+    history: deque[np.ndarray] = deque()
+    filtered = np.empty_like(values)
+    for index, value in enumerate(values):
+        history.append(value.copy())
+        while len(history) > median_window:
+            history.popleft()
+        samples = list(history)
+        samples = [samples[0]] * (median_window - len(samples)) + samples
+        filtered[index] = np.median(np.stack(samples, axis=0), axis=0)
+    return filtered
 
 
 def _joint_parameter(
