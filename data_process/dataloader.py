@@ -23,6 +23,7 @@ from model.pinn_model.contact_gate import (
     contact_labels_from_wrench,
     load_contact_label_cache,
 )
+from data_process.causal_data_filter import build_filtered_dataset_view
 
 
 def _load_lerobot_dataset_class():
@@ -54,21 +55,78 @@ class PINNDataset(torch.utils.data.Dataset):
                     normalize_mode=None,
                     compute_normalizer=True,):
         # repo_id, root, 
-        self.config = config 
-        self.data_config = config.get("dataloader")
+        self.config = config
+        self.data_config = config.get("dataloader") or {}
+        self.backend = str(self.data_config.get("backend", "lerobot")).lower()
+        root = self.data_config.get("root")
+        self.root = Path(root) if root is not None else None
         self.repo_id = self.data_config.get("repo_id",None)
-        self.root = Path(self.data_config.get("root", None))
         self.video_backend = self.data_config.get("video_backend", "torchcodec")
-        if not self.repo_id or not self.root:
-            raise ValueError(f"miss lerobotv3 dataset repo_id and root")
-        # self.repo_path = os.path.join(self.root, self.repo_id)
-        LeRobotDataset = _load_lerobot_dataset_class()
-        self.dataset = LeRobotDataset(
-            repo_id=self.repo_id,
-            root=self.root,
-            video_backend=self.video_backend
+        self.lowdim_keys = self.data_config.get("lowdim_keys", {})
+        self.load_image = bool(self.data_config.get("load_images",True))
+        if self.backend == "lerobot":
+            if not self.repo_id or self.root is None:
+                raise ValueError("dataloader.repo_id and dataloader.root are required")
+            LeRobotDataset = _load_lerobot_dataset_class()
+            self.dataset = LeRobotDataset(
+                repo_id=self.repo_id,
+                root=self.root,
+                video_backend=self.video_backend
+            )
+        elif self.backend == "h5":
+            if self.root is None:
+                raise ValueError("dataloader.root is required for backend=h5")
+            if self.load_image:
+                raise ValueError(
+                    "PINNDataset backend=h5 currently supports low-dimensional "
+                    "fields only; set dataloader.load_images=false"
+                )
+            from data_process.h5_direct_dataset import DirectH5EpisodeDataset
+
+            h5_fields = self.data_config.get("h5_fields") or {}
+            required_columns = set(self.lowdim_keys.values())
+            missing_specs = sorted(required_columns - set(h5_fields))
+            if missing_specs:
+                raise ValueError(
+                    "dataloader.h5_fields is missing direct H5 specifications "
+                    f"for columns: {missing_specs}"
+                )
+            self.dataset = DirectH5EpisodeDataset(
+                root=self.root,
+                fields={name: h5_fields[name] for name in required_columns},
+                timestamp_path=str(
+                    self.data_config.get("h5_timestamp_path", "teleop/timestamp_us")
+                ),
+                timestamp_output_key=str(
+                    self.data_config.get("h5_timestamp_output_key", "timestamp")
+                ),
+                timestamp_unit=str(
+                    self.data_config.get("h5_timestamp_unit", "us")
+                ),
+                timestamp_output_unit=str(
+                    self.data_config.get("h5_timestamp_output_unit", "s")
+                ),
+                patterns=tuple(
+                    self.data_config.get("h5_patterns", ["*.h5", "*.hdf5"])
+                ),
+                max_episodes=self.data_config.get("max_episodes"),
+                expected_fps=self.data_config.get("expected_fps"),
+                max_cadence_error_s=float(
+                    self.data_config.get("max_cadence_error_s", 1.0e-6)
+                ),
+            )
+        else:
+            raise ValueError(
+                "dataloader.backend must be 'lerobot' or 'h5', "
+                f"got {self.backend!r}"
+            )
+        self.stats_dataset, self.filter_config = build_filtered_dataset_view(
+            self.dataset.hf_dataset,
+            data_config=self.data_config,
+            lowdim_keys=self.lowdim_keys,
+            episodes=self.dataset.meta.episodes,
         )
-        self.stats_dataset =  self.dataset.hf_dataset
+        self.sample_rate_hz = self._resolve_sample_rate_hz()
         # self.dt = float(1/30)  # 采样frequency 30Hz
 
         self.horizon = int(self.data_config.get("horizon", 1))
@@ -81,12 +139,9 @@ class PINNDataset(torch.utils.data.Dataset):
         self.raw_idx_to_episode_end = {}
         self._build_valid_indices()
 
-        self.load_image = bool(self.data_config.get("load_images",True))
-
         self.normalize_lowdim_keys = self.data_config.get("normalize_lowdim_keys",None)
         if self.normalize_lowdim_keys is None:
             self.normalize_lowdim_keys = []
-        self.lowdim_keys = self.data_config.get("lowdim_keys", {})
         if self.load_image:
             self.image_keys = self.data_config.get("image_keys", {})
         else:
@@ -192,9 +247,33 @@ class PINNDataset(torch.utils.data.Dataset):
         return sample
     
     def _read_frame(self, i):
-        if self.load_image:
-            return self.dataset[i]
-        return self.dataset.hf_dataset[i]
+        filtered_frame = self.stats_dataset[i]
+        if not self.load_image:
+            return filtered_frame
+        frame = dict(self.dataset[i])
+        for dataset_key in self.lowdim_keys.values():
+            if dataset_key in filtered_frame:
+                frame[dataset_key] = filtered_frame[dataset_key]
+        return frame
+
+    def _resolve_sample_rate_hz(self):
+        configured = self.data_config.get(
+            "filter_sample_rate_hz",
+            self.data_config.get("expected_fps"),
+        )
+        if configured is None:
+            metadata = getattr(self.dataset, "meta", None)
+            configured = getattr(metadata, "fps", None)
+            if configured is None:
+                info = getattr(metadata, "info", None)
+                if isinstance(info, dict):
+                    configured = info.get("fps")
+        if configured is None:
+            return None
+        sample_rate_hz = float(configured)
+        if not torch.isfinite(torch.tensor(sample_rate_hz)) or sample_rate_hz <= 0.0:
+            raise ValueError("dataloader filter sample rate must be positive and finite")
+        return sample_rate_hz
 
 
 class PINNHistoryFutureDataset(PINNDataset):

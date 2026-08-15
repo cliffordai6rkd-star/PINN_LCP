@@ -12,10 +12,6 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 import yaml
 
-from data_process.torque_target_filter import (
-    filter_torque_target_dataset,
-    torque_target_filter_config,
-)
 from physics.nero_dynamics import PinocchioDynamics
 from train.tau_free_wrench_loss import TauFreeTorqueWrenchLoss
 from train.trainer.tau_f_sequence_train import (
@@ -50,7 +46,6 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
 
     def __init__(self, config):
         self._validate_v2_contract(config)
-        self.target_filter_config = torque_target_filter_config(config)
         super().__init__(config)
         self.tau_wrench_loss = TauFreeTorqueWrenchLoss(config)
         self.torque_loss_space = self.tau_wrench_loss.torque_loss_space
@@ -58,47 +53,6 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
         self.wrench_dynamics = (
             PinocchioDynamics(config) if self.use_wrench_objective else None
         )
-
-    def _load_lowdim_columns(self, cache_keys):
-        cache = super()._load_lowdim_columns(cache_keys)
-        if self.target_filter_config is None or "tau" not in cache:
-            return cache
-
-        timestamp_key = str(
-            ((self.config.get("model") or {}).get("target_filter") or {}).get(
-                "timestamp_key",
-                "timestamp",
-            )
-        )
-        hf_dataset = self.dataset.stats_dataset
-        if timestamp_key not in hf_dataset.column_names:
-            raise KeyError(
-                f"tau target filtering requires timestamp column {timestamp_key!r}"
-            )
-        formatted = hf_dataset.with_format(
-            "torch",
-            columns=[timestamp_key],
-            output_all_columns=False,
-        )
-        timestamps = self._column_to_tensor(formatted[:][timestamp_key]).reshape(-1)
-        episode_ranges = [
-            (int(episode["dataset_from_index"]), int(episode["dataset_to_index"]))
-            for episode in self.dataset.dataset.meta.episodes
-        ]
-        cache["tau"] = filter_torque_target_dataset(
-            timestamps,
-            cache["tau"],
-            episode_ranges,
-            self.target_filter_config,
-        )
-        log.info(
-            "tau-free target filter: median_window=%d "
-            "apply_additional_lowpass=%s cutoff_hz=%s",
-            self.target_filter_config["median_window"],
-            self.target_filter_config["apply_additional_lowpass"],
-            self.target_filter_config["cutoff_hz"],
-        )
-        return cache
 
     def _denormalize_key(self, key, value):
         dataset = getattr(self, "dataset", None)
@@ -226,6 +180,7 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
             **metrics,
         }
         out["_absolute_error_nm"] = absolute_error_nm.detach()
+        out["_target_nm"] = target_nm.detach()
         if self.use_wrench_objective:
             out["_wrench_pred"] = diagnostics["wrench_pred"].detach()
         return loss, out
@@ -307,7 +262,7 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
             loss_config.get("joint_weight_mode", default_joint_weight_mode)
         ).lower()
 
-        allowed_inputs = {"q", "dq", "delta_q"}
+        allowed_inputs = {"q", "dq", "ddq", "tau_id", "tau_f", "delta_q"}
         unknown_inputs = sorted(set(inputs) - allowed_inputs)
         if not inputs or inputs[0] != "q" or unknown_inputs:
             raise ValueError(
@@ -325,8 +280,8 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
             raise ValueError(
                 "tau-free V2 model.architecture must be lstm, gru, or tcn."
             )
-        if horizon != 50:
-            raise ValueError("tau-free V2 requires dataloader.horizon=50.")
+        # if horizon != 50:
+        #     raise ValueError("tau-free V2 requires dataloader.horizon=50.")
         if pad_history:
             raise ValueError(
                 "tau-free V2 requires dataloader.pad_history=false so every "

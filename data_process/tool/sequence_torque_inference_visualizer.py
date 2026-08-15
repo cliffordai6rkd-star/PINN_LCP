@@ -11,11 +11,22 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
+from scipy.signal import butter, sosfilt, sosfilt_zi
 
+from data_process.causal_data_filter import (
+    filter_episode_values,
+    normalize_dataloader_filters,
+)
 from data_process.offline_tau_labels import (
     KalmanRTSConfig,
     causal_median_one_pole_filter,
-    estimate_joint_states_rts,
+    estimate_joint_states_causal,
+)
+from data_process.tau_f_target_generation import (
+    build_causal_tau_f_target,
+    normalize_tau_f_target_generation,
+    resolve_tau_f_target_generation,
+    timestamps_to_seconds,
 )
 from data_process.torque_target_filter import (
     filter_torque_target_episode,
@@ -210,7 +221,7 @@ def load_episode_columns(
     dataset_columns = list(dict.fromkeys([*column_mapping.values(), timestamp_key]))
     missing = sorted(set(dataset_columns) - set(dataset.hf_dataset.column_names))
     if missing:
-        raise KeyError(f"LeRobot dataset is missing columns: {missing}")
+        raise KeyError(f"Dataset is missing columns: {missing}")
 
     formatted = dataset.hf_dataset.with_format(
         "torch",
@@ -226,6 +237,51 @@ def load_episode_columns(
         raw_columns[timestamp_key]
     ).to(dtype=torch.float64).reshape(-1)
     return columns
+
+
+def checkpoint_dataloader_filters(
+    checkpoint: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    data_config = dict(config.get("dataloader") or {})
+    if "dataloader_filters" in checkpoint:
+        data_config["filters"] = checkpoint["dataloader_filters"]
+    return normalize_dataloader_filters(
+        data_config,
+        data_config.get("lowdim_keys") or {},
+    )
+
+
+def checkpoint_derived_target_config(
+    checkpoint: Mapping[str, Any],
+    config: Mapping[str, Any],
+    filters: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    resolved = checkpoint.get("derived_target_config")
+    if resolved is not None:
+        if not isinstance(resolved, Mapping):
+            raise ValueError("checkpoint derived_target_config must be a mapping")
+        return dict(resolved)
+    return resolve_tau_f_target_generation(config, filters)
+
+
+def apply_checkpoint_filters_to_episode(
+    columns: dict[str, torch.Tensor],
+    filters: Mapping[str, Mapping[str, Any]],
+) -> None:
+    timestamps = columns["timestamp"]
+    for key, spec in filters.items():
+        if key not in columns or not bool(spec.get("enabled", False)):
+            continue
+        operations = list(spec.get("operations", ()))
+        preprocessed = list(spec.get("dataset_preprocessed_operations", ()))
+        pending = operations[len(preprocessed) :]
+        if not pending:
+            continue
+        columns[key] = torch.as_tensor(
+            filter_episode_values(timestamps, columns[key], pending),
+            dtype=columns[key].dtype,
+        )
 
 
 @torch.inference_mode()
@@ -331,6 +387,9 @@ def torque_error_metrics(result: Mapping[str, np.ndarray]) -> dict[str, Any]:
 
 
 def _rollout_state_estimator_config(config: Mapping[str, Any]) -> KalmanRTSConfig:
+    target_generation = normalize_tau_f_target_generation(config)
+    if target_generation["enabled"]:
+        return KalmanRTSConfig(**target_generation["state_estimator"])
     rollout = config.get("rollout") or {}
     values = rollout.get("state_estimator") or {}
     allowed = {
@@ -375,6 +434,81 @@ def causal_trailing_moving_average(
     return (cumulative[window:] - cumulative[:-window]) / float(window)
 
 
+def causal_trailing_hampel_filter(
+    values: np.ndarray,
+    *,
+    window: int,
+    n_sigma: float,
+) -> np.ndarray:
+    """Replace causal trailing-window outliers using a Hampel MAD threshold."""
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or len(values) == 0:
+        raise ValueError("Hampel filter expects non-empty values [N, D]")
+    if not np.isfinite(values).all():
+        raise ValueError("Hampel filter inputs must be finite")
+    if window < 1 or window % 2 == 0:
+        raise ValueError("Hampel window must be a positive odd integer")
+    if not math.isfinite(n_sigma) or n_sigma <= 0.0:
+        raise ValueError("Hampel n_sigma must be positive and finite")
+
+    filtered = values.copy()
+    for index in range(len(values)):
+        start = max(0, index - window + 1)
+        samples = values[start : index + 1]
+        if len(samples) < 3:
+            continue
+        median = np.median(samples, axis=0)
+        mad = np.median(np.abs(samples - median), axis=0)
+        robust_sigma = 1.4826 * mad
+        deviation = np.abs(values[index] - median)
+        is_outlier = deviation > n_sigma * robust_sigma
+        filtered[index] = np.where(is_outlier, median, values[index])
+    return filtered
+
+
+def causal_butterworth_lowpass(
+    values: np.ndarray,
+    *,
+    sample_rate_hz: float,
+    cutoff_hz: float,
+    order: int,
+) -> np.ndarray:
+    """Apply a causal Butterworth SOS filter with steady first-sample startup."""
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or len(values) == 0:
+        raise ValueError("Butterworth filter expects non-empty values [N, D]")
+    if not np.isfinite(values).all():
+        raise ValueError("Butterworth filter inputs must be finite")
+    if not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
+        raise ValueError("Butterworth sample_rate_hz must be positive and finite")
+    if (
+        not math.isfinite(cutoff_hz)
+        or cutoff_hz <= 0.0
+        or cutoff_hz >= 0.5 * sample_rate_hz
+    ):
+        raise ValueError(
+            "Butterworth cutoff_hz must be positive and below the Nyquist frequency"
+        )
+    if order < 1:
+        raise ValueError("Butterworth order must be positive")
+
+    sos = butter(
+        order,
+        cutoff_hz,
+        btype="lowpass",
+        fs=sample_rate_hz,
+        output="sos",
+    )
+    initial_state = (
+        sosfilt_zi(sos)[:, :, np.newaxis]
+        * values[0][np.newaxis, np.newaxis, :]
+    )
+    filtered, _ = sosfilt(sos, values, axis=0, zi=initial_state)
+    return filtered
+
+
 def add_external_wrench_rollout(
     rollout_mode: str,
     result: dict[str, np.ndarray],
@@ -401,7 +535,7 @@ def add_external_wrench_rollout(
         timestamps_s = columns["timestamp"].detach().cpu().numpy().astype(np.float64)
         q_np = q.numpy()
         dq_np = columns["dq"].detach().cpu().numpy().astype(np.float64)
-        estimate = estimate_joint_states_rts(
+        estimate = estimate_joint_states_causal(
             timestamps_s,
             q_np,
             dq_np,
@@ -411,23 +545,35 @@ def add_external_wrench_rollout(
         dq = torch.as_tensor(dq_np, dtype=torch.float64)
         tau_id = dynamics.inverse_dynamics(q, dq, ddq_causal).cpu().numpy()
 
-        model_config = config.get("model") or {}
-        rollout_config = config.get("rollout") or {}
-        matched_filter = (
-            rollout_config.get("matched_torque_filter")
-            or model_config.get("target_filter")
-            or {}
+        filters = normalize_dataloader_filters(
+            config.get("dataloader") or {},
+            (config.get("dataloader") or {}).get("lowdim_keys") or {},
         )
-        cutoff_hz = float(matched_filter.get("cutoff_hz", 10.0))
-        median_window = int(matched_filter.get("median_window", 1))
-        tau_id_filtered = causal_median_one_pole_filter(
-            timestamps_s,
-            tau_id,
-            cutoff_hz=cutoff_hz,
-            median_window=median_window,
-        )
+        tau_filter = filters.get("tau") or {}
+        if bool(tau_filter.get("enabled", False)):
+            tau_id_filtered = filter_episode_values(
+                timestamps_s,
+                tau_id,
+                tau_filter["operations"],
+            )
+        else:
+            model_config = config.get("model") or {}
+            rollout_config = config.get("rollout") or {}
+            matched_filter = (
+                rollout_config.get("matched_torque_filter")
+                or model_config.get("target_filter")
+                or {}
+            )
+            cutoff_hz = float(matched_filter.get("cutoff_hz", 10.0))
+            median_window = int(matched_filter.get("median_window", 1))
+            tau_id_filtered = causal_median_one_pole_filter(
+                timestamps_s,
+                tau_id,
+                cutoff_hz=cutoff_hz,
+                median_window=median_window,
+            )
         tau_measured = columns["tau"].detach().cpu().numpy().astype(np.float64)
-        if not bool(rollout_config.get("measured_tau_already_filtered", True)):
+        if not tau_filter and not bool(rollout_config.get("measured_tau_already_filtered", True)):
             tau_measured = causal_median_one_pole_filter(
                 timestamps_s,
                 tau_measured,
@@ -449,10 +595,27 @@ def add_external_wrench_rollout(
     tau_ext_filter = rollout_config.get("tau_ext_filter") or {}
     filter_enabled = bool(tau_ext_filter.get("enabled", False))
     if filter_enabled:
-        filter_mode = str(tau_ext_filter.get("mode", "moving_average")).lower()
-        filter_window = int(tau_ext_filter.get("window", 21))
+        filter_mode = str(
+            tau_ext_filter.get("mode", "hampel_butterworth")
+        ).lower()
+        filter_window = int(tau_ext_filter.get("window", 5))
         timestamps_s = np.asarray(result["timestamp_s"], dtype=np.float64)
-        if filter_mode == "moving_average":
+        if filter_mode == "hampel_butterworth":
+            hampel_tau_ext = causal_trailing_hampel_filter(
+                tau_ext_raw_nm,
+                window=filter_window,
+                n_sigma=float(tau_ext_filter.get("hampel_n_sigma", 3.0)),
+            )
+            tau_ext_nm = causal_butterworth_lowpass(
+                hampel_tau_ext,
+                sample_rate_hz=float(
+                    tau_ext_filter.get("sample_rate_hz", 100.0)
+                ),
+                cutoff_hz=float(tau_ext_filter.get("cutoff_hz", 8.0)),
+                order=int(tau_ext_filter.get("order", 4)),
+            )
+            result["tau_ext_hampel_nm"] = hampel_tau_ext
+        elif filter_mode == "moving_average":
             averaged_tau_ext = causal_trailing_moving_average(
                 tau_ext_raw_nm,
                 window=filter_window,
@@ -472,7 +635,8 @@ def add_external_wrench_rollout(
             )
         else:
             raise ValueError(
-                "rollout.tau_ext_filter.mode must be moving_average or median, "
+                "rollout.tau_ext_filter.mode must be hampel_butterworth, "
+                "moving_average, or median, "
                 f"got {filter_mode!r}"
             )
     else:
@@ -536,6 +700,12 @@ def rollout_metrics(result: Mapping[str, np.ndarray]) -> dict[str, Any]:
         "moment_norm_p95_nm": float(np.quantile(moment_norm, 0.95)),
         "moment_norm_max_nm": float(moment_norm.max()),
     }
+    if "tau_ext_hampel_nm" in result:
+        tau_ext_raw = np.asarray(result["tau_ext_raw_nm"], dtype=np.float64)
+        tau_ext_hampel = np.asarray(result["tau_ext_hampel_nm"], dtype=np.float64)
+        replaced = ~np.isclose(tau_ext_raw, tau_ext_hampel, rtol=0.0, atol=1.0e-12)
+        metrics["hampel_replacement_ratio"] = float(replaced.mean())
+        metrics["hampel_replacement_ratio_by_joint"] = replaced.mean(axis=0).tolist()
     if "tau_ext_raw_nm" in result and "wrench_ext_raw" in result:
         tau_ext_raw = np.asarray(result["tau_ext_raw_nm"], dtype=np.float64)
         wrench_raw = np.asarray(result["wrench_ext_raw"], dtype=np.float64)
@@ -871,9 +1041,57 @@ def _select_episodes(dataset, requested: list[int] | None, all_episodes: bool):
     return [(index, by_index[index]) for index in requested]
 
 
+def load_visualization_dataset(config, *, root=None, repo_id=None, video_backend=None):
+    """Load the checkpoint's dataset backend without changing time semantics."""
+
+    data_config = config.get("dataloader") or {}
+    backend = str(data_config.get("backend", "lerobot")).lower()
+    configured_root = data_config.get("root")
+    resolved_root = Path(root) if root is not None else (
+        Path(configured_root) if configured_root is not None else None
+    )
+    if resolved_root is None:
+        raise ValueError("Dataset root must be provided by the checkpoint or CLI")
+
+    if backend == "h5":
+        from data_process.dataloader import PINNDataset
+
+        config.setdefault("dataloader", {})["root"] = str(resolved_root)
+        return (
+            PINNDataset(config, compute_normalizer=False).dataset,
+            resolved_root,
+            None,
+        )
+    if backend != "lerobot":
+        raise ValueError(
+            "dataloader.backend must be 'lerobot' or 'h5', "
+            f"got {backend!r}"
+        )
+
+    resolved_repo_id = repo_id or data_config.get("repo_id")
+    if not resolved_repo_id:
+        raise ValueError(
+            "LeRobot repo-id must be provided by the checkpoint or CLI"
+        )
+    resolved_video_backend = video_backend or data_config.get(
+        "video_backend", "torchcodec"
+    )
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    return (
+        LeRobotDataset(
+            repo_id=resolved_repo_id,
+            root=resolved_root,
+            video_backend=resolved_video_backend,
+        ),
+        resolved_root,
+        resolved_repo_id,
+    )
+
+
 def build_parser(task: TorqueVisualizationTask) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=f"Run {task.name} checkpoint inference on LeRobot data and plot it."
+        description=f"Run {task.name} checkpoint inference on H5/LeRobot data and plot it."
     )
     parser.add_argument(
         "--checkpoint",
@@ -910,31 +1128,52 @@ def build_parser(task: TorqueVisualizationTask) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tau-ext-filter-mode",
-        choices=("moving_average", "median"),
-        default="moving_average",
-        help="Temporal filter applied to tau_ext before the low-pass.",
+        choices=("hampel_butterworth", "moving_average", "median"),
+        default="hampel_butterworth",
+        help=(
+            "tau_ext filter chain. The default applies a causal Hampel outlier "
+            "filter followed by a causal Butterworth low-pass."
+        ),
     )
     parser.add_argument(
         "--tau-ext-filter-window",
         "--tau-ext-median-window",
         dest="tau_ext_filter_window",
         type=int,
-        default=21,
+        default=5,
         help=(
-            "Causal moving-average or median window. The old median-window "
-            "option remains as an alias."
+            "Causal Hampel, moving-average, or median window. The old "
+            "median-window option remains as an alias."
         ),
+    )
+    parser.add_argument(
+        "--tau-ext-hampel-n-sigma",
+        type=float,
+        default=3.0,
+        help="Hampel outlier threshold in robust standard deviations.",
+    )
+    parser.add_argument(
+        "--tau-ext-butterworth-order",
+        type=int,
+        default=4,
+        help="Order of the causal Butterworth low-pass.",
+    )
+    parser.add_argument(
+        "--tau-ext-sample-rate-hz",
+        type=float,
+        default=100.0,
+        help="Fixed tau_ext sampling rate used to design the Butterworth filter.",
     )
     parser.add_argument(
         "--tau-ext-lowpass-cutoff-hz",
         type=float,
-        default=20.0,
-        help="Causal one-pole cutoff applied to tau_ext after the median.",
+        default=8.0,
+        help="Low-pass cutoff in Hz; defaults to 8 Hz.",
     )
     parser.add_argument(
         "--no-tau-ext-filter",
         action="store_true",
-        help="Disable tau_ext median and low-pass filtering.",
+        help="Disable all tau_ext outlier and low-pass filtering.",
     )
     parser.add_argument(
         "--max-plot-points",
@@ -973,14 +1212,34 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
         "mode": str(args.tau_ext_filter_mode),
         "window": int(args.tau_ext_filter_window),
         "cutoff_hz": float(args.tau_ext_lowpass_cutoff_hz),
+        "hampel_n_sigma": float(args.tau_ext_hampel_n_sigma),
+        "order": int(args.tau_ext_butterworth_order),
+        "sample_rate_hz": float(args.tau_ext_sample_rate_hz),
     }
     data_config = config.get("dataloader") or {}
+    filters = checkpoint_dataloader_filters(checkpoint, config)
+    data_config["filters"] = filters
+    derived_target_config = checkpoint_derived_target_config(
+        checkpoint,
+        config,
+        filters,
+    )
     model_config = config.get("model") or {}
     lowdim_keys = data_config.get("lowdim_keys") or {}
     active_inputs = list(model_config.get("inputs") or [])
     rollout_keys = ["q"] if task.rollout_mode == "tau_free" else ["q", "dq", "tau"]
+    build_target_from_sources = bool(
+        task.rollout_mode == "tau_f"
+        and derived_target_config.get("enabled", False)
+        and derived_target_config.get("target_key") == task.target_key
+    )
+    target_keys = (
+        list(derived_target_config["source_keys"].values())
+        if build_target_from_sources
+        else [task.target_key]
+    )
     required_keys = list(
-        dict.fromkeys([*active_inputs, task.target_key, *rollout_keys])
+        dict.fromkeys([*active_inputs, *target_keys, *rollout_keys])
     )
     missing_mappings = [key for key in required_keys if key not in lowdim_keys]
     if missing_mappings:
@@ -988,23 +1247,11 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
             f"Checkpoint dataloader.lowdim_keys is missing: {missing_mappings}"
         )
 
-    root = args.root or Path(data_config.get("root", ""))
-    repo_id = args.repo_id or data_config.get("repo_id")
-    if not str(root) or not repo_id:
-        raise ValueError(
-            "Dataset root/repo-id must be provided by the checkpoint or CLI"
-        )
-    video_backend = args.video_backend or data_config.get(
-        "video_backend",
-        "torchcodec",
-    )
-
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=root,
-        video_backend=video_backend,
+    dataset, root, repo_id = load_visualization_dataset(
+        config,
+        root=args.root,
+        repo_id=args.repo_id,
+        video_backend=args.video_backend,
     )
     selected_episodes = _select_episodes(
         dataset,
@@ -1012,6 +1259,12 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
         args.all_episodes,
     )
     horizon = int(data_config.get("horizon", 50))
+    timestamp_dataset_key = (
+        str(derived_target_config["timestamp_key"])
+        if build_target_from_sources
+        else str(args.timestamp_key)
+    )
+    dynamics = PinocchioDynamics(config) if task.rollout_mode == "tau_f" else None
     log.info(
         "%s inference: checkpoint=%s dataset=%s episodes=%s device=%s horizon=%d",
         task.name,
@@ -1027,10 +1280,41 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
             dataset,
             episode,
             {key: lowdim_keys[key] for key in required_keys},
-            args.timestamp_key,
+            timestamp_dataset_key,
         )
+        if build_target_from_sources:
+            columns["timestamp"] = torch.as_tensor(
+                timestamps_to_seconds(
+                    columns["timestamp"],
+                    derived_target_config["timestamp_unit"],
+                ),
+                dtype=torch.float64,
+            )
+        apply_checkpoint_filters_to_episode(columns, filters)
+        if build_target_from_sources:
+            source_keys = derived_target_config["source_keys"]
+            derived = build_causal_tau_f_target(
+                timestamps_s=columns["timestamp"].numpy(),
+                q=columns[source_keys["q"]],
+                dq=columns[source_keys["dq"]],
+                tau_filtered=columns[source_keys["tau"]],
+                episodes=[
+                    {
+                        "dataset_from_index": 0,
+                        "dataset_to_index": len(columns["timestamp"]),
+                    }
+                ],
+                target_config=derived_target_config,
+                dynamics=dynamics,
+            )
+            columns[source_keys["dq"]] = derived.dq
+            columns[task.target_key] = derived.tau_f
         target_filter = torque_target_filter_config(config)
-        if task.rollout_mode == "tau_free" and target_filter is not None:
+        if (
+            task.rollout_mode == "tau_free"
+            and not filters
+            and target_filter is not None
+        ):
             columns[task.target_key] = torch.as_tensor(
                 filter_torque_target_episode(
                     columns["timestamp"],
@@ -1055,6 +1339,7 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
             result,
             columns,
             config,
+            dynamics=dynamics,
         )
         metrics = torque_error_metrics(result)
         metrics["rollout"] = rollout_metrics(result)
@@ -1088,6 +1373,7 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
             "episode_index": episode_index,
             "history_horizon": horizon,
             "target_key": task.target_key,
+            "derived_target_config": derived_target_config,
             "active_inputs": active_inputs,
             "rollout_mode": task.rollout_mode,
             "wrench_frame_name": str(args.frame_name),

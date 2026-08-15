@@ -1,9 +1,71 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import h5py
+import numpy as np
 import torch
 
 from data_process.world_model_dataset import TorqueWorldModelDataset
+
+
+def _write_direct_world_model_h5(path, frames=16, fps=4):
+    timestamps_us = 1_000_000 + (
+        np.arange(frames, dtype=np.int64) * int(round(1_000_000 / fps))
+    )
+    values = np.arange(frames * 2, dtype=np.float64).reshape(frames, 2)
+    poses = np.repeat(np.eye(4, dtype=np.float64)[None], frames, axis=0)
+    poses[:, 0, 3] = np.arange(frames, dtype=np.float64)
+    with h5py.File(path, "w") as h5_file:
+        teleop = h5_file.create_group("teleop")
+        teleop.create_dataset("timestamp_us", data=timestamps_us)
+        teleop.create_dataset("q_follower", data=values)
+        teleop.create_dataset("dq_follower", data=values + 100.0)
+        teleop.create_dataset("ddq_follower", data=values + 200.0)
+        teleop.create_dataset("tau_follower", data=values + 300.0)
+        teleop.create_dataset(
+            "wrench_ext", data=np.zeros((frames, 6), dtype=np.float64)
+        )
+        teleop.create_dataset("ee_pose_follower", data=poses)
+        camera = h5_file.create_group("cameras").create_group("wrist")
+        camera.create_dataset(
+            "timestamp_us", data=timestamps_us[3::4]
+        )
+
+
+def test_world_model_can_read_uniform_h5_without_lerobot_or_resampling(tmp_path):
+    _write_direct_world_model_h5(tmp_path / "episode_0007_direct.h5")
+    config = {
+        "dataloader": {
+            "backend": "h5",
+            "root": str(tmp_path),
+            "high_fps": 4,
+            "expert_fps": 1,
+            "action_chunk_horizon": 2,
+            "inference_delay_s": 0.0,
+            "state_history_horizon": 3,
+            "prediction_horizon": 2,
+            "normalize_mode": None,
+            "action_condition_mode": "relative_pose",
+        },
+        "contact_gate": {"enabled": False},
+    }
+
+    dataset = TorqueWorldModelDataset(config)
+    sample = dataset[0]
+
+    assert dataset.backend == "h5"
+    assert dataset.episodes[0]["episode_index"] == 7
+    assert dataset.high_timestamps.dtype == torch.int64
+    assert dataset.high_timestamps.tolist() == (
+        1_000_000_000 + torch.arange(16) * 250_000_000
+    ).tolist()
+    assert sample["q"].shape == (3, 2)
+    assert sample["tau_future"].shape == (2, 2)
+    assert sample["target_relative_pose"].shape == (5, 7)
+    torch.testing.assert_close(
+        dataset.high_tensors["reference_pose"][:, 3:],
+        torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(16, 4),
+    )
 
 
 class _FakeHFDataset:

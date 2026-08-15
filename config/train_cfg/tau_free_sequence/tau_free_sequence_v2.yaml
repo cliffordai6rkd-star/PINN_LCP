@@ -5,6 +5,7 @@ dataloader:
   contact_free: true
   load_images: false
   video_backend: torchcodec
+  filter_sample_rate_hz: 100
 
   # NEXT uses a stateless 50-step look-back window at 100 Hz.
   horizon: 50
@@ -25,6 +26,20 @@ dataloader:
     - dq
     - delta_q
     - tau
+
+  # Unified causal preprocessing. This legacy dataset is already low-pass
+  # filtered; the complete source contract is still stored in new checkpoints.
+  filter_timestamp_key: timestamp
+  filters:
+    q: {enabled: false, operations: []}
+    dq: {enabled: false, operations: []}
+    delta_q: {enabled: false, operations: []}
+    tau:
+      enabled: true
+      dataset_preprocessed_operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+      operations:
+        - {type: lowpass, cutoff_hz: 10.0}
 
 model:
   task: free_space_inverse_dynamics

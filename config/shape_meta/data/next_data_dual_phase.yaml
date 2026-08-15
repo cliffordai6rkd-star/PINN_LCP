@@ -1,0 +1,50 @@
+io:
+  input: nero_ws/runs/bg_data_filted
+  output_phase0: data/train_episode/bg_data_filted_a_lbv3
+  output_phase1: data/train_episode/bg_data_filted_b_lbv3
+  repo_id_phase0: bg_data_filted_a_lbv3
+  repo_id_phase1: bg_data_filted_b_lbv3
+  max_episodes: null
+  no_videos: true
+  push_to_hub: false
+
+task: bg_data_filted_
+master_timestamp_path: teleop/timestamp_us
+fps: 50
+
+# The recorder produces a fixed 100 Hz row stream. Phase 0 reads rows
+# 0,2,4,... and phase 1 reads rows 1,3,5,... into separate datasets.
+downsample:
+  mode: index_stride
+  source_fps: 100
+  stride: 2
+  phases: [0, 1]
+
+features:
+  observation.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    align: index
+
+  observation.velocity:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/dq_follower
+    align: index
+
+  observation.delta_q:
+    dtype: float32
+    shape: [7]
+    sources:
+      - h5_path: teleop/q_cmd
+        align: index
+      - h5_path: teleop/q_follower
+        align: index
+    combine: subtract
+
+  observation.torque:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_follower
+    align: index

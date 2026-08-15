@@ -4,6 +4,7 @@ dataloader:
   contact_free: true
   load_images: false
   video_backend: torchcodec
+  filter_sample_rate_hz: 100
   horizon: 50
   pad_history: false
 
@@ -15,6 +16,18 @@ dataloader:
 
   normalize_mode: gaussian
   normalize_lowdim_keys: [q, dq, delta_q, tau]
+
+  filter_timestamp_key: timestamp
+  filters:
+    q: {enabled: false, operations: []}
+    dq: {enabled: false, operations: []}
+    delta_q: {enabled: false, operations: []}
+    tau:
+      enabled: true
+      dataset_preprocessed_operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+      operations:
+        - {type: lowpass, cutoff_hz: 10.0}
 
 model:
   task: free_space_inverse_dynamics

@@ -310,6 +310,57 @@ class TauFSequenceRegressorTest(unittest.TestCase):
             3.0,
         )
 
+    def test_validation_nmae_uses_complete_split_target_distribution(self):
+        class FixedPredictionModel(torch.nn.Module):
+            def forward(self, batch):
+                return {
+                    "tau_f_pred": batch["prediction"],
+                    "tau_f_target": batch["target"],
+                }
+
+        target_levels = torch.tensor([0.0, 1.0, 2.0, 3.0])
+        samples = [
+            {
+                "prediction": torch.full((7,), level + 1.0),
+                "target": torch.full((7,), level),
+            }
+            for level in target_levels
+        ]
+        trainer = TauFTrainer(make_config())
+        trainer.device = "cpu"
+        trainer.dataset = SimpleNamespace(
+            normalize_mode=None,
+            normalize_lowdim_keys=[],
+        )
+        trainer.model = FixedPredictionModel()
+        trainer.val_loader = torch.utils.data.DataLoader(samples, batch_size=2)
+
+        trainer.validate_one_epoch(epoch=0)
+
+        target_std = target_levels.std().item()
+        robust_range = (
+            torch.quantile(target_levels, 0.95)
+            - torch.quantile(target_levels, 0.05)
+        ).item()
+        metrics = trainer.last_val_epoch_metrics
+        for joint_index in range(1, 8):
+            self.assertAlmostEqual(metrics[f"mae_nm_j{joint_index}"], 1.0)
+            self.assertAlmostEqual(metrics[f"joint_mae_nm_j{joint_index}"], 1.0)
+            self.assertAlmostEqual(
+                metrics[f"joint_tau_std_nm_j{joint_index}"], target_std
+            )
+            self.assertAlmostEqual(
+                metrics[f"joint_nmae_std_j{joint_index}"],
+                1.0 / (target_std + 1.0e-8),
+            )
+            self.assertAlmostEqual(
+                metrics[f"joint_tau_p90_range_nm_j{joint_index}"], robust_range
+            )
+            self.assertAlmostEqual(
+                metrics[f"joint_nmae_p90_j{joint_index}"],
+                1.0 / (robust_range + 1.0e-8),
+            )
+
     def test_peak_cvar_targets_the_largest_errors(self):
         objective = TorqueSequencePeakLoss(
             {
@@ -520,6 +571,55 @@ class FakeMultiEpisodeWindowDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         return self.valid_indices[index]
+
+
+class EpisodeSplitTest(unittest.TestCase):
+    def test_explicit_validation_episodes_override_ratio_and_seed(self):
+        dataset = FakeMultiEpisodeWindowDataset(
+            episode_lengths=(12, 14, 16),
+            horizon=5,
+        )
+        trainer = BaseTrainer(
+            {
+                "train": {
+                    "val_ratio": 0.9,
+                    "split_mode": "episode",
+                    "seed": 999,
+                    "val_episode_indices": [1],
+                }
+            }
+        )
+        trainer.dataset = dataset
+
+        train_dataset, val_dataset = trainer.split_dataset_by_episode()
+
+        def episode_indices(subset):
+            result = set()
+            for sample_idx in subset.indices:
+                raw_idx = dataset.valid_indices[sample_idx]
+                episode_start = dataset.raw_idx_to_episode_start[raw_idx]
+                for episode in dataset.dataset.meta.episodes:
+                    if int(episode["dataset_from_index"]) == episode_start:
+                        result.add(int(episode["episode_index"]))
+                        break
+            return result
+
+        self.assertEqual(episode_indices(val_dataset), {1})
+        self.assertEqual(episode_indices(train_dataset), {0, 2})
+
+    def test_unknown_explicit_validation_episode_fails(self):
+        trainer = BaseTrainer(
+            {
+                "train": {
+                    "split_mode": "episode",
+                    "val_episode_indices": [7],
+                }
+            }
+        )
+        trainer.dataset = FakeMultiEpisodeWindowDataset()
+
+        with self.assertRaisesRegex(ValueError, "unknown episode indices"):
+            trainer.split_dataset_by_episode()
 
 
 class PurgedTemporalSplitTest(unittest.TestCase):

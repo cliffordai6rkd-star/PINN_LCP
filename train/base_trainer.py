@@ -79,6 +79,32 @@ class BaseTrainer:
 
         self.val_ratio = float(self.train_config.get("val_ratio", 0.1))
         self.split_mode = self.train_config.get("split_mode", "episode")
+        configured_val_episodes = self.train_config.get("val_episode_indices")
+        if configured_val_episodes is None:
+            self.val_episode_indices = None
+        else:
+            if not isinstance(configured_val_episodes, (list, tuple)):
+                raise ValueError(
+                    "train.val_episode_indices must be a list of episode indices"
+                )
+            if not configured_val_episodes:
+                raise ValueError("train.val_episode_indices must not be empty")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in configured_val_episodes
+            ):
+                raise ValueError(
+                    "train.val_episode_indices must contain integer episode indices"
+                )
+            if len(set(configured_val_episodes)) != len(configured_val_episodes):
+                raise ValueError(
+                    "train.val_episode_indices must not contain duplicates"
+                )
+            self.val_episode_indices = tuple(configured_val_episodes)
+            if self.split_mode != "episode":
+                raise ValueError(
+                    "train.val_episode_indices requires train.split_mode=episode"
+                )
         self.seed = int(self.train_config.get("seed", 42))
         self.deterministic = bool(
             self.train_config.get("deterministic", True)
@@ -209,7 +235,6 @@ class BaseTrainer:
         if self.wandb_log_every_steps < 1:
             raise ValueError("wandb.log_every_steps must be at least 1.")
         self.wandb_run = None
-        
 
     def set_seed(self):
         import random
@@ -250,7 +275,7 @@ class BaseTrainer:
     def fit_dataset_normalizer(self, train_dataset):
         """Hook for datasets that must fit normalization after the split."""
         return None
-    
+
     def build_scheduler(self):
         if self.scheduler_config is None:
             return None
@@ -300,17 +325,39 @@ class BaseTrainer:
                 "split_mode=purged_temporal for a single time-series episode."
             )
 
-        num_val_episodes = int(len(episodes) * self.val_ratio)
-        num_val_episodes = max(1, num_val_episodes)
-        num_val_episodes = min(num_val_episodes, len(episodes) - 1)
+        episode_indices = [
+            int(episode.get("episode_index", position))
+            for position, episode in enumerate(episodes)
+        ]
+        if len(set(episode_indices)) != len(episode_indices):
+            raise ValueError("episode metadata contains duplicate episode_index values")
 
-        generator = torch.Generator().manual_seed(self.seed)
-        perm = torch.randperm(len(episodes), generator=generator).tolist()
-        val_episode_indices = set(perm[:num_val_episodes])
+        if self.val_episode_indices is not None:
+            val_episode_indices = set(self.val_episode_indices)
+            unknown = sorted(val_episode_indices - set(episode_indices))
+            if unknown:
+                raise ValueError(
+                    "train.val_episode_indices contains unknown episode indices: "
+                    f"{unknown}; available={sorted(episode_indices)}"
+                )
+            if len(val_episode_indices) >= len(episodes):
+                raise ValueError(
+                    "train.val_episode_indices must leave at least one training episode"
+                )
+        else:
+            num_val_episodes = int(len(episodes) * self.val_ratio)
+            num_val_episodes = max(1, num_val_episodes)
+            num_val_episodes = min(num_val_episodes, len(episodes) - 1)
+
+            generator = torch.Generator().manual_seed(self.seed)
+            perm = torch.randperm(len(episodes), generator=generator).tolist()
+            val_episode_indices = {
+                episode_indices[position] for position in perm[:num_val_episodes]
+            }
 
         episode_start_to_idx = {
-            int(ep["dataset_from_index"]): ep_idx
-            for ep_idx, ep in enumerate(episodes)
+            int(ep["dataset_from_index"]): episode_indices[position]
+            for position, ep in enumerate(episodes)
         }
 
         train_indices = []
@@ -526,7 +573,11 @@ class BaseTrainer:
         self.set_seed()
         self.dataset = self.build_dataset()
 
-        if self.val_ratio > 0 or self.split_mode == "purged_kfold":
+        if (
+            self.val_ratio > 0
+            or self.split_mode == "purged_kfold"
+            or self.val_episode_indices is not None
+        ):
             if self.split_mode == "episode":
                 train_dataset, val_dataset = self.split_dataset_by_episode()
             elif self.split_mode == "sample":
@@ -1101,6 +1152,11 @@ class BaseTrainer:
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "optimizer": self.optimizer.state_dict(),
             "config": self.config,
+            "dataloader_filters": getattr(self.dataset, "filter_config", {}),
+            "sample_rate_hz": getattr(self.dataset, "sample_rate_hz", None),
+            "derived_target_config": getattr(
+                self, "derived_target_config", {"enabled": False}
+            ),
             "normalizer": {
                 "stats": self.dataset.normalizer.stats,
                 "eps": self.dataset.normalizer.eps,
@@ -1145,6 +1201,11 @@ class BaseTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "config": self.config,
+            "dataloader_filters": getattr(self.dataset, "filter_config", {}),
+            "sample_rate_hz": getattr(self.dataset, "sample_rate_hz", None),
+            "derived_target_config": getattr(
+                self, "derived_target_config", {"enabled": False}
+            ),
             "normalizer": {
                 "stats": self.dataset.normalizer.stats,
                 "eps": self.dataset.normalizer.eps,

@@ -2,18 +2,63 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 
 from data_process.tool.h5_2_lerobotev3 import (
     H5Dataset,
     LeRobotV3Dataset,
+    NERO_RUNS_ROOT,
+    PINN_ROOT,
     build_conversion_spec,
+    config_path,
+    resolve_raw_index_fps,
+    resolve_io_path,
 )
 
 
 def _dataset() -> H5Dataset:
     return H5Dataset(".", h5py=object(), np=np)
+
+
+def test_next_point_sampling_selects_first_row_at_or_after_target() -> None:
+    dataset = _dataset()
+    source_times = np.asarray([0.00, 0.01, 0.02, 0.03])
+    targets = np.asarray([0.001, 0.01, 0.019, 0.03])
+
+    np.testing.assert_array_equal(
+        dataset._point_sample_indices(source_times, targets, "next"),
+        [1, 1, 2, 3],
+    )
+
+
+def test_io_paths_resolve_from_repo_roots_instead_of_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_io_path("data/train_episode/example") == (
+        PINN_ROOT / "data/train_episode/example"
+    ).resolve()
+    assert resolve_io_path("nero_ws/runs/next_data") == (
+        NERO_RUNS_ROOT / "next_data"
+    ).resolve()
+    assert resolve_io_path("../nero_ws/runs/next_data") == (
+        NERO_RUNS_ROOT / "next_data"
+    ).resolve()
+    assert resolve_io_path("runs/next_data") == (
+        NERO_RUNS_ROOT / "next_data"
+    ).resolve()
+
+
+def test_cli_io_override_uses_nero_runs_alias() -> None:
+    config = {"io": {"input": "data/old"}}
+
+    assert config_path(config, "input", override="runs/test") == (
+        NERO_RUNS_ROOT / "test"
+    ).resolve()
 
 
 def _dual_rate_spec() -> dict:
@@ -88,6 +133,122 @@ def _dual_rate_cache() -> tuple[dict, dict]:
     return spec, cache
 
 
+def _camera_rows_spec() -> dict:
+    return build_conversion_spec(
+        {
+            "fps": 25,
+            "master_timestamp_path": "wrist/timestamp_us",
+            "timeline": {
+                "mode": "camera_rows",
+                "history_size": 4,
+                "action_horizon": 8,
+                "max_gap_s": 0.02,
+                "store_timestamps": True,
+            },
+            "features": {
+                "observation.images.wrist": {
+                    "dtype": "video",
+                    "shape": [1, 1, 3],
+                    "h5_path": "wrist/frames",
+                    "timestamp_path": "wrist/timestamp_us",
+                    "grid": "low_anchor",
+                    "resample": "previous",
+                    "allow_stale": True,
+                },
+                "observation.images.side": {
+                    "dtype": "video",
+                    "shape": [1, 1, 3],
+                    "h5_path": "side/frames",
+                    "timestamp_path": "side/timestamp_us",
+                    "grid": "low_anchor",
+                    "resample": "previous",
+                    "allow_stale": True,
+                },
+                "observation.wrench_ext": {
+                    "dtype": "float32",
+                    "shape": [4, 1],
+                    "h5_path": "teleop/wrench",
+                    "timestamp_path": "teleop/timestamp_us",
+                    "grid": "high_past",
+                    "resample": "previous",
+                },
+                "action.joint": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "h5_path": "teleop/q",
+                    "timestamp_path": "teleop/timestamp_us",
+                    "grid": "low_anchor",
+                    "resample": "next",
+                },
+            },
+        }
+    )
+
+
+def test_camera_rows_preserve_real_wrist_rows_and_use_causal_alignment() -> None:
+    spec = _camera_rows_spec()
+    wrist_us = np.asarray([5_000, 46_000, 84_000], dtype=np.int64)
+    side_us = np.asarray([4_000, 45_000, 83_000], dtype=np.int64)
+    teleop_us = np.arange(0, 100_000, 10_000, dtype=np.int64)
+    def image(values):
+        return np.stack(
+            [np.full((1, 1, 3), value, dtype=np.uint8) for value in values]
+        )
+    datasets = {
+        "wrist/timestamp_us": wrist_us,
+        "wrist/frames": image([1, 2, 3]),
+        "side/timestamp_us": side_us,
+        "side/frames": image([11, 12, 13]),
+        "teleop/timestamp_us": teleop_us,
+        "teleop/wrench": np.arange(10, dtype=np.float32)[:, None],
+        "teleop/q": (100 + np.arange(10, dtype=np.float32))[:, None],
+    }
+    cache = _dataset()._build_camera_rows_episode_cache(
+        dataset_cache=datasets,
+        timestamp_cache={
+            "wrist/timestamp_us": wrist_us,
+            "side/timestamp_us": side_us,
+            "teleop/timestamp_us": teleop_us,
+        },
+        mappings=spec["mappings"],
+        master_timestamp_path=spec["master_timestamp_path"],
+        h5_path=Path("episode.h5"),
+        timeline=spec["timeline"],
+    )
+
+    # The first wrist row is dropped because four causal wrench rows do not yet exist.
+    np.testing.assert_array_equal(cache["target_timestamps"], [46_000, 84_000])
+    np.testing.assert_array_equal(
+        cache["resampled"]["observation.wrench_ext"][:, :, 0],
+        [[1, 2, 3, 4], [5, 6, 7, 8]],
+    )
+    np.testing.assert_array_equal(
+        cache["resampled"]["action.joint"][:, 0], [105, 109]
+    )
+    np.testing.assert_array_equal(
+        cache["resampled"]["observation.images.wrist"]["indices"], [1, 2]
+    )
+    np.testing.assert_array_equal(
+        cache["resampled"]["observation.images.side"]["indices"], [1, 2]
+    )
+    np.testing.assert_array_equal(
+        cache["anchor_timestamp_ns"], [46_000_000, 84_000_000]
+    )
+    np.testing.assert_array_equal(
+        cache["action_source_timestamp_ns"], [50_000_000, 90_000_000]
+    )
+    assert "timing.action_source_timestamp_ns" in spec["lerobot_features"]
+    assert "timing.action_timestamp_ns" not in spec["lerobot_features"]
+
+
+def test_timestamp_ns_conversion_preserves_epoch_microseconds_exactly() -> None:
+    raw = np.asarray([1_700_000_000_000_001], dtype=np.int64)
+    np.testing.assert_array_equal(
+        _dataset()._timestamps_ns(raw, "timestamp_us"),
+        [1_700_000_000_000_001_000],
+    )
+
+
 def test_conversion_spec_requires_explicit_fps() -> None:
     with pytest.raises(ValueError, match="define a positive integer 'fps'"):
         build_conversion_spec(
@@ -104,6 +265,116 @@ def test_conversion_spec_requires_explicit_fps() -> None:
         )
 
 
+def _raw_index_shape_meta() -> dict:
+    return {
+        "fps": 100,
+        "master_timestamp_path": "teleop/timestamp_us",
+        "sampling": {"mode": "raw_index"},
+        "features": {
+            "observation.joint": {
+                "dtype": "float32",
+                "shape": [1],
+                "h5_path": "teleop/q",
+                "align": "index",
+            },
+            "observation.delta_q": {
+                "dtype": "float32",
+                "shape": [1],
+                "sources": [
+                    {"h5_path": "teleop/q_cmd", "align": "index"},
+                    {"h5_path": "teleop/q", "align": "index"},
+                ],
+                "combine": "subtract",
+            },
+        },
+    }
+
+
+def test_raw_index_keeps_every_master_row_despite_timestamp_jitter(
+    tmp_path: Path,
+) -> None:
+    h5_path = tmp_path / "episode.h5"
+    timestamps = np.asarray(
+        [1_000_000, 1_010_100, 1_020_300, 1_030_200, 1_040_500],
+        dtype=np.int64,
+    )
+    q = np.arange(len(timestamps), dtype=np.float64)[:, None]
+    with h5py.File(h5_path, "w") as h5_file:
+        h5_file.create_dataset("teleop/timestamp_us", data=timestamps)
+        h5_file.create_dataset("teleop/q", data=q)
+        h5_file.create_dataset("teleop/q_cmd", data=q + 10.0)
+
+    spec = build_conversion_spec(_raw_index_shape_meta())
+    dataset = H5Dataset(tmp_path, h5py=h5py, np=np)
+    with dataset.open_episode(h5_path) as h5_file:
+        cache = dataset.build_episode_cache(
+            h5_file,
+            spec["mappings"],
+            spec["master_timestamp_path"],
+            spec["fps"],
+            h5_path,
+            sampling=spec["sampling"],
+        )
+        frames = [
+            dataset.read_frame(
+                h5_file,
+                index,
+                spec["mappings"],
+                h5_path,
+                spec["master_timestamp_path"],
+                cache,
+            )
+            for index in range(dataset.episode_length(
+                h5_file,
+                spec["master_timestamp_path"],
+                h5_path,
+                cache,
+            ))
+        ]
+
+    np.testing.assert_array_equal(cache["target_timestamps"], timestamps)
+    np.testing.assert_array_equal(
+        [frame["observation.joint"][0] for frame in frames],
+        [0, 1, 2, 3, 4],
+    )
+    np.testing.assert_allclose(
+        [frame["observation.delta_q"][0] for frame in frames],
+        10.0,
+    )
+
+
+def test_raw_index_rejects_any_non_index_feature() -> None:
+    shape_meta = _raw_index_shape_meta()
+    shape_meta["features"]["observation.joint"].update(
+        {
+            "align": "previous",
+            "timestamp_path": "teleop/timestamp_us",
+        }
+    )
+
+    with pytest.raises(ValueError, match="raw_index.*must use align='index'"):
+        build_conversion_spec(shape_meta)
+
+
+def test_raw_index_infers_nominal_fps_from_median_interval(
+    tmp_path: Path,
+) -> None:
+    timestamps = np.asarray(
+        [0, 10_000, 20_100, 30_000, 530_000, 540_000],
+        dtype=np.int64,
+    )
+    with h5py.File(tmp_path / "episode.h5", "w") as h5_file:
+        h5_file.create_dataset("teleop/timestamp_us", data=timestamps)
+
+    dataset = H5Dataset(tmp_path, h5py=h5py, np=np)
+    shape_meta = _raw_index_shape_meta()
+    shape_meta.pop("fps")
+
+    resolved = resolve_raw_index_fps(shape_meta, dataset)
+
+    assert resolved["fps"] == 100
+
+
 def test_uniform_timestamps_use_configured_fps_and_master_bounds() -> None:
     master = np.asarray([1_000_000, 1_071_000, 1_129_000, 1_210_000], dtype=np.int64)
 
@@ -113,6 +384,202 @@ def test_uniform_timestamps_use_configured_fps_and_master_bounds() -> None:
         result,
         np.asarray([1_000_000, 1_100_000, 1_200_000], dtype=np.int64),
     )
+
+
+def test_fixed_phase_timestamps_use_absolute_50hz_grid() -> None:
+    master = np.asarray(
+        [1_000_007, 1_011_000, 1_025_000, 1_043_000],
+        dtype=np.int64,
+    )
+
+    result = _dataset().fixed_phase_timestamps(
+        master,
+        "teleop/timestamp_us",
+        fps=50,
+    )
+
+    np.testing.assert_array_equal(
+        result,
+        np.asarray([1_020_000, 1_040_000], dtype=np.int64),
+    )
+
+
+def test_fixed_rate_causal_snapshot_uses_one_historical_row_for_all_features() -> None:
+    shape_meta = {
+        "fps": 50,
+        "master_timestamp_path": "teleop/timestamp_us",
+        "sampling": {
+            "mode": "fixed_rate_causal_snapshot",
+            "phase": "unix_epoch",
+            "max_staleness_s": 0.03,
+        },
+        "features": {
+            "observation.joint": {
+                "dtype": "float32",
+                "shape": [1],
+                "h5_path": "teleop/q",
+                "timestamp_path": "teleop/timestamp_us",
+                "align": "previous",
+            },
+            "observation.delta_q": {
+                "dtype": "float32",
+                "shape": [1],
+                "sources": [
+                    {
+                        "h5_path": "teleop/q_cmd",
+                        "timestamp_path": "teleop/timestamp_us",
+                        "align": "previous",
+                    },
+                    {
+                        "h5_path": "teleop/q",
+                        "timestamp_path": "teleop/timestamp_us",
+                        "align": "previous",
+                    },
+                ],
+                "combine": "subtract",
+            },
+        },
+    }
+    spec = build_conversion_spec(shape_meta)
+    timestamps = np.asarray(
+        [1_000_007, 1_011_000, 1_025_000, 1_043_000],
+        dtype=np.int64,
+    )
+    datasets = {
+        "teleop/timestamp_us": timestamps,
+        "teleop/q": np.asarray([[0.0], [1.0], [2.0], [3.0]]),
+        "teleop/q_cmd": np.asarray([[10.0], [11.0], [12.0], [13.0]]),
+    }
+
+    cache = _dataset()._build_causal_snapshot_episode_cache(
+        dataset_cache=datasets,
+        timestamp_cache={"teleop/timestamp_us": timestamps},
+        mappings=spec["mappings"],
+        master_timestamp_path=spec["master_timestamp_path"],
+        fps=spec["fps"],
+        h5_path=Path("episode.h5"),
+        sampling=spec["sampling"],
+    )
+
+    np.testing.assert_array_equal(cache["snapshot_indices"], [1, 2])
+    np.testing.assert_allclose(cache["aligned"]["observation.joint"][:, 0], [1, 2])
+    np.testing.assert_allclose(cache["aligned"]["observation.delta_q"][:, 0], [10, 10])
+
+
+def test_fixed_rate_causal_snapshot_index_uses_selected_master_row() -> None:
+    shape_meta = {
+        "fps": 50,
+        "master_timestamp_path": "teleop/timestamp_us",
+        "sampling": {
+            "mode": "fixed_rate_causal_snapshot",
+            "phase": "unix_epoch",
+        },
+        "features": {
+            "observation.joint": {
+                "dtype": "float32",
+                "shape": [1],
+                "h5_path": "teleop/q",
+                "align": "index",
+            }
+        },
+    }
+    spec = build_conversion_spec(shape_meta)
+    timestamps = np.asarray(
+        [1_000_007, 1_011_000, 1_025_000, 1_043_000],
+        dtype=np.int64,
+    )
+    datasets = {
+        "teleop/timestamp_us": timestamps,
+        "teleop/q": np.asarray([[0.0], [1.0], [2.0], [3.0]]),
+    }
+
+    cache = _dataset()._build_causal_snapshot_episode_cache(
+        dataset_cache=datasets,
+        timestamp_cache={"teleop/timestamp_us": timestamps},
+        mappings=spec["mappings"],
+        master_timestamp_path=spec["master_timestamp_path"],
+        fps=spec["fps"],
+        h5_path=Path("episode.h5"),
+        sampling=spec["sampling"],
+    )
+
+    np.testing.assert_array_equal(cache["snapshot_indices"], [1, 2])
+    np.testing.assert_allclose(cache["aligned"]["observation.joint"][:, 0], [1, 2])
+
+
+def test_fixed_rate_causal_snapshot_rejects_noncausal_feature_alignment() -> None:
+    shape_meta = {
+        "fps": 50,
+        "master_timestamp_path": "teleop/timestamp_us",
+        "sampling": {"mode": "fixed_rate_causal_snapshot"},
+        "features": {
+            "observation.joint": {
+                "dtype": "float32",
+                "shape": [1],
+                "h5_path": "teleop/q",
+                "timestamp_path": "teleop/timestamp_us",
+                "align": "nearest",
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="must use align='previous'"):
+        build_conversion_spec(shape_meta)
+
+
+def test_structured_sources_support_direct_index_alignment() -> None:
+    spec = build_conversion_spec(
+        {
+            "fps": 50,
+            "master_timestamp_path": "teleop/timestamp_us",
+            "features": {
+                "observation.delta_q": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "sources": [
+                        {"h5_path": "teleop/q_cmd", "align": "index"},
+                        {"h5_path": "teleop/q", "align": "index"},
+                    ],
+                    "combine": "subtract",
+                }
+            },
+        }
+    )
+
+    mapping = spec["mappings"][0]
+    assert [source["method"] for source in mapping["sources"]] == [
+        "index",
+        "index",
+    ]
+    assert all(source["timestamp_path"] is None for source in mapping["sources"])
+
+
+def test_index_alignment_rejects_source_length_mismatch() -> None:
+    spec = build_conversion_spec(
+        {
+            "fps": 50,
+            "master_timestamp_path": "teleop/timestamp_us",
+            "features": {
+                "observation.joint": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "h5_path": "teleop/q",
+                    "align": "index",
+                }
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires exactly 3 rows"):
+        _dataset()._validate_index_sources(
+            dataset_cache={"teleop/q": np.zeros((2, 1), dtype=np.float32)},
+            timestamp_cache={
+                "teleop/timestamp_us": np.asarray([100, 200, 300], dtype=np.int64)
+            },
+            mappings=spec["mappings"],
+            master_timestamp_path=spec["master_timestamp_path"],
+            h5_path=Path("episode.h5"),
+        )
 
 
 def test_nearest_alignment_selects_latest_historical_sample() -> None:
@@ -128,6 +595,75 @@ def test_nearest_alignment_rejects_target_before_first_sample() -> None:
 
     with pytest.raises(ValueError, match="No historical sample"):
         _dataset()._history_index_from_timestamps(timestamps, 99)
+
+
+@pytest.mark.parametrize(
+    ("target_t", "expected_index"),
+    [
+        (100, 0),
+        (149, 0),
+        (150, 0),
+        (199, 0),
+        (200, 1),
+        (299, 1),
+        (301, 2),
+    ],
+)
+def test_nearest_point_sampling_selects_latest_historical_sample(
+    target_t: int,
+    expected_index: int,
+) -> None:
+    timestamps = np.asarray([100, 200, 300], dtype=np.float64)
+
+    result = _dataset()._point_sample_indices(
+        timestamps,
+        np.asarray([target_t], dtype=np.float64),
+        method="nearest",
+    )
+
+    assert int(result[0]) == expected_index
+
+
+def test_nearest_point_sampling_rejects_target_before_first_sample() -> None:
+    with pytest.raises(ValueError, match="outside the source timestamp range"):
+        _dataset()._point_sample_indices(
+            np.asarray([100, 200, 300], dtype=np.float64),
+            np.asarray([99], dtype=np.float64),
+            method="nearest",
+        )
+
+
+def test_nearest_source_allows_stale_samples() -> None:
+    spec = build_conversion_spec(
+        {
+            "fps": 50,
+            "master_timestamp_path": "teleop/timestamp_us",
+            "features": {
+                "observation.delta_q": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "sources": [
+                        {
+                            "h5_path": "teleop/q_cmd",
+                            "timestamp_path": "teleop/timestamp_us",
+                            "align": "nearest",
+                            "allow_stale": True,
+                        },
+                        {
+                            "h5_path": "teleop/q_follower",
+                            "timestamp_path": "teleop/timestamp_us",
+                            "align": "nearest",
+                        },
+                    ],
+                    "combine": "subtract",
+                }
+            },
+        }
+    )
+
+    command_source = spec["mappings"][0]["sources"][0]
+    assert command_source["method"] == "nearest"
+    assert command_source["allow_stale"] is True
 
 
 def test_pchip_alignment_requires_a_bounded_gap() -> None:

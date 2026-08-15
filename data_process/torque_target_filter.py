@@ -25,7 +25,24 @@ def torque_target_filter_config(
     if not bool(filter_config.get("enabled", True)):
         return None
 
-    median_window = int(filter_config.get("median_window", 1))
+    has_moving_average = "moving_average_window" in filter_config
+    has_legacy_median = "median_window" in filter_config
+    if has_moving_average and has_legacy_median:
+        raise ValueError(
+            "model.target_filter must not define both moving_average_window "
+            "and median_window"
+        )
+    if has_moving_average:
+        filter_mode = "moving_average"
+        filter_window = int(filter_config["moving_average_window"])
+    elif has_legacy_median:
+        # Preserve old checkpoints exactly. New configs should use
+        # moving_average_window instead of median_window.
+        filter_mode = "median"
+        filter_window = int(filter_config["median_window"])
+    else:
+        filter_mode = "moving_average"
+        filter_window = 1
     apply_additional_lowpass = bool(
         filter_config.get("apply_additional_lowpass", False)
     )
@@ -41,15 +58,48 @@ def torque_target_filter_config(
             raise ValueError(
                 "model.target_filter.cutoff_hz must be positive and finite"
             )
-    if median_window < 1 or median_window % 2 == 0:
+    if filter_window < 1:
+        raise ValueError("model.target_filter window must be a positive integer")
+    if filter_mode == "median" and filter_window % 2 == 0:
         raise ValueError(
             "model.target_filter.median_window must be a positive odd integer"
         )
     return {
         "cutoff_hz": cutoff_hz,
-        "median_window": median_window,
+        "mode": filter_mode,
+        "window": filter_window,
         "apply_additional_lowpass": apply_additional_lowpass,
     }
+
+
+def causal_trailing_moving_average(
+    values: np.ndarray | torch.Tensor,
+    *,
+    window: int,
+) -> np.ndarray:
+    """Apply a causal trailing boxcar average without crossing an episode."""
+
+    samples = np.asarray(values, dtype=np.float64)
+    if samples.ndim != 2 or len(samples) == 0:
+        raise ValueError("moving average expects non-empty values [N, D]")
+    if not np.isfinite(samples).all():
+        raise ValueError("moving average inputs must be finite")
+    if window < 1:
+        raise ValueError("moving average window must be positive")
+    if window == 1:
+        return samples.copy()
+    padded = np.concatenate(
+        [np.repeat(samples[:1], window - 1, axis=0), samples],
+        axis=0,
+    )
+    cumulative = np.concatenate(
+        [
+            np.zeros((1, samples.shape[1]), dtype=np.float64),
+            padded.cumsum(axis=0),
+        ],
+        axis=0,
+    )
+    return (cumulative[window:] - cumulative[:-window]) / float(window)
 
 
 def filter_torque_target_episode(
@@ -61,17 +111,37 @@ def filter_torque_target_episode(
 
     timestamps = np.asarray(timestamps_s, dtype=np.float64).reshape(-1)
     tau = np.asarray(tau_nm, dtype=np.float64)
-    median_window = int(filter_config["median_window"])
-    if not bool(filter_config["apply_additional_lowpass"]):
-        return causal_trailing_median_filter(
+    filter_mode = str(filter_config["mode"])
+    filter_window = int(filter_config["window"])
+    if filter_mode == "moving_average":
+        filtered = causal_trailing_moving_average(
             tau,
-            median_window=median_window,
+            window=filter_window,
+        )
+    elif filter_mode == "median":
+        filtered = causal_trailing_median_filter(
+            tau,
+            median_window=filter_window,
+        )
+    else:
+        raise ValueError(f"unsupported torque target filter mode: {filter_mode!r}")
+
+    if not bool(filter_config["apply_additional_lowpass"]):
+        return filtered
+    if filter_mode == "median":
+        # Keep the exact legacy median-then-one-pole implementation for old
+        # checkpoints.
+        return causal_median_one_pole_filter(
+            timestamps,
+            tau,
+            cutoff_hz=float(filter_config["cutoff_hz"]),
+            median_window=filter_window,
         )
     return causal_median_one_pole_filter(
         timestamps,
-        tau,
+        filtered,
         cutoff_hz=float(filter_config["cutoff_hz"]),
-        median_window=median_window,
+        median_window=1,
     )
 
 

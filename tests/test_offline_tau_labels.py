@@ -6,6 +6,7 @@ import numpy as np
 from data_process.offline_tau_labels import (
     KalmanRTSConfig,
     causal_median_one_pole_filter,
+    estimate_joint_states_causal,
     estimate_joint_states_rts,
     fill_missing_measurements,
     residual_torque,
@@ -44,6 +45,23 @@ def test_rts_acceleration_beats_velocity_differencing_with_jittered_timestamps()
     assert smoothed_rmse < causal_rmse < naive_rmse
     assert estimate.ddq_smoothed_std.shape == q.shape
     assert np.all(estimate.ddq_smoothed_std >= 0.0)
+
+
+def test_causal_estimator_matches_rts_forward_pass_and_ignores_future_changes():
+    timestamps, q, dq, _ = _noisy_motion(sample_count=120)
+
+    causal = estimate_joint_states_causal(timestamps, q, dq)
+    rts = estimate_joint_states_rts(timestamps, q, dq)
+    changed_q = q.copy()
+    changed_dq = dq.copy()
+    changed_q[80:] += 100.0
+    changed_dq[80:] -= 100.0
+    changed = estimate_joint_states_causal(timestamps, changed_q, changed_dq)
+
+    np.testing.assert_allclose(causal.q_filtered, rts.q_filtered)
+    np.testing.assert_allclose(causal.dq_filtered, rts.dq_filtered)
+    np.testing.assert_allclose(causal.ddq_filtered, rts.ddq_filtered)
+    np.testing.assert_allclose(changed.ddq_filtered[:80], causal.ddq_filtered[:80])
 
 
 def test_missing_observations_are_smoothed_and_long_gaps_start_new_segments():

@@ -1,0 +1,78 @@
+io:
+  input: nero_ws/runs/wipe_board
+  # Keep the previous fixed-grid dataset intact; write the camera-row version
+  # to a new destination.
+  output: data/train_episode/wipe_board_camera_rows_lbv3
+  repo_id: wipe_board_camera_rows_lbv3
+  max_episodes: null
+  no_videos: false
+  push_to_hub: false
+
+task: wipe_board
+
+# One LeRobot row per recorded wrist-camera frame. No uniform timeline is
+# generated: every retained row keeps the exact raw wrist timestamp.
+fps: 25
+master_timestamp_path: cameras/wrist/timestamp_us
+
+timeline:
+  mode: camera_rows
+  # Four latest raw teleop rows at or before each wrist timestamp.
+  history_size: 4
+  # DP assembles eight future rows from per-row single-point actions.
+  action_horizon: 8
+  # One verified teleop interval in episode 51 is 19.063 ms; 20 ms accepts
+  # that isolated jitter while still rejecting a missing 100 Hz sample chain.
+  max_gap_s: 0.020
+  store_timestamps: true
+
+features:
+  observation.images.wrist:
+    dtype: video
+    shape: [192, 256, 3]
+    h5_path: cameras/wrist/frames
+    timestamp_path: cameras/wrist/timestamp_us
+    grid: low_anchor
+    resample: previous
+    allow_stale: true
+    emit_age_key: wrist
+
+  observation.images.side:
+    dtype: video
+    shape: [192, 256, 3]
+    h5_path: cameras/side/frames
+    timestamp_path: cameras/side/timestamp_us
+    grid: low_anchor
+    resample: previous
+    allow_stale: true
+    emit_age_key: side
+
+  # At every image anchor, retain the four most recent raw wrench rows.
+  observation.wrench_ext:
+    dtype: float32
+    shape: [4, 6]
+    h5_path: teleop/wrench_cal
+    timestamp_path: teleop/timestamp_us
+    grid: high_past
+    resample: previous
+
+  # Store one action per camera row. Select the first teleop pose whose
+  # timestamp is at or after this real camera timestamp. Diffusion Policy must
+  # use action_layout=per_step and horizon=8 to collect eight consecutive rows.
+  action.ee_pose:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/ee_pose_follower
+    timestamp_path: teleop/timestamp_us
+    grid: low_anchor
+    resample: next
+    transform: ee_pose_matrix_to_quaternion
+
+  # The joint target uses the same first-at-or-after timestamp rule.
+  action.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    timestamp_path: teleop/timestamp_us
+    grid: low_anchor
+    resample: next

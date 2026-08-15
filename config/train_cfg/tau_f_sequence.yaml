@@ -1,10 +1,11 @@
 dataloader:
-  repo_id: tau_refinement_matched_lerobotv3
-  root: data/train_episode/tau_refinement_matched_lerobotv3
+  repo_id: bg_data_filted_a_lbv3
+  root: data/train_episode/bg_data_filted_a_lbv3
   load_images: false
   video_backend: torchcodec
+  filter_sample_rate_hz: 50
 
-  # FACTR 2/NEXT uses a 50-step history at 100 Hz.
+  # The dual-phase B dataset is stored on a uniform 50 Hz LeRobot timeline.
   horizon: 50
   # NEXT-style samples contain 50 real frames; do not train on zero-padded starts.
   pad_history: false
@@ -12,47 +13,86 @@ dataloader:
   lowdim_keys:
     q: observation.joint
     dq: observation.velocity
-    ddq: observation.acceleration
+    ddq: observation.ddq
     delta_q: observation.delta_q
-    tau: observation.torque
+    tau_id: observation.tau_id
     tau_f: observation.tau_f
+    tau: observation.torque
 
   normalize_mode: gaussian
   normalize_lowdim_keys:
     - q
     - dq
+    - ddq
     - delta_q
+    # - tau_id
+    # - tau
     - tau_f
+
+  # Apply the same resolved torque operations independently to measured tau and
+  # derived RNEA tau_id on the dataset's 50 Hz timeline.
+  filter_timestamp_key: timestamp
+  filter_timestamp_unit: s
+  filters:
+    q:
+      enabled: false
+      operations: []
+    dq:
+      enabled: false
+      operations: []
+    tau:
+      enabled: false
+      operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+
+# Build supervision once from each complete episode before normalization and
+# mini-batch sampling. This resolved contract is also stored in every checkpoint.
+target_generation:
+  enabled: true
+  method: causal_rnea_residual_v1
+  target_key: tau_f
+  timestamp_key: timestamp
+  timestamp_unit: s
+  source_keys: {q: q, dq: dq, tau: tau}
+  dq_sign: [1, 1, 1, 1, 1, 1, 1]
+  rnea_state_source: measured
+  torque_filter_key: tau
+  state_estimator:
+    position_std: 5.0e-4
+    velocity_std: 3.0e-2
+    jerk_std: 2.0
+    initial_position_std: 1.0e-2
+    initial_velocity_std: 2.0e-1
+    initial_acceleration_std: 5.0
+    max_gap_s: 0.1
 
 model:
   # Every window is independent. The causal TCN has an exact 50-frame
   # receptive field and an explicit current-state skip.
   history_mode: stateless_sliding_window
   architecture: lstm
-  tcn_kernel_size: 2
-  tcn_dilations: [1, 2, 4, 8, 16, 18]
+  # tcn_kernel_size: 2
+  # tcn_dilations: [1, 2, 4, 8, 16, 18]
 
   # Remove entries here to run input ablations without changing code.
   inputs:
     - q
     - dq
+    - ddq
     - delta_q
+    # - tau
 
 
   input_dims:
     q: 7
     dq: 7
+    ddq: 7
     delta_q: 7
+    # tau: 7
 
   output_dim: 7
   target_key: tau_f
-  # Deployment validates this contract before enabling tau_ext_cal.
-  target_contract: matched_causal_torque_filter_v1
-  # Contract metadata only: do not post-filter tau_f or tau_f_pred. It records
-  # the source filter shared by measured tau and independently computed tau_id.
-  target_filter:
-    cutoff_hz: 10.0
-    median_window: 1
+  target_contract: causal_rnea_residual_v1
 
 
   hidden_dim: 128
@@ -62,22 +102,19 @@ model:
   head_hidden_dim: 256
   head_num_layers: 2
   activation: relu
-  dropout: 0.2
+  dropout: 0.1
 
 loss:
   # Ordinary seven-axis MSE in normalized target space. The tau_f rollout below
   # is visualization-only and does not add a wrench term to this training loss.
   type: mse
   # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
-  joint_weights: null
+  joint_weights: [1, 1, 1, 1, 1, 1, 1]
 
 # Offline visualization replays the same causal state/RNEA/filter chain used by
 # nero_ws before mapping tau_ext to the gripper-frame wrench.
 rollout:
   measured_tau_already_filtered: true
-  matched_torque_filter:
-    cutoff_hz: 10.0
-    median_window: 1
 
 physics:
   wrench_damping: 0.02
@@ -92,14 +129,15 @@ train:
   # The low-dimensional cache is device-resident; workers only emit indices.
   batch_size: 512
   num_workers: 2
-  val_ratio: 0.1
+  # val_ratio: 0.1
 
   # Random windows keep mixed motion regimes represented on both sides. This
   # is an interpolation/checkpoint-ranking split, not an unbiased generalization test.
-  split_mode: sample
+  split_mode:  episode
+  val_episode_indices: [21]
   seed: 42
 
-  lr: 1.0e-4
+  lr: 1.0e-3
   weight_decay: 1.0e-4
   num_epochs: 1000
   gradient_clip_norm: 1.0
@@ -121,7 +159,7 @@ train:
     warmup_epochs: 10
     min_delta: 1.0e-5
 
-  output_dir: outputs/tau_f_sequence/lstm
+  output_dir: outputs/tau_f_sequence/ep3
   monitor_key: val_loss
   top_k: 5
 

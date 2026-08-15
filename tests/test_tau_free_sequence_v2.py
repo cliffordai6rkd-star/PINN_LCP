@@ -18,12 +18,14 @@ CONFIG_PATH = (
     Path(__file__).resolve().parents[1]
     / "config"
     / "train_cfg"
+    / "tau_free_sequence"
     / "tau_free_sequence_v2.yaml"
 )
 PHYSICAL_MSE_CONFIG_PATH = (
     Path(__file__).resolve().parents[1]
     / "config"
     / "train_cfg"
+    / "tau_free_sequence"
     / "tau_free_sequence_v2_sample_lstm_physical_mse_noema.yaml"
 )
 
@@ -52,19 +54,17 @@ def test_v2_config_matches_q_history_to_measured_torque_contract():
     assert config["dataloader"]["lowdim_keys"]["tau"] == "observation.torque"
     assert config["model"]["inputs"] == ["q", "dq", "delta_q"]
     assert config["model"]["target_key"] == "tau"
-    assert config["model"]["architecture"] == "tcn"
-    assert config["model"]["tcn_kernel_size"] == 2
-    assert config["model"]["tcn_dilations"] == [1, 2, 4, 8, 16, 18]
-    assert config["train"]["val_ratio"] == pytest.approx(0.3)
-    assert config["train"]["split_mode"] == "episode"
-    assert config["train"]["lr"] == pytest.approx(1.0e-3)
-    assert config["train"]["monitor_key"] == "val_wrench_force_norm_p95_n"
-    assert config["train"]["scheduler_monitor_key"] == "val_tau_mse"
-    assert config["train"]["early_stopping_monitor_key"] == "val_tau_mse"
+    assert config["model"]["architecture"] == "lstm"
+    assert config["model"]["hidden_dim"] == 128
+    assert config["model"]["num_layers"] == 2
+    assert config["train"]["val_ratio"] == pytest.approx(0.1)
+    assert config["train"]["split_mode"] == "sample"
+    assert config["train"]["lr"] == pytest.approx(1.0e-4)
+    assert config["train"]["monitor_key"] == "val_peak_cvar_rmse_nm"
     assert config["loss"] == {
         "type": "mse",
         "tau_weight": 1.0,
-        "wrench_weight": 0.01,
+        "wrench_weight": 0,
         "force_scale_n": 1.0,
         "moment_scale_nm": 0.1,
         "joint_weights": None,
@@ -110,29 +110,38 @@ def test_v2_pure_mse_disables_jacobian_pipeline():
     assert trainer.wrench_dynamics is None
 
 
-def test_physical_mse_config_is_tau_free_only_and_uses_filtered_manual_target():
+def test_physical_mse_config_uses_direct_h5_and_current_aligned_target():
     config = load_physical_mse_config()
 
-    assert config["model"]["target_key"] == "tau"
-    assert config["model"]["target_filter"] == {
-        "enabled": True,
-        "median_window": 3,
-        "apply_additional_lowpass": False,
-        "timestamp_key": "timestamp",
+    assert config["dataloader"]["backend"] == "h5"
+    assert config["dataloader"]["h5_timestamp_path"] == "teleop/timestamp_us"
+    assert config["dataloader"]["expected_fps"] == 100
+    assert config["dataloader"]["horizon"] == 50
+    assert config["dataloader"]["pad_history"] is False
+    assert config["dataloader"]["h5_fields"]["observation.delta_q"] == {
+        "operation": "subtract",
+        "paths": ["teleop/q_cmd", "teleop/q_follower"],
     }
+    assert config["model"]["target_key"] == "tau"
+    assert config["dataloader"]["filters"]["tau"] == {
+        "enabled": True,
+        "dataset_preprocessed_operations": [
+            {"type": "lowpass", "cutoff_hz": 10.0}
+        ],
+        "operations": [
+            {"type": "lowpass", "cutoff_hz": 10.0},
+            {"type": "median", "window": 3},
+        ],
+    }
+    assert "target_filter" not in config["model"]
     assert config["loss"]["torque_loss_space"] == "physical_nm"
     assert config["loss"]["joint_weight_mode"] == "manual"
-    assert config["loss"]["joint_weights"] == [
-        1.0,
-        3.5,
-        1.0,
-        0.7,
-        0.25,
-        0.25,
-        0.3,
-    ]
+    assert config["loss"]["joint_weights"] == [1, 2.5, 1, 2.5, 1, 1, 1]
     assert config["loss"]["wrench_weight"] == 0.0
     assert config["train"]["lr"] == pytest.approx(1.0e-3)
+    assert config["train"]["split_mode"] == "episode"
+    assert config["train"]["val_episode_indices"] == [7, 8, 31, 32]
+    assert config["train"]["output_dir"] == "outputs/tau_free_sequence/final_v"
     assert config["train"]["ema"]["enabled"] is False
     assert config["train"]["monitor_key"] == "val_tau_mse_nm2"
 
@@ -232,11 +241,11 @@ def test_automatic_joint_weights_use_physical_training_targets(mode):
     torch.testing.assert_close(weights.mean(), torch.tensor(1.0))
 
 
-def test_tau_target_filter_resets_at_episode_boundaries_and_skips_second_lowpass():
+def test_tau_target_moving_average_resets_at_episode_boundaries_and_skips_second_lowpass():
     config = {
         "model": {
             "target_filter": {
-                "median_window": 3,
+                "moving_average_window": 3,
                 "apply_additional_lowpass": False,
             }
         }
@@ -254,15 +263,41 @@ def test_tau_target_filter_resets_at_episode_boundaries_and_skips_second_lowpass
 
     torch.testing.assert_close(
         filtered,
-        torch.tensor([[0.0], [0.0], [0.0], [5.0], [5.0], [5.0]]),
+        torch.tensor(
+            [[0.0], [10.0 / 3.0], [10.0 / 3.0], [5.0], [20.0], [20.0]]
+        ),
     )
+
+
+def test_legacy_tau_target_median_filter_remains_checkpoint_compatible():
+    config = {
+        "model": {
+            "target_filter": {
+                "median_window": 3,
+                "apply_additional_lowpass": False,
+            }
+        }
+    }
+    filter_config = torque_target_filter_config(config)
+    timestamps = torch.tensor([0.00, 0.01, 0.02])
+    tau = torch.tensor([[0.0], [10.0], [0.0]])
+
+    filtered = filter_torque_target_dataset(
+        timestamps,
+        tau,
+        [(0, 3)],
+        filter_config,
+    )
+
+    assert filter_config["mode"] == "median"
+    torch.testing.assert_close(filtered, torch.zeros_like(tau))
 
 
 def test_additional_lowpass_requires_an_explicit_cutoff():
     config = {
         "model": {
             "target_filter": {
-                "median_window": 3,
+                "moving_average_window": 3,
                 "apply_additional_lowpass": True,
             }
         }
@@ -296,11 +331,64 @@ def test_v2_model_uses_configured_inputs_and_last_measured_torque():
 
     assert trainer.model.active_inputs == ["q", "dq", "delta_q"]
     assert trainer.model.input_dim == 21
-    assert trainer.model.temporal_receptive_field == 50
+    assert trainer.model.recurrent.input_size == 21
     assert loss.ndim == 0
     torch.testing.assert_close(out["tau_f_target"], tau[:, -1])
-    assert out["wrench_pred"].shape == (3, 6)
-    assert "wrench_mse_scaled" in out["loss_dict"]
+    torch.testing.assert_close(out["_target_nm"], tau[:, -1])
+    assert "wrench_pred" not in out
+    assert "wrench_mse_scaled" not in out["loss_dict"]
+
+
+def test_v2_validation_reports_joint_normalized_mae_metrics():
+    class FixedPredictionModel(torch.nn.Module):
+        def forward(self, batch):
+            return {
+                "tau_f_pred": batch["prediction"],
+                "tau_f_target": batch["target"],
+            }
+
+    config = load_config()
+    config["train"]["device"] = "cpu"
+    trainer = TauFreeSequenceTrainerV2(config)
+    trainer.device = "cpu"
+    trainer.dataset = SimpleNamespace(
+        normalize_mode=None,
+        normalize_lowdim_keys=[],
+    )
+    trainer.model = FixedPredictionModel()
+    levels = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    trainer.val_loader = torch.utils.data.DataLoader(
+        [
+            {
+                "prediction": torch.full((7,), level + 1.0),
+                "target": torch.full((7,), level),
+            }
+            for level in levels
+        ],
+        batch_size=2,
+    )
+
+    trainer.validate_one_epoch(epoch=0)
+
+    metrics = trainer.last_val_epoch_metrics
+    expected_std = levels.std().item()
+    expected_range = (
+        torch.quantile(levels, 0.95) - torch.quantile(levels, 0.05)
+    ).item()
+    for joint_index in range(1, 8):
+        assert metrics[f"joint_mae_nm_j{joint_index}"] == pytest.approx(1.0)
+        assert metrics[f"joint_tau_std_nm_j{joint_index}"] == pytest.approx(
+            expected_std
+        )
+        assert metrics[f"joint_nmae_std_j{joint_index}"] == pytest.approx(
+            1.0 / (expected_std + 1.0e-8)
+        )
+        assert metrics[f"joint_tau_p90_range_nm_j{joint_index}"] == pytest.approx(
+            expected_range
+        )
+        assert metrics[f"joint_nmae_p90_j{joint_index}"] == pytest.approx(
+            1.0 / (expected_range + 1.0e-8)
+        )
 
 
 def test_tau_wrench_loss_backpropagates_through_torque_prediction():

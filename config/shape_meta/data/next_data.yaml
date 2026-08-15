@@ -1,0 +1,49 @@
+io:
+  # Resolved to the sibling repository regardless of the launch directory.
+  input: nero_ws/runs/next_background_data_filted
+  output: data/train_episode/next_bg_data50hz_lbv3
+  repo_id: next_bg_data50hz_lbv3
+  max_episodes: null
+  no_videos: True
+  push_to_hub: false
+
+task: next_bg_data50hz_lbv3
+master_timestamp_path: teleop/timestamp_us
+fps: 50
+
+# Match online NEXT inference: every Unix-epoch-aligned 20 ms tick selects the
+# latest complete recorder row at or before that tick.
+sampling:
+  mode: fixed_rate_causal_snapshot
+  phase: unix_epoch
+  max_staleness_s: 1
+
+features:
+  observation.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    align: index
+
+  observation.velocity:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/dq_follower
+    align: index
+
+  # Read command and measured position from the selected row before subtracting.
+  observation.delta_q:
+    dtype: float32
+    shape: [7]
+    sources:
+      - h5_path: teleop/q_cmd
+        align: index
+      - h5_path: teleop/q_follower
+        align: index
+    combine: subtract
+
+  observation.torque:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_follower
+    align: index

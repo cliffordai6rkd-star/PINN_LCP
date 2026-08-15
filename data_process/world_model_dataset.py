@@ -1,9 +1,8 @@
 """Training dataset for the torque state world model.
 
-The converter stores state streams at the high-rate grid and keeps action
-chunks on the low-rate expert schedule.  This module is deliberately separate
-from the legacy packed-stream loader: state, action, and timing have different
-contracts and must not be flattened into one index space.
+The preferred H5 backend consumes an already uniform, shared state timeline
+without running a dataset converter.  The legacy LeRobot packed backend remains
+available for old experiments.
 """
 
 from __future__ import annotations
@@ -48,24 +47,48 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         "wrench": "observation.wrench_ext",
         "reference_pose": "reference.ee_pose",
     }
+    DEFAULT_H5_HIGH_FIELDS = {
+        "q": "teleop/q_follower",
+        "dq": "teleop/dq_follower",
+        "ddq": "teleop/ddq_follower",
+        "tau": "teleop/tau_follower",
+        "wrench": "teleop/wrench_ext",
+        "reference_pose": {
+            "path": "teleop/ee_pose_follower",
+            "transform": "ee_pose_matrix_to_quaternion",
+        },
+    }
 
     def __init__(self, config, normalizer=None, compute_normalizer=False):
         self.config = config
         self.data_config = config.get("dataloader") or {}
+        self.backend = str(self.data_config.get("backend", "lerobot")).lower()
         self.repo_id = self.data_config.get("repo_id")
         root = self.data_config.get("root")
         self.root = Path(root) if root is not None else None
-        if not self.repo_id or self.root is None:
-            raise ValueError("dataloader.repo_id and dataloader.root are required")
-
-        LeRobotDataset = _load_lerobot_dataset_class()
-        self.source_dataset = LeRobotDataset(
-            repo_id=self.repo_id,
-            root=self.root,
-            video_backend=self.data_config.get("video_backend", "torchcodec"),
-            download_videos=False,
-        )
-        self.stats_dataset = self.source_dataset.hf_dataset
+        if self.root is None:
+            raise ValueError("dataloader.root is required")
+        if self.backend not in {"lerobot", "h5"}:
+            raise ValueError(
+                "dataloader.backend must be 'lerobot' or 'h5', "
+                f"got {self.backend!r}"
+            )
+        if self.backend == "lerobot":
+            if not self.repo_id:
+                raise ValueError(
+                    "dataloader.repo_id is required for backend=lerobot"
+                )
+            LeRobotDataset = _load_lerobot_dataset_class()
+            self.source_dataset = LeRobotDataset(
+                repo_id=self.repo_id,
+                root=self.root,
+                video_backend=self.data_config.get("video_backend", "torchcodec"),
+                download_videos=False,
+            )
+            self.stats_dataset = self.source_dataset.hf_dataset
+        else:
+            self.source_dataset = None
+            self.stats_dataset = None
 
         self.history_horizon = int(
             self.data_config.get(
@@ -110,12 +133,24 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             **self.DEFAULT_HIGH_KEYS,
             **(self.data_config.get("high_keys") or {}),
         }
+        self.h5_high_fields = {
+            **self.DEFAULT_H5_HIGH_FIELDS,
+            **(self.data_config.get("h5_high_fields") or {}),
+        }
         self._validate_config()
 
-        self.high_tensors, self.high_timestamps, self.anchor_timestamps = (
-            self._load_columns()
-        )
-        self.episodes = self._build_virtual_episodes()
+        if self.backend == "h5":
+            (
+                self.high_tensors,
+                self.high_timestamps,
+                self.anchor_timestamps,
+                self.episodes,
+            ) = self._load_h5_columns()
+        else:
+            self.high_tensors, self.high_timestamps, self.anchor_timestamps = (
+                self._load_columns()
+            )
+            self.episodes = self._build_virtual_episodes()
         self.dataset = SimpleNamespace(meta=SimpleNamespace(episodes=self.episodes))
 
         self.contact_gate_config = ContactGateConfig.from_config(config)
@@ -161,6 +196,19 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "dataloader.action_resample must be pose, nearest, or previous"
             )
+        sampling_dt = (
+            ((self.config.get("model") or {}).get("state_estimator") or {}).get(
+                "sampling_dt"
+            )
+        )
+        if sampling_dt is not None:
+            expected_dt = 1.0 / self.high_fps
+            if abs(float(sampling_dt) - expected_dt) > 1.0e-9:
+                raise ValueError(
+                    "model.state_estimator.sampling_dt must equal "
+                    f"1/dataloader.high_fps ({expected_dt:g}), got "
+                    f"{float(sampling_dt):g}"
+                )
 
     @staticmethod
     def _as_tensor(value, dtype=None):
@@ -238,6 +286,116 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         ) + 1
         return high_tensors, high_ts, anchor_ts
 
+    def _load_h5_columns(self):
+        """Load native uniform H5 rows exactly once, without time alignment."""
+
+        from data_process.h5_direct_dataset import (
+            DirectH5EpisodeDataset,
+            load_h5py,
+            read_h5_array,
+            timestamp_scale_to_seconds,
+        )
+
+        timestamp_path = str(
+            self.data_config.get("h5_timestamp_path", "teleop/timestamp_us")
+        )
+        timestamp_unit = str(self.data_config.get("h5_timestamp_unit", "us"))
+        anchor_timestamp_path = str(
+            self.data_config.get(
+                "h5_anchor_timestamp_path", "cameras/wrist/timestamp_us"
+            )
+        )
+        anchor_timestamp_unit = str(
+            self.data_config.get("h5_anchor_timestamp_unit", timestamp_unit)
+        )
+        patterns = tuple(
+            self.data_config.get("h5_patterns", ["*.h5", "*.hdf5"])
+        )
+        direct = DirectH5EpisodeDataset(
+            root=self.root,
+            fields=self.h5_high_fields,
+            timestamp_path=timestamp_path,
+            timestamp_output_key="__h5_timestamp_ns",
+            timestamp_unit=timestamp_unit,
+            timestamp_output_unit="ns",
+            patterns=patterns,
+            max_episodes=self.data_config.get("max_episodes"),
+            expected_fps=self.high_fps,
+            max_cadence_error_s=float(
+                self.data_config.get("max_cadence_error_s", 1.0e-6)
+            ),
+        )
+        columns = direct.hf_dataset[:]
+        high_tensors = {
+            key: self._as_tensor(columns[key], dtype=torch.float32).contiguous()
+            for key in self.h5_high_fields
+        }
+        high_ts = self._as_tensor(
+            columns["__h5_timestamp_ns"], dtype=torch.int64
+        ).reshape(-1).contiguous()
+
+        h5py = load_h5py()
+        anchor_scale_to_ns = timestamp_scale_to_seconds(
+            anchor_timestamp_unit
+        ) / 1.0e-9
+        rounded_anchor_scale = round(anchor_scale_to_ns)
+        anchor_buffers = []
+        episodes = []
+        anchor_offset = 0
+        for episode, path in zip(direct.meta.episodes, direct.files):
+            with h5py.File(path, "r") as h5_file:
+                raw_anchor = torch.as_tensor(
+                    read_h5_array(h5_file, anchor_timestamp_path)
+                ).reshape(-1)
+            if raw_anchor.numel() == 0:
+                raise ValueError(f"H5 episode {path.name} has no action anchors")
+            if (
+                not raw_anchor.is_floating_point()
+                and abs(anchor_scale_to_ns - rounded_anchor_scale) < 1.0e-12
+            ):
+                anchor_ns = raw_anchor.to(dtype=torch.int64) * int(
+                    rounded_anchor_scale
+                )
+            else:
+                anchor_ns = (
+                    raw_anchor.to(dtype=torch.float64) * anchor_scale_to_ns
+                ).round().to(dtype=torch.int64)
+            if anchor_ns.numel() > 1 and torch.any(torch.diff(anchor_ns) <= 0):
+                raise ValueError(
+                    f"H5 action anchors must be strictly increasing in {path.name}"
+                )
+            start = int(episode["dataset_from_index"])
+            end = int(episode["dataset_to_index"])
+            episode_high_ts = high_ts[start:end]
+            if int(anchor_ns[-1]) < int(episode_high_ts[0]) or int(
+                anchor_ns[0]
+            ) > int(episode_high_ts[-1]):
+                raise ValueError(
+                    f"H5 action-anchor clock does not overlap the state clock in "
+                    f"{path.name}"
+                )
+            episodes.append(
+                {
+                    **dict(episode),
+                    "anchor_from_index": anchor_offset,
+                    "anchor_to_index": anchor_offset + int(anchor_ns.numel()),
+                }
+            )
+            anchor_buffers.append(anchor_ns.contiguous())
+            anchor_offset += int(anchor_ns.numel())
+
+        anchor_ts = torch.cat(anchor_buffers, dim=0).contiguous()
+        self.packed_window_size = 1
+        self.high_dt_ns = int(round(1.0e9 / self.high_fps))
+        self.action_period_ns = int(round(1.0e9 / self.expert_fps))
+        self.inference_delay_ns = int(round(self.inference_delay_s * 1.0e9))
+        self.action_condition_horizon = int(
+            round((self.action_horizon - 1) * self.high_fps / self.expert_fps)
+        ) + 1
+        self.source_dataset = direct
+        self.stats_dataset = direct.hf_dataset
+        return high_tensors, high_ts, anchor_ts, episodes
+
     def _build_virtual_episodes(self):
         episodes = []
         for episode in self.source_dataset.meta.episodes:
@@ -283,9 +441,14 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
 
     def _refresh_time(self, high_idx, episode):
         episode_start = int(episode["dataset_from_index"])
-        anchor_origin = int(
-            self.anchor_timestamps[int(episode["source_dataset_from_index"])]
-        )
+        if self.backend == "h5":
+            anchor_origin = int(
+                self.anchor_timestamps[int(episode["anchor_from_index"])]
+            )
+        else:
+            anchor_origin = int(
+                self.anchor_timestamps[int(episode["source_dataset_from_index"])]
+            )
         current_time = int(self.high_timestamps[high_idx])
         if current_time < anchor_origin:
             return anchor_origin
@@ -467,7 +630,17 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         for episode in self.episodes:
             start = int(episode["dataset_from_index"])
             end = int(episode["dataset_to_index"])
-            anchor_start = start + self.packed_window_size - 1
+            if self.backend == "h5":
+                first_anchor = self.anchor_timestamps[
+                    int(episode["anchor_from_index"])
+                ]
+                anchor_start = start + int(
+                    torch.searchsorted(
+                        self.high_timestamps[start:end], first_anchor
+                    ).item()
+                )
+            else:
+                anchor_start = start + self.packed_window_size - 1
             if not self.pad_history:
                 anchor_start += self.history_horizon - 1
             last = end - self.future_horizon - 1

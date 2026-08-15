@@ -41,6 +41,16 @@ class JointStateEstimate:
     segment_starts: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class CausalJointStateEstimate:
+    """Forward-filtered joint state that can be replayed online."""
+
+    q_filtered: np.ndarray
+    dq_filtered: np.ndarray
+    ddq_filtered: np.ndarray
+    segment_starts: tuple[int, ...]
+
+
 def causal_median_one_pole_filter(
     timestamps_s: np.ndarray,
     values: np.ndarray,
@@ -223,7 +233,7 @@ def _initial_value(value: float, fallback: float = 0.0) -> float:
     return float(value) if np.isfinite(value) else fallback
 
 
-def _filter_and_smooth_joint(
+def _filter_joint(
     timestamps_s: np.ndarray,
     q: np.ndarray,
     dq: np.ndarray,
@@ -234,7 +244,7 @@ def _filter_and_smooth_joint(
     initial_position_std: float,
     initial_velocity_std: float,
     initial_acceleration_std: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     count = len(timestamps_s)
     filtered_state = np.empty((count, 3), dtype=np.float64)
     filtered_covariance = np.empty((count, 3, 3), dtype=np.float64)
@@ -290,6 +300,46 @@ def _filter_and_smooth_joint(
         filtered_state[index] = state
         filtered_covariance[index] = covariance
 
+    return (
+        filtered_state,
+        filtered_covariance,
+        predicted_state,
+        predicted_covariance,
+        transitions,
+    )
+
+
+def _filter_and_smooth_joint(
+    timestamps_s: np.ndarray,
+    q: np.ndarray,
+    dq: np.ndarray,
+    *,
+    position_std: float,
+    velocity_std: float,
+    jerk_std: float,
+    initial_position_std: float,
+    initial_velocity_std: float,
+    initial_acceleration_std: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    (
+        filtered_state,
+        filtered_covariance,
+        predicted_state,
+        predicted_covariance,
+        transitions,
+    ) = _filter_joint(
+        timestamps_s,
+        q,
+        dq,
+        position_std=position_std,
+        velocity_std=velocity_std,
+        jerk_std=jerk_std,
+        initial_position_std=initial_position_std,
+        initial_velocity_std=initial_velocity_std,
+        initial_acceleration_std=initial_acceleration_std,
+    )
+
+    count = len(timestamps_s)
     smoothed_state = filtered_state.copy()
     smoothed_covariance = filtered_covariance.copy()
     for index in range(count - 2, -1, -1):
@@ -325,6 +375,56 @@ def _segment_bounds(
     return tuple((int(start), int(stop)) for start, stop in zip(starts, stops))
 
 
+def _estimator_parameters(
+    config: KalmanRTSConfig,
+    joint_count: int,
+) -> dict[str, np.ndarray]:
+    return {
+        name: _joint_parameter(getattr(config, name), joint_count, name)
+        for name in (
+            "position_std",
+            "velocity_std",
+            "jerk_std",
+            "initial_position_std",
+            "initial_velocity_std",
+            "initial_acceleration_std",
+        )
+    }
+
+
+def estimate_joint_states_causal(
+    timestamps_s: np.ndarray,
+    q: np.ndarray,
+    dq: np.ndarray,
+    config: KalmanRTSConfig | None = None,
+) -> CausalJointStateEstimate:
+    """Estimate ``[q, dq, ddq]`` using only current and previous samples."""
+
+    timestamps_s, q, dq = _validate_measurements(timestamps_s, q, dq)
+    config = config or KalmanRTSConfig()
+    joint_count = q.shape[1]
+    parameters = _estimator_parameters(config, joint_count)
+    bounds = _segment_bounds(timestamps_s, config.max_gap_s)
+    filtered = np.empty((len(q), joint_count, 3), dtype=np.float64)
+
+    for start, stop in bounds:
+        for joint in range(joint_count):
+            joint_filtered, _, _, _, _ = _filter_joint(
+                timestamps_s[start:stop],
+                q[start:stop, joint],
+                dq[start:stop, joint],
+                **{name: value[joint] for name, value in parameters.items()},
+            )
+            filtered[start:stop, joint] = joint_filtered
+
+    return CausalJointStateEstimate(
+        q_filtered=filtered[..., 0],
+        dq_filtered=filtered[..., 1],
+        ddq_filtered=filtered[..., 2],
+        segment_starts=tuple(start for start, _ in bounds),
+    )
+
+
 def estimate_joint_states_rts(
     timestamps_s: np.ndarray,
     q: np.ndarray,
@@ -336,17 +436,7 @@ def estimate_joint_states_rts(
     timestamps_s, q, dq = _validate_measurements(timestamps_s, q, dq)
     config = config or KalmanRTSConfig()
     joint_count = q.shape[1]
-    parameters = {
-        name: _joint_parameter(getattr(config, name), joint_count, name)
-        for name in (
-            "position_std",
-            "velocity_std",
-            "jerk_std",
-            "initial_position_std",
-            "initial_velocity_std",
-            "initial_acceleration_std",
-        )
-    }
+    parameters = _estimator_parameters(config, joint_count)
     bounds = _segment_bounds(timestamps_s, config.max_gap_s)
     filtered = np.empty((len(q), joint_count, 3), dtype=np.float64)
     smoothed = np.empty_like(filtered)

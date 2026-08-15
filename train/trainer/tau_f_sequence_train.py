@@ -17,7 +17,14 @@ import torch.nn.functional as F
 import yaml
 from tqdm.auto import tqdm
 
+from data_process.tau_f_target_generation import (
+    build_causal_tau_f_target,
+    normalize_tau_f_target_generation,
+    resolve_tau_f_target_generation,
+    timestamps_to_seconds,
+)
 from model.tau_f_sequence import build_tau_f_sequence_model
+from physics.nero_dynamics import PinocchioDynamics
 from train.base_trainer import BaseTrainer
 from train.nomalizer import Normalizer
 from train.torque_sequence_peak_loss import TorqueSequencePeakLoss
@@ -70,6 +77,23 @@ class TauFTrainer(BaseTrainer):
         self.tensor_cache = None
         self.valid_raw_indices_device = None
         self.episode_starts_device = None
+        self.derived_target_config = normalize_tau_f_target_generation(config)
+        self.tau_f_dynamics = None
+        if self.derived_target_config["enabled"]:
+            model_target = str((config.get("model") or {}).get("target_key", "tau_f"))
+            derived_target = self.derived_target_config["target_key"]
+            if model_target != derived_target:
+                raise ValueError(
+                    "model.target_key must match target_generation.target_key; "
+                    f"got {model_target!r} and {derived_target!r}"
+                )
+            # active_inputs = list((config.get("model") or {}).get("inputs") or [])
+            # tau_source = self.derived_target_config["source_keys"]["tau"]
+            # if tau_source in active_inputs:
+            #     raise ValueError(
+            #         "Measured tau is a target-generation source and must not be a "
+            #         "model input; doing so leaks the tau_f supervision target."
+            #     )
 
     def build_dataset(self):
         # Keep the optional LeRobot dependency out of model-only imports and tests.
@@ -114,13 +138,16 @@ class TauFTrainer(BaseTrainer):
     def _build_device_cache(self, training_frames):
         model_config = self.config.get("model") or {}
         active_inputs = list(model_config.get("inputs") or ["q", "dq", "delta_q"])
-        cache_keys = list(
-            dict.fromkeys(
-                active_inputs
-                + [str(model_config.get("target_key", "tau_f"))]
-                + list(self.dataset.normalize_lowdim_keys)
+        target_key = str(model_config.get("target_key", "tau_f"))
+        requested_keys = active_inputs + list(self.dataset.normalize_lowdim_keys)
+        if self.derived_target_config["enabled"]:
+            requested_keys = [key for key in requested_keys if key != target_key]
+            requested_keys.extend(
+                self.derived_target_config["source_keys"].values()
             )
-        )
+        else:
+            requested_keys.append(target_key)
+        cache_keys = list(dict.fromkeys(requested_keys))
         missing_keys = [
             key for key in cache_keys if key not in self.dataset.lowdim_keys
         ]
@@ -130,6 +157,16 @@ class TauFTrainer(BaseTrainer):
             )
 
         cpu_cache = self._load_lowdim_columns(cache_keys)
+        if self.derived_target_config["enabled"]:
+            self._build_derived_target(cpu_cache, target_key)
+            retained_keys = list(
+                dict.fromkeys(
+                    active_inputs
+                    + [target_key]
+                    + list(self.dataset.normalize_lowdim_keys)
+                )
+            )
+            cpu_cache = {key: cpu_cache[key] for key in retained_keys}
         stats = self._normalizer_stats(cpu_cache, training_frames)
         if stats:
             self.dataset.set_normalizer(Normalizer(stats))
@@ -165,8 +202,44 @@ class TauFTrainer(BaseTrainer):
         log.info(
             "low-dimensional sequence cache ready: device=%s keys=%s memory=%.2f MiB",
             cache_device,
-            cache_keys,
+            list(self.tensor_cache),
             cache_bytes / (1024**2),
+        )
+
+    def _build_derived_target(self, cpu_cache, target_key):
+        self.derived_target_config = resolve_tau_f_target_generation(
+            self.config,
+            self.dataset.filter_config,
+        )
+        timestamp_key = self.derived_target_config["timestamp_key"]
+        timestamp_values = self._load_dataset_column(timestamp_key)
+        timestamps_s = timestamps_to_seconds(
+            timestamp_values,
+            self.derived_target_config["timestamp_unit"],
+        )
+        source_keys = self.derived_target_config["source_keys"]
+        if self.tau_f_dynamics is None:
+            self.tau_f_dynamics = PinocchioDynamics(self.config)
+        result = build_causal_tau_f_target(
+            timestamps_s=timestamps_s,
+            q=cpu_cache[source_keys["q"]],
+            dq=cpu_cache[source_keys["dq"]],
+            tau_filtered=cpu_cache[source_keys["tau"]],
+            episodes=self.dataset.dataset.meta.episodes,
+            target_config=self.derived_target_config,
+            dynamics=self.tau_f_dynamics,
+        )
+        cpu_cache[source_keys["dq"]] = result.dq
+        cpu_cache[target_key] = result.tau_f
+        ddq_abs_p99 = torch.quantile(result.ddq.abs().reshape(-1), 0.99).item()
+        target_abs_p99 = torch.quantile(result.tau_f.abs().reshape(-1), 0.99).item()
+        log.info(
+            "derived causal tau_f target ready: frames=%d ddq_abs_p99=%.6f "
+            "tau_f_abs_p99=%.6f operations=%s",
+            len(result.tau_f),
+            ddq_abs_p99,
+            target_abs_p99,
+            self.derived_target_config["torque_filter_operations"],
         )
 
     def _load_lowdim_columns(self, cache_keys):
@@ -204,6 +277,26 @@ class TauFTrainer(BaseTrainer):
                     f"expected {expected_length}."
                 )
         return cache
+
+    def _load_dataset_column(self, dataset_key):
+        hf_dataset = self.dataset.stats_dataset
+        if dataset_key not in hf_dataset.column_names:
+            raise KeyError(
+                f"target_generation timestamp column is missing: {dataset_key!r}"
+            )
+        formatted_dataset = hf_dataset.with_format(
+            "torch",
+            columns=[dataset_key],
+            output_all_columns=False,
+        )
+        columns = formatted_dataset[:]
+        value = self._column_to_tensor(columns[dataset_key])
+        if value.shape[0] != len(hf_dataset):
+            raise ValueError(
+                f"Target-generation column {dataset_key!r} has {value.shape[0]} "
+                f"frames, expected {len(hf_dataset)}."
+            )
+        return value
 
     @staticmethod
     def _column_to_tensor(column):
@@ -376,7 +469,58 @@ class TauFTrainer(BaseTrainer):
             **self._physical_mae_metrics(prediction, target),
         }
         out["_absolute_error_nm"] = absolute_error_nm.detach()
+        out["_target_nm"] = target_nm.detach()
         return loss, out
+
+    @staticmethod
+    def _normalized_torque_metrics(absolute_error_nm, target_nm):
+        absolute_error_nm = absolute_error_nm.reshape(
+            -1, absolute_error_nm.shape[-1]
+        )
+        target_nm = target_nm.reshape(-1, target_nm.shape[-1])
+        if absolute_error_nm.shape != target_nm.shape:
+            raise ValueError(
+                "absolute torque errors and targets must have matching shapes"
+            )
+        if len(target_nm) == 0:
+            return {}
+
+        joint_mae_nm = absolute_error_nm.mean(dim=0)
+        joint_tau_std_nm = (
+            target_nm.std(dim=0)
+            if len(target_nm) > 1
+            else torch.zeros_like(joint_mae_nm)
+        )
+        p05 = torch.quantile(target_nm, 0.05, dim=0)
+        p95 = torch.quantile(target_nm, 0.95, dim=0)
+        joint_tau_p90_range_nm = p95 - p05
+        eps = target_nm.new_tensor(1.0e-8)
+        joint_nmae_std = joint_mae_nm / (joint_tau_std_nm + eps)
+        joint_nmae_p90 = joint_mae_nm / (joint_tau_p90_range_nm + eps)
+
+        metrics = {
+            "nmae_std": float(joint_nmae_std.mean().item()),
+            "nmae_p90": float(joint_nmae_p90.mean().item()),
+        }
+        for joint_index in range(target_nm.shape[-1]):
+            suffix = f"j{joint_index + 1}"
+            metrics[f"mae_nm_{suffix}"] = float(joint_mae_nm[joint_index].item())
+            metrics[f"joint_mae_nm_{suffix}"] = float(
+                joint_mae_nm[joint_index].item()
+            )
+            metrics[f"joint_tau_std_nm_{suffix}"] = float(
+                joint_tau_std_nm[joint_index].item()
+            )
+            metrics[f"joint_nmae_std_{suffix}"] = float(
+                joint_nmae_std[joint_index].item()
+            )
+            metrics[f"joint_tau_p90_range_nm_{suffix}"] = float(
+                joint_tau_p90_range_nm[joint_index].item()
+            )
+            metrics[f"joint_nmae_p90_{suffix}"] = float(
+                joint_nmae_p90[joint_index].item()
+            )
+        return metrics
 
     @torch.no_grad()
     def evaluate_loader(self, loader, epoch, description):
@@ -391,6 +535,7 @@ class TauFTrainer(BaseTrainer):
         metric_sums = {}
         metric_counts = {}
         absolute_errors_nm = []
+        targets_nm = []
         wrench_predictions = []
         pbar = tqdm(
             loader,
@@ -413,6 +558,7 @@ class TauFTrainer(BaseTrainer):
                     batch_size,
                 )
                 absolute_errors_nm.append(out["_absolute_error_nm"].cpu())
+                targets_nm.append(out["_target_nm"].cpu())
                 if "_wrench_pred" in out:
                     wrench_predictions.append(out["_wrench_pred"].cpu())
                 pbar.set_postfix({"loss": f"{loss.item():.6f}"})
@@ -421,14 +567,21 @@ class TauFTrainer(BaseTrainer):
 
         metrics = self._average_scalar_metrics(metric_sums, metric_counts)
         if absolute_errors_nm:
+            global_absolute_error_nm = torch.cat(absolute_errors_nm, dim=0)
             global_peak_metrics = self.peak_loss.metrics_from_absolute_error(
-                torch.cat(absolute_errors_nm, dim=0)
+                global_absolute_error_nm
             )
             metrics.update(
                 {
                     key: float(value.item())
                     for key, value in global_peak_metrics.items()
                 }
+            )
+            metrics.update(
+                self._normalized_torque_metrics(
+                    global_absolute_error_nm,
+                    torch.cat(targets_nm, dim=0),
+                )
             )
         if wrench_predictions:
             wrench = torch.cat(wrench_predictions, dim=0)
@@ -463,6 +616,23 @@ class TauFTrainer(BaseTrainer):
                 metrics["peak_p99_nm"],
                 metrics["peak_max_nm"],
             )
+            metric_groups = (
+                ("joint_mae_nm", "joint_mae_nm_j"),
+                ("joint_tau_std_nm", "joint_tau_std_nm_j"),
+                ("joint_nmae_std", "joint_nmae_std_j"),
+                ("joint_tau_p90_range_nm", "joint_tau_p90_range_nm_j"),
+                ("joint_nmae_p90", "joint_nmae_p90_j"),
+            )
+            normalized_metric_text = " ".join(
+                f"{label}=["
+                + ",".join(
+                    f"{metrics[f'{prefix}{joint_index}']:.6f}"
+                    for joint_index in range(1, 8)
+                )
+                + "]"
+                for label, prefix in metric_groups
+            )
+            log.info("validation normalized torque: %s", normalized_metric_text)
         return val_loss
 
 

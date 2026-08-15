@@ -10,6 +10,11 @@ from typing import Any, Mapping
 
 from tqdm import tqdm
 
+
+PINN_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = PINN_ROOT.parent
+NERO_RUNS_ROOT = WORKSPACE_ROOT / "nero_ws" / "runs"
+
 EXAMPLE_SHAPE_META = {
     "task": "your_task_name",
     "fps": 15,
@@ -39,9 +44,11 @@ EXAMPLE_SHAPE_META = {
 
 _DUAL_RATE_GRIDS = frozenset({"high_past", "low_anchor", "low_future"})
 _DUAL_RATE_RESAMPLERS = frozenset(
-    {"linear", "pchip", "pose", "previous", "nearest"}
+    {"linear", "pchip", "pose", "previous", "nearest", "next"}
 )
-_STANDARD_RESAMPLERS = frozenset({"linear", "pchip", "previous", "nearest"})
+_STANDARD_RESAMPLERS = frozenset(
+    {"index", "linear", "pchip", "previous", "nearest"}
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +66,24 @@ def parse_args() -> argparse.Namespace:
         "--inspect-only",
         action="store_true",
         help="Print the H5 tree and exit.",
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=None,
+        help=(
+            "Override io.input. Relative paths are resolved from the PINN root; "
+            "nero_ws/runs/... and runs/... address the sibling nero_ws run directory."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Override io.output with the same path rules as --input. "
+            "Ignored by --inspect-only."
+        ),
     )
     parser.add_argument(
         "--print-example-shape-meta",
@@ -110,6 +135,9 @@ def load_conversion_deps() -> tuple[Any, Any, Any]:
 def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
     fps = normalize_fps(shape_meta.get("fps"))
     timeline = normalize_timeline_spec(shape_meta.get("timeline"), fps)
+    sampling = normalize_sampling_spec(shape_meta.get("sampling"), fps)
+    if timeline is not None and sampling is not None:
+        raise ValueError("shape_meta must not combine timeline and sampling contracts.")
     raw_features = shape_meta.get("features")
     if not isinstance(raw_features, Mapping):
         raise ValueError("shape_meta must contain a 'features' mapping.")
@@ -232,11 +260,17 @@ def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
                 "dtype": "int64",
                 "shape": (timeline["high_window_size"], 1),
             },
-            "timing.action_timestamp_ns": {
+        }
+        if timeline["mode"] == "camera_rows":
+            timing_features["timing.action_source_timestamp_ns"] = {
+                "dtype": "int64",
+                "shape": (1,),
+            }
+        else:
+            timing_features["timing.action_timestamp_ns"] = {
                 "dtype": "int64",
                 "shape": (timeline["action_horizon"], 1),
-            },
-        }
+            }
         duplicates = sorted(set(lerobot_features) & set(timing_features))
         if duplicates:
             raise ValueError(
@@ -244,6 +278,14 @@ def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
                 f"must not be declared manually: {duplicates}"
             )
         lerobot_features.update(timing_features)
+
+    if sampling is not None and sampling["mode"] == "fixed_rate_causal_snapshot":
+        validate_causal_snapshot_mappings(
+            mappings,
+            master_timestamp_path=str(shape_meta["master_timestamp_path"]),
+        )
+    if sampling is not None and sampling["mode"] == "raw_index":
+        validate_raw_index_mappings(mappings)
 
     return {
         "io": shape_meta.get("io", {}),
@@ -253,7 +295,97 @@ def build_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
         "master_timestamp_path": shape_meta["master_timestamp_path"],
         "fps": fps,
         "timeline": timeline,
+        "sampling": sampling,
     }
+
+
+def normalize_sampling_spec(value: Any, fps: int) -> dict[str, Any] | None:
+    """Normalize raw-index or fixed-rate sampling contracts."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("shape_meta.sampling must be a mapping.")
+    mode = str(value.get("mode", "")).strip().lower()
+    if mode == "raw_index":
+        unknown = set(value) - {"mode"}
+        if unknown:
+            raise ValueError(
+                f"shape_meta.sampling raw_index has unknown options: "
+                f"{sorted(unknown)}"
+            )
+        return {"mode": mode, "fps": fps}
+
+    unknown = set(value) - {"mode", "phase", "max_staleness_s"}
+    if unknown:
+        raise ValueError(f"shape_meta.sampling has unknown options: {sorted(unknown)}")
+    if mode != "fixed_rate_causal_snapshot":
+        raise ValueError(
+            "shape_meta.sampling.mode must be 'raw_index' or "
+            "'fixed_rate_causal_snapshot'."
+        )
+    phase = str(value.get("phase", "unix_epoch")).strip().lower()
+    if phase != "unix_epoch":
+        raise ValueError("shape_meta.sampling.phase must be 'unix_epoch'.")
+    max_staleness_s = value.get("max_staleness_s")
+    if max_staleness_s is not None:
+        max_staleness_s = float(max_staleness_s)
+        if not math.isfinite(max_staleness_s) or max_staleness_s <= 0.0:
+            raise ValueError(
+                "shape_meta.sampling.max_staleness_s must be positive and finite."
+            )
+    return {
+        "mode": mode,
+        "phase": phase,
+        "fps": fps,
+        "max_staleness_s": max_staleness_s,
+    }
+
+
+def validate_causal_snapshot_mappings(
+    mappings: list[dict[str, Any]],
+    *,
+    master_timestamp_path: str,
+) -> None:
+    """Require every model feature to come from one selected H5 snapshot row."""
+
+    for mapping in mappings:
+        for source in mapping["sources"]:
+            method = source.get("method")
+            timestamp_path = source.get("timestamp_path")
+            if method == "previous" and timestamp_path != master_timestamp_path:
+                raise ValueError(
+                    f"Feature {mapping['lerobot_key']!r} fixed-rate causal snapshot "
+                    f"source {source['h5_path']!r} must use master timestamp path "
+                    f"{master_timestamp_path!r}."
+                )
+            if method == "index" and timestamp_path not in {
+                None,
+                master_timestamp_path,
+            }:
+                raise ValueError(
+                    f"Feature {mapping['lerobot_key']!r} fixed-rate causal snapshot "
+                    f"source {source['h5_path']!r} align='index' must omit "
+                    f"timestamp_path or use {master_timestamp_path!r}."
+                )
+            if method not in {"previous", "index"}:
+                raise ValueError(
+                    f"Feature {mapping['lerobot_key']!r} fixed-rate causal snapshot "
+                    f"source {source['h5_path']!r} must use align='previous' "
+                    "or align='index'."
+                )
+
+
+def validate_raw_index_mappings(mappings: list[dict[str, Any]]) -> None:
+    """Require every raw-index feature to read the selected master row."""
+
+    for mapping in mappings:
+        for source in mapping["sources"]:
+            if source.get("method") != "index":
+                raise ValueError(
+                    f"Feature {mapping['lerobot_key']!r} raw_index source "
+                    f"{source['h5_path']!r} must use align='index'."
+                )
 
 
 def normalize_timeline_spec(value: Any, fps: int) -> dict[str, Any] | None:
@@ -262,8 +394,42 @@ def normalize_timeline_spec(value: Any, fps: int) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         raise ValueError("shape_meta.timeline must be a mapping.")
     mode = str(value.get("mode", "dual_rate")).lower()
-    if mode != "dual_rate":
-        raise ValueError("shape_meta.timeline.mode must be 'dual_rate'.")
+    if mode not in {"dual_rate", "camera_rows"}:
+        raise ValueError(
+            "shape_meta.timeline.mode must be 'dual_rate' or 'camera_rows'."
+        )
+
+    if mode == "camera_rows":
+        unknown = set(value) - {
+            "mode",
+            "history_size",
+            "action_horizon",
+            "max_gap_s",
+            "store_timestamps",
+        }
+        if unknown:
+            raise ValueError(
+                "shape_meta.timeline camera_rows has unknown options: "
+                f"{sorted(unknown)}"
+            )
+        history_size = int(value.get("history_size", 4))
+        action_horizon = int(value.get("action_horizon", 8))
+        if history_size <= 0:
+            raise ValueError("timeline.history_size must be positive.")
+        if action_horizon <= 0:
+            raise ValueError("timeline.action_horizon must be positive.")
+        max_gap_s = float(value.get("max_gap_s", 0.05))
+        if not math.isfinite(max_gap_s) or max_gap_s <= 0.0:
+            raise ValueError("timeline.max_gap_s must be positive and finite.")
+        return {
+            "mode": mode,
+            "low_fps": fps,
+            "high_fps": None,
+            "high_window_size": history_size,
+            "action_horizon": action_horizon,
+            "max_gap_s": max_gap_s,
+            "store_timestamps": bool(value.get("store_timestamps", True)),
+        }
 
     low_fps = normalize_fps(value.get("low_fps", fps))
     high_fps = normalize_fps(value.get("high_fps"))
@@ -332,10 +498,11 @@ def validate_timeline_mapping(
     if (
         not per_source_resampling
         and raw_spec.get("allow_stale", False)
-        and resample != "previous"
+        and resample not in {"previous", "nearest"}
     ):
         raise ValueError(
-            f"Feature {lerobot_key!r} allow_stale is only valid with resample=previous."
+            f"Feature {lerobot_key!r} allow_stale is only valid with "
+            "point resampling (previous or nearest)."
         )
     timestamp_path = raw_spec.get("timestamp_path")
     if (
@@ -387,17 +554,45 @@ def normalize_fps(value: Any) -> int:
     return fps
 
 
-def config_path(config: Mapping[str, Any], key: str, required: bool = True) -> Path | None:
+def resolve_io_path(value: str | Path) -> Path:
+    """Resolve conversion paths independently of the caller's working directory.
+
+    Existing shape-meta paths remain PINN-root relative. Two aliases make data
+    collected by the sibling nero_ws repository explicit and portable:
+
+    - ``nero_ws/runs/<name>`` -> ``<workspace>/nero_ws/runs/<name>``
+    - ``runs/<name>`` -> ``<workspace>/nero_ws/runs/<name>``
+    """
+
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    parts = path.parts
+    if len(parts) >= 2 and parts[:2] == ("nero_ws", "runs"):
+        return (WORKSPACE_ROOT / path).resolve()
+    if parts and parts[0] == "runs":
+        return (NERO_RUNS_ROOT.joinpath(*parts[1:])).resolve()
+    return (PINN_ROOT / path).resolve()
+
+
+def config_path(
+    config: Mapping[str, Any],
+    key: str,
+    required: bool = True,
+    *,
+    override: str | Path | None = None,
+) -> Path | None:
     io_config = config.get("io", {})
     if not isinstance(io_config, Mapping):
         raise ValueError("config field 'io' must be a mapping.")
 
-    value = io_config.get(key)
+    value = override if override is not None else io_config.get(key)
     if value is None:
         if required:
             raise ValueError(f"config needs io.{key}")
         return None
-    return Path(value)
+    return resolve_io_path(value)
 
 
 def normalize_feature_spec(feature_spec: dict[str, Any]) -> None:
@@ -555,6 +750,12 @@ def normalize_h5_sources(
             structured=True,
         )
         sources.append(source)
+    methods = {source["method"] for source in sources}
+    if "index" in methods and len(methods) > 1:
+        raise ValueError(
+            f"Feature {lerobot_key!r} cannot mix align='index' with "
+            "timestamp-based alignment in one sources list."
+        )
     return sources
 
 
@@ -577,12 +778,21 @@ def validate_source_resampling(
         return
 
     timestamp_path = source.get("timestamp_path")
+    max_gap_s = source.get("max_gap_s")
+    allow_stale = bool(source.get("allow_stale", False))
+    if method == "index":
+        if max_gap_s is not None or allow_stale:
+            raise ValueError(
+                f"Feature {lerobot_key!r} source {source['h5_path']!r} "
+                "align='index' does not use max_gap_s or allow_stale."
+            )
+        return
+
     if not isinstance(timestamp_path, str) or not timestamp_path:
         raise ValueError(
             f"Feature {lerobot_key!r} source {source['h5_path']!r} "
             f"method={method!r} needs timestamp_path."
         )
-    max_gap_s = source.get("max_gap_s")
     if max_gap_s is not None and (
         not math.isfinite(float(max_gap_s)) or float(max_gap_s) <= 0.0
     ):
@@ -590,11 +800,11 @@ def validate_source_resampling(
             f"Feature {lerobot_key!r} source {source['h5_path']!r} "
             "max_gap_s must be positive and finite."
         )
-    allow_stale = bool(source.get("allow_stale", False))
-    if allow_stale and method != "previous":
+    if allow_stale and method not in {"previous", "nearest"}:
         raise ValueError(
             f"Feature {lerobot_key!r} source {source['h5_path']!r} "
-            "allow_stale is only valid with previous/ZOH resampling."
+            "allow_stale is only valid with point resampling "
+            "(previous/ZOH or nearest)."
         )
     if not dual_rate and method in {"linear", "pchip"} and max_gap_s is None:
         raise ValueError(
@@ -717,6 +927,7 @@ class H5Dataset:
         fps,
         h5_path,
         timeline=None,
+        sampling=None,
     ):
         """Cache dataset handles and timestamp arrays for one opened episode."""
 
@@ -738,7 +949,24 @@ class H5Dataset:
         for timestamp_path in all_timestamp_paths:
             timestamp_cache[timestamp_path] = dataset_cache[timestamp_path][:]
 
+        self._validate_index_sources(
+            dataset_cache=dataset_cache,
+            timestamp_cache=timestamp_cache,
+            mappings=mappings,
+            master_timestamp_path=master_timestamp_path,
+            h5_path=h5_path,
+        )
+
         if timeline is not None:
+            if timeline["mode"] == "camera_rows":
+                return self._build_camera_rows_episode_cache(
+                    dataset_cache=dataset_cache,
+                    timestamp_cache=timestamp_cache,
+                    mappings=mappings,
+                    master_timestamp_path=master_timestamp_path,
+                    h5_path=h5_path,
+                    timeline=timeline,
+                )
             return self._build_dual_rate_episode_cache(
                 dataset_cache=dataset_cache,
                 timestamp_cache=timestamp_cache,
@@ -746,6 +974,25 @@ class H5Dataset:
                 master_timestamp_path=master_timestamp_path,
                 h5_path=h5_path,
                 timeline=timeline,
+            )
+
+        if sampling is not None:
+            if sampling["mode"] == "raw_index":
+                return self._build_raw_index_episode_cache(
+                    dataset_cache=dataset_cache,
+                    timestamp_cache=timestamp_cache,
+                    mappings=mappings,
+                    master_timestamp_path=master_timestamp_path,
+                    h5_path=h5_path,
+                )
+            return self._build_causal_snapshot_episode_cache(
+                dataset_cache=dataset_cache,
+                timestamp_cache=timestamp_cache,
+                mappings=mappings,
+                master_timestamp_path=master_timestamp_path,
+                fps=fps,
+                h5_path=h5_path,
+                sampling=sampling,
             )
 
         target_timestamps = self.uniform_timestamps(
@@ -766,10 +1013,16 @@ class H5Dataset:
         )
         for mapping in mappings:
             method = mapping["align"]
+            if all(
+                source.get("method") == "index"
+                for source in mapping["sources"]
+            ):
+                continue
             if not mapping.get("per_source_resampling") and method not in {
                 "linear",
                 "pchip",
                 "previous",
+                "nearest",
             }:
                 continue
             for source in mapping["sources"]:
@@ -796,6 +1049,354 @@ class H5Dataset:
                 target_seconds,
                 cache,
             )
+        return cache
+
+    def _build_raw_index_episode_cache(
+        self,
+        *,
+        dataset_cache,
+        timestamp_cache,
+        mappings,
+        master_timestamp_path,
+        h5_path,
+    ):
+        master_timestamps = self.np.asarray(
+            timestamp_cache[master_timestamp_path]
+        ).reshape(-1)
+        if master_timestamps.size == 0:
+            raise ValueError(f"Raw-index episode is empty: {h5_path}")
+        if not self.np.isfinite(master_timestamps).all():
+            raise ValueError(f"Raw-index timestamps must be finite in {h5_path}.")
+        if master_timestamps.size > 1 and self.np.any(
+            self.np.diff(master_timestamps) <= 0
+        ):
+            raise ValueError(
+                f"Raw-index timestamps must be strictly increasing in {h5_path}."
+            )
+        return {
+            "datasets": dataset_cache,
+            "timestamps": timestamp_cache,
+            "target_timestamps": master_timestamps,
+            "timestamp_seconds": {},
+            "aligned": {},
+            "raw_index": True,
+        }
+
+    def _validate_index_sources(
+        self,
+        *,
+        dataset_cache,
+        timestamp_cache,
+        mappings,
+        master_timestamp_path,
+        h5_path,
+    ) -> None:
+        master_length = len(timestamp_cache[master_timestamp_path])
+        for mapping in mappings:
+            for source in mapping["sources"]:
+                if source.get("method") != "index":
+                    continue
+                source_dataset = dataset_cache[source["h5_path"]]
+                source_shape = tuple(source_dataset.shape)
+                if not source_shape or source_shape[0] != master_length:
+                    raise ValueError(
+                        f"Feature {mapping['lerobot_key']!r} source "
+                        f"{source['h5_path']!r} align='index' in {h5_path} "
+                        f"requires exactly {master_length} rows to match "
+                        f"{master_timestamp_path!r}, got shape {source_shape}."
+                    )
+
+    def _build_causal_snapshot_episode_cache(
+        self,
+        *,
+        dataset_cache,
+        timestamp_cache,
+        mappings,
+        master_timestamp_path,
+        fps,
+        h5_path,
+        sampling,
+    ):
+        master_timestamps = timestamp_cache[master_timestamp_path]
+        target_timestamps = self.fixed_phase_timestamps(
+            master_timestamps,
+            master_timestamp_path,
+            fps,
+        )
+        master_seconds = self._timestamps_seconds(
+            master_timestamps,
+            master_timestamp_path,
+        )
+        target_seconds = self._timestamps_seconds(
+            target_timestamps,
+            master_timestamp_path,
+        )
+        snapshot_indices = self._point_sample_indices(
+            master_seconds,
+            target_seconds,
+            "previous",
+        )
+        ages_s = target_seconds - master_seconds[snapshot_indices]
+        max_staleness_s = sampling.get("max_staleness_s")
+        if max_staleness_s is not None and self.np.any(
+            ages_s > float(max_staleness_s) + 1.0e-12
+        ):
+            first = int(
+                self.np.flatnonzero(
+                    ages_s > float(max_staleness_s) + 1.0e-12
+                )[0]
+            )
+            raise ValueError(
+                f"Causal snapshot in {h5_path} is stale by {ages_s[first]:.6f}s "
+                f"at target={target_seconds[first]:.9f}s; maximum is "
+                f"{float(max_staleness_s):.6f}s."
+            )
+
+        cache = {
+            "datasets": dataset_cache,
+            "timestamps": timestamp_cache,
+            "timestamp_seconds": {master_timestamp_path: master_seconds},
+            "master_timestamp_path": master_timestamp_path,
+            "target_timestamps": target_timestamps,
+            "snapshot_indices": snapshot_indices,
+            "snapshot_age_s": ages_s,
+            "aligned": {},
+            "causal_snapshot": True,
+        }
+        for mapping in mappings:
+            cache["aligned"][mapping["lerobot_key"]] = (
+                self._sample_snapshot_mapping(mapping, snapshot_indices, cache)
+            )
+        return cache
+
+    def _sample_snapshot_mapping(self, mapping, snapshot_indices, cache):
+        values = []
+        for source in mapping["sources"]:
+            source_values = self.np.asarray(cache["datasets"][source["h5_path"]][:])
+            sampled = source_values[snapshot_indices]
+            sampled = self._apply_transform(sampled, mapping.get("transform"))
+            values.append(sampled)
+        if len(values) == 1:
+            result = values[0]
+        elif mapping.get("combine") == "subtract":
+            result = self._subtract_values(values, mapping["lerobot_key"])
+        else:
+            result = self.np.concatenate(
+                [value.reshape(*value.shape[:-1], -1) for value in values],
+                axis=-1,
+            )
+        return self.np.asarray(result).astype(
+            self._dtype_from_feature(mapping["feature_spec"]),
+            copy=False,
+        )
+
+    def _build_camera_rows_episode_cache(
+        self,
+        *,
+        dataset_cache,
+        timestamp_cache,
+        mappings,
+        master_timestamp_path,
+        h5_path,
+        timeline,
+    ):
+        """Build one output row for each valid *recorded* master-camera frame.
+
+        No target clock is synthesized here. Observation point samples are
+        causal, actions use the first source row at/after the camera timestamp,
+        and ``high_past`` contains the latest raw history rows rather than
+        samples on an artificial 100 Hz grid.
+        """
+
+        if self.np is None:
+            raise RuntimeError("camera_rows conversion requires numpy.")
+        master_raw = self.np.asarray(
+            timestamp_cache[master_timestamp_path]
+        ).reshape(-1)
+        master_seconds = self._timestamps_seconds(master_raw, master_timestamp_path)
+        if master_seconds.size == 0:
+            raise ValueError(f"Camera-row episode is empty: {h5_path}")
+
+        timestamp_seconds = {master_timestamp_path: master_seconds}
+        for mapping in mappings:
+            for source in self._mapping_sources(mapping):
+                timestamp_path = source["timestamp_path"]
+                if timestamp_path not in timestamp_seconds:
+                    timestamp_seconds[timestamp_path] = self._timestamps_seconds(
+                        timestamp_cache[timestamp_path], timestamp_path
+                    )
+
+        row_count = len(master_seconds)
+        valid = self.np.ones(row_count, dtype=bool)
+        plans = {}
+        history_size = int(timeline["high_window_size"])
+        eps = 1.0e-12
+
+        for mapping in mappings:
+            grid = mapping["grid"]
+            mapping_plans = []
+            for source in self._mapping_sources(mapping):
+                source_seconds = timestamp_seconds[source["timestamp_path"]]
+                method = source["method"]
+                if grid == "high_past":
+                    if method not in {"previous", "nearest"}:
+                        raise ValueError(
+                            f"Feature {mapping['lerobot_key']!r} camera_rows "
+                            "high_past must use resample='previous'."
+                        )
+                    last = self.np.searchsorted(
+                        source_seconds, master_seconds, side="right"
+                    ) - 1
+                    enough_history = last >= history_size - 1
+                    safe_last = last.clip(
+                        history_size - 1, len(source_seconds) - 1
+                    )
+                    offsets = self.np.arange(
+                        -(history_size - 1), 1, dtype=self.np.int64
+                    )
+                    indices = safe_last[:, None] + offsets[None, :]
+                    source_time_window = source_seconds[indices]
+                    max_gap = source.get("max_gap_s")
+                    if max_gap is None:
+                        max_gap = mapping.get("max_gap_s")
+                    if max_gap is None:
+                        max_gap = timeline["max_gap_s"]
+                    recent = (
+                        master_seconds - source_time_window[:, -1]
+                        <= float(max_gap) + eps
+                    )
+                    continuous = self.np.all(
+                        self.np.diff(source_time_window, axis=1)
+                        <= float(max_gap) + eps,
+                        axis=1,
+                    )
+                    source_valid = enough_history & recent & continuous
+                else:
+                    if method in {"previous", "nearest"}:
+                        raw_indices = self.np.searchsorted(
+                            source_seconds, master_seconds, side="right"
+                        ) - 1
+                    elif method == "next":
+                        raw_indices = self.np.searchsorted(
+                            source_seconds, master_seconds, side="left"
+                        )
+                    else:
+                        raise ValueError(
+                            f"Feature {mapping['lerobot_key']!r} camera_rows "
+                            f"does not support resample={method!r}."
+                        )
+                    in_range = (raw_indices >= 0) & (
+                        raw_indices < len(source_seconds)
+                    )
+                    indices = raw_indices.clip(0, len(source_seconds) - 1)
+                    source_valid = in_range
+                    max_gap = source.get("max_gap_s")
+                    if max_gap is None:
+                        max_gap = mapping.get("max_gap_s")
+                    if max_gap is None:
+                        max_gap = timeline["max_gap_s"]
+                    if not source.get("allow_stale"):
+                        source_valid &= (
+                            self.np.abs(master_seconds - source_seconds[indices])
+                            <= float(max_gap) + eps
+                        )
+                valid &= source_valid
+                mapping_plans.append(
+                    {"source": source, "indices": indices}
+                )
+            plans[mapping["lerobot_key"]] = mapping_plans
+
+        selected_rows = self.np.flatnonzero(valid)
+        if selected_rows.size == 0:
+            raise ValueError(f"No complete camera rows remain in {h5_path}.")
+        anchors = master_seconds[selected_rows]
+        anchor_raw = master_raw[selected_rows]
+        anchor_timestamp_ns = self._timestamps_ns(
+            anchor_raw, master_timestamp_path
+        )
+
+        cache = {
+            "datasets": dataset_cache,
+            "timestamps": timestamp_cache,
+            "timestamp_seconds": timestamp_seconds,
+            "target_timestamps": anchor_raw,
+            "anchor_timestamp_ns": anchor_timestamp_ns,
+            "selected_master_indices": selected_rows,
+            "resampled": {},
+            "camera_rows": True,
+            "store_timestamps": bool(timeline["store_timestamps"]),
+        }
+        high_timestamp_ns = None
+        action_source_timestamp_ns = None
+        for mapping in mappings:
+            values = []
+            selected_plans = plans[mapping["lerobot_key"]]
+            for plan in selected_plans:
+                source = plan["source"]
+                indices = self.np.asarray(plan["indices"])[selected_rows]
+                source_times = timestamp_seconds[source["timestamp_path"]]
+                if mapping["grid"] == "high_past" and high_timestamp_ns is None:
+                    high_timestamp_ns = self._timestamps_ns(
+                        timestamp_cache[source["timestamp_path"]],
+                        source["timestamp_path"],
+                    )[indices]
+                if (
+                    source["method"] == "next"
+                    and action_source_timestamp_ns is None
+                ):
+                    action_source_timestamp_ns = self._timestamps_ns(
+                        timestamp_cache[source["timestamp_path"]],
+                        source["timestamp_path"],
+                    )[indices]
+
+                if self._is_media_feature(mapping["feature_spec"]):
+                    if len(selected_plans) != 1:
+                        raise ValueError(
+                            f"Media feature {mapping['lerobot_key']!r} must have "
+                            "one source."
+                        )
+                    cached = {"indices": indices, "mapping": mapping}
+                    if mapping.get("emit_age_key") is not None:
+                        cached["age_s"] = (
+                            anchors - source_times[indices]
+                        ).astype(self.np.float32)
+                    cache["resampled"][mapping["lerobot_key"]] = cached
+                    values = []
+                    break
+
+                source_values = self.np.asarray(
+                    dataset_cache[source["h5_path"]][:]
+                )[indices]
+                source_values = self._apply_transform(
+                    source_values, mapping.get("transform")
+                )
+                values.append(source_values)
+
+            if self._is_media_feature(mapping["feature_spec"]):
+                continue
+            if len(values) == 1:
+                result = values[0]
+            elif mapping.get("combine") == "subtract":
+                result = self._subtract_values(values, mapping["lerobot_key"])
+            else:
+                result = self.np.concatenate(
+                    [value.reshape(*value.shape[:-1], -1) for value in values],
+                    axis=-1,
+                )
+            cache["resampled"][mapping["lerobot_key"]] = self.np.asarray(
+                result
+            ).astype(
+                self._dtype_from_feature(mapping["feature_spec"]), copy=False
+            )
+
+        if high_timestamp_ns is None:
+            high_timestamp_ns = self.np.repeat(
+                anchor_timestamp_ns[:, None], history_size, axis=1
+            )
+        if action_source_timestamp_ns is None:
+            action_source_timestamp_ns = anchor_timestamp_ns.copy()
+        cache["high_timestamp_ns"] = high_timestamp_ns
+        cache["action_source_timestamp_ns"] = action_source_timestamp_ns
         return cache
 
     def _build_dual_rate_episode_cache(
@@ -840,10 +1441,10 @@ class H5Dataset:
                     )
                     timestamp_seconds[timestamp_path] = source_seconds
                 grid = mapping["grid"]
-                stale_hold = (
-                    source.get("allow_stale")
-                    and source["method"] == "previous"
-                )
+                stale_hold = source.get("allow_stale") and source["method"] in {
+                    "previous",
+                    "nearest",
+                }
                 if grid == "high_past":
                     anchor_start = max(
                         anchor_start,
@@ -1001,16 +1602,16 @@ class H5Dataset:
 
     def _point_sample_indices(self, source_times, targets, method):
         flat = self.np.asarray(targets, dtype=self.np.float64).reshape(-1)
-        if method == "previous":
+        if method in {"previous", "nearest"}:
+            # Causal point sampling: both names select the nearest sample at or
+            # before each target.  This keeps offline conversion consistent
+            # with online inference, where future frames are unavailable.
             indices = self.np.searchsorted(source_times, flat, side="right") - 1
-        elif method == "nearest":
-            right = self.np.searchsorted(source_times, flat, side="left")
-            right = self.np.clip(right, 0, len(source_times) - 1)
-            left = self.np.clip(right - 1, 0, len(source_times) - 1)
-            use_right = self.np.abs(source_times[right] - flat) < self.np.abs(
-                source_times[left] - flat
-            )
-            indices = self.np.where(use_right, right, left)
+        elif method == "next":
+            # Supervision-only point sampling: select the first recorded source
+            # row at or after the target timestamp. This is intentionally
+            # non-causal and must not be used for observation features.
+            indices = self.np.searchsorted(source_times, flat, side="left")
         else:
             raise ValueError(f"Point sampling does not support method={method!r}")
         if self.np.any(indices < 0) or self.np.any(indices >= len(source_times)):
@@ -1098,7 +1699,7 @@ class H5Dataset:
     ):
         target_shape = self.np.asarray(targets).shape
         flat_targets = self.np.asarray(targets, dtype=self.np.float64).reshape(-1)
-        if method in {"previous", "nearest"}:
+        if method in {"previous", "nearest", "next"}:
             indices = self._point_sample_indices(source_times, flat_targets, method)
             sampled = source_values[indices]
             if transform is not None:
@@ -1203,6 +1804,8 @@ class H5Dataset:
         cache.pop("anchor_timestamp_ns", None)
         cache.pop("high_timestamp_ns", None)
         cache.pop("action_timestamp_ns", None)
+        cache.pop("action_source_timestamp_ns", None)
+        cache.pop("selected_master_indices", None)
         cache.clear()
 
     def episode_length(self, h5_file, master_timestamp_path, h5_path, cache=None):
@@ -1237,6 +1840,70 @@ class H5Dataset:
             raise ValueError("Configured fps is too high for the master timestamp resolution.")
         return target
 
+    def fixed_phase_timestamps(
+        self,
+        master_timestamps,
+        master_timestamp_path: str,
+        fps: int,
+        *,
+        phase_offset_s: float = 0.0,
+    ):
+        """Build an absolute 50 Hz-style grid shared with online inference."""
+
+        timestamps = self.np.asarray(master_timestamps).reshape(-1)
+        if timestamps.size == 0 or not self.np.isfinite(timestamps).all():
+            raise ValueError("Cannot generate a fixed grid from invalid timestamps.")
+        if timestamps.size > 1 and self.np.any(self.np.diff(timestamps) <= 0):
+            raise ValueError("Master timestamps must be strictly increasing.")
+
+        scale = self._timestamp_seconds_scale(master_timestamp_path)
+        units_per_second = int(round(1.0 / scale))
+        if not math.isclose(units_per_second * scale, 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("Fixed-phase sampling requires an integral timestamp unit.")
+        if units_per_second % fps != 0:
+            raise ValueError(
+                f"fps={fps} does not divide {units_per_second} timestamp units per second."
+            )
+        period = units_per_second // fps
+        if not self.np.issubdtype(timestamps.dtype, self.np.integer):
+            raise ValueError("Fixed-phase sampling requires integer source timestamps.")
+
+        phase_offset_units_float = float(phase_offset_s) * units_per_second
+        phase_offset_units = int(round(phase_offset_units_float))
+        if not math.isclose(
+            phase_offset_units_float,
+            phase_offset_units,
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            raise ValueError(
+                "Fixed-phase offset must be exactly representable in the master "
+                "timestamp unit."
+            )
+        if phase_offset_units < 0 or phase_offset_units >= period:
+            raise ValueError(
+                f"Fixed-phase offset must be in [0, {1.0 / fps:.9f}) seconds."
+            )
+
+        first = int(timestamps[0])
+        last = int(timestamps[-1])
+        first_tick = (
+            -(-(first - phase_offset_units) // period) * period
+            + phase_offset_units
+        )
+        last_tick = (
+            (last - phase_offset_units) // period * period
+            + phase_offset_units
+        )
+        if last_tick < first_tick:
+            raise ValueError("Episode contains no complete fixed-rate sampling tick.")
+        return self.np.arange(
+            first_tick,
+            last_tick + period,
+            period,
+            dtype=timestamps.dtype,
+        )
+
     def estimate_fps_from_master_timestamps(self, master_timestamp_path: str) -> int:
         if self.np is None:
             raise RuntimeError("numpy is required to estimate fps from timestamps.")
@@ -1264,17 +1931,19 @@ class H5Dataset:
             )
 
         all_dt = self.np.concatenate(dt_chunks)
-        mean_dt_seconds = float(all_dt.mean()) * self._timestamp_seconds_scale(master_timestamp_path)
-        if mean_dt_seconds <= 0:
-            raise ValueError(f"Invalid mean timestamp delta: {mean_dt_seconds}")
+        median_dt_seconds = float(self.np.median(all_dt)) * self._timestamp_seconds_scale(
+            master_timestamp_path
+        )
+        if median_dt_seconds <= 0:
+            raise ValueError(f"Invalid median timestamp delta: {median_dt_seconds}")
 
-        fps = int(round(1.0 / mean_dt_seconds))
+        fps = int(round(1.0 / median_dt_seconds))
         if fps <= 0:
             raise ValueError(f"Invalid estimated fps: {fps}")
 
         print(
             f"estimated fps={fps} from {master_timestamp_path} "
-            f"(mean_dt={mean_dt_seconds:.9f}s, num_deltas={all_dt.size})"
+            f"(median_dt={median_dt_seconds:.9f}s, num_deltas={all_dt.size})"
         )
         return fps
 
@@ -1289,8 +1958,24 @@ class H5Dataset:
             return 1e-9
         return 1.0
 
+    def _timestamps_ns(self, timestamps, timestamp_path):
+        """Convert timestamps without losing integer microsecond precision."""
+
+        raw = self.np.asarray(timestamps).reshape(-1)
+        scale_to_ns = self._timestamp_seconds_scale(timestamp_path) / 1.0e-9
+        integral_scale = int(round(scale_to_ns))
+        if self.np.issubdtype(raw.dtype, self.np.integer) and math.isclose(
+            scale_to_ns, integral_scale, rel_tol=0.0, abs_tol=1.0e-12
+        ):
+            return raw.astype(self.np.int64) * integral_scale
+        return self.np.rint(
+            raw.astype(self.np.float64) * scale_to_ns
+        ).astype(self.np.int64)
+
     def read_frame(self, h5_file, frame_idx, mappings, h5_path, master_timestamp_path, cache=None):
         # 从 H5 里读出一帧，返回 LeRobotDataset.add_frame 需要的字典
+        if cache is not None and cache.get("camera_rows"):
+            return self._read_camera_rows_frame(frame_idx, mappings, cache)
         if cache is not None and cache.get("dual_rate"):
             return self._read_dual_rate_frame(frame_idx, mappings, cache)
         if cache is not None and "target_timestamps" in cache:
@@ -1312,6 +1997,46 @@ class H5Dataset:
                 cache=cache,
             )
 
+        return frame
+
+    def _read_camera_rows_frame(self, frame_idx, mappings, cache):
+        frame = {}
+        for mapping in mappings:
+            cached = cache["resampled"][mapping["lerobot_key"]]
+            if isinstance(cached, Mapping) and "indices" in cached:
+                indices = self.np.asarray(cached["indices"][frame_idx])
+                source = self._mapping_sources(mapping)[0]
+                dataset = cache["datasets"][source["h5_path"]]
+                if indices.shape == ():
+                    value = dataset[int(indices)]
+                else:
+                    value = self.np.stack(
+                        [dataset[int(index)] for index in indices.reshape(-1)],
+                        axis=0,
+                    ).reshape(indices.shape + dataset.shape[1:])
+                value = self._apply_transform(value, mapping.get("transform"))
+                frame[mapping["lerobot_key"]] = self._to_lerobot_value(value)
+                age_key = mapping.get("emit_age_key")
+                if age_key is not None:
+                    frame[age_key] = self.np.asarray(
+                        [cached["age_s"][frame_idx]], dtype=self.np.float32
+                    )
+            else:
+                frame[mapping["lerobot_key"]] = self._to_lerobot_value(
+                    cached[frame_idx]
+                )
+
+        if cache.get("store_timestamps"):
+            frame["timing.anchor_timestamp_ns"] = self.np.asarray(
+                [cache["anchor_timestamp_ns"][frame_idx]], dtype=self.np.int64
+            )
+            frame["timing.high_timestamp_ns"] = cache[
+                "high_timestamp_ns"
+            ][frame_idx, :, None].copy()
+            frame["timing.action_source_timestamp_ns"] = self.np.asarray(
+                [cache["action_source_timestamp_ns"][frame_idx]],
+                dtype=self.np.int64,
+            )
         return frame
 
     def _read_dual_rate_frame(self, frame_idx, mappings, cache):
@@ -1765,7 +2490,11 @@ def filter_supported_kwargs(callable_obj: Any, kwargs: Mapping[str, Any]) -> dic
 
 def run_inspect(args: argparse.Namespace) -> None:
     config = load_shape_meta(args.config)
-    input_path = config_path(config, "input")
+    input_path = config_path(
+        config,
+        "input",
+        override=getattr(args, "input", None),
+    )
     h5py = load_h5py()
     h5_dataset = H5Dataset(
         input_path,
@@ -1774,22 +2503,54 @@ def run_inspect(args: argparse.Namespace) -> None:
     )
     h5_dataset.inspect()
 
+
+def resolve_raw_index_fps(config: Mapping[str, Any], h5_dataset: H5Dataset) -> dict[str, Any]:
+    """Infer only the nominal LeRobot fps; raw-index rows remain untouched."""
+
+    if config.get("fps") is not None:
+        return dict(config)
+    sampling = config.get("sampling")
+    mode = (
+        str(sampling.get("mode", "")).strip().lower()
+        if isinstance(sampling, Mapping)
+        else ""
+    )
+    if mode != "raw_index":
+        return dict(config)
+    master_timestamp_path = config.get("master_timestamp_path")
+    if not isinstance(master_timestamp_path, str) or not master_timestamp_path:
+        raise ValueError("shape_meta must define master_timestamp_path.")
+    resolved = dict(config)
+    resolved["fps"] = h5_dataset.estimate_fps_from_master_timestamps(
+        master_timestamp_path
+    )
+    return resolved
+
 def run_conversion(args: argparse.Namespace) -> None:
     config = load_shape_meta(args.config)
-    spec = build_conversion_spec(config)
     h5py, np, LeRobotDataset = load_conversion_deps()
 
     h5_dataset = H5Dataset(
-        config_path(config, "input"),
+        config_path(
+            config,
+            "input",
+            override=getattr(args, "input", None),
+        ),
         h5py=h5py,
         np=np,
         max_episodes=config_int(config, "max_episodes"),
     )
+    config = resolve_raw_index_fps(config, h5_dataset)
+    spec = build_conversion_spec(config)
     fps = spec["fps"]
     lerobot_dataset = LeRobotV3Dataset(
         LeRobotDataset,
         repo_id=config_str(config, "repo_id", "local/h5_to_lerobot_v3"),
-        root=config_path(config, "output"),
+        root=config_path(
+            config,
+            "output",
+            override=getattr(args, "output", None),
+        ),
         fps=fps,
         features=spec["lerobot_features"],
         no_videos=config_bool(config, "no_videos"),
@@ -1810,6 +2571,7 @@ def run_conversion(args: argparse.Namespace) -> None:
                         spec["fps"],
                         h5_path,
                         timeline=spec["timeline"],
+                        sampling=spec["sampling"],
                     )
                     episode_length = h5_dataset.episode_length(
                         h5_file,

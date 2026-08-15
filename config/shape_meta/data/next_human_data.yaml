@@ -1,0 +1,76 @@
+io:
+  # Resolved to the sibling repository regardless of the launch directory.
+  input: nero_ws/runs/next_data_v2_filted  
+  output: data/train_episode/next_data_v2_50hz_lbv3
+  repo_id: next_data_v2_50hz_lbv3
+  max_episodes: null
+  no_videos: True
+  push_to_hub: false
+
+task: nero_tau_free_downsample
+master_timestamp_path: teleop/timestamp_us
+fps: 50
+
+# Match tau-free deployment exactly: absolute 20 ms ticks select the newest
+# complete H5 snapshot whose watermark is not later than the tick.
+sampling:
+  mode: fixed_rate_causal_snapshot
+  phase: unix_epoch
+  max_staleness_s: 0.03
+
+
+features:
+  observation.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  observation.velocity:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/dq_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  # observation.acceleration:
+  #   dtype: float32
+  #   shape: [7]
+  #   h5_path: teleop/ddq_follower
+  #   timestamp_path: teleop/timestamp_us
+  #   align: pchip
+  #   max_gap_s: 0.015
+  
+
+  # Desired joint displacement used by the low-level position controller.
+  # Select one complete snapshot first, then subtract on the shared 50 Hz grid.
+  observation.delta_q:
+    dtype: float32
+    shape: [7]
+    sources:
+      # q_cmd is an event/hold signal: use the latest command at or before t.
+      - h5_path: teleop/q_cmd
+        timestamp_path: teleop/timestamp_us
+        align: previous
+        # allow_stale: true
+      # q_follower is a continuous physical trajectory.
+      - h5_path: teleop/q_follower
+        timestamp_path: teleop/timestamp_us
+        align: previous
+    combine: subtract
+
+  observation.torque:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+ 
+
+
+
+
+
+        

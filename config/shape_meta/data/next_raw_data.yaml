@@ -1,0 +1,53 @@
+io:
+  # Gap-split raw signals: no Butterworth preprocessing and no resampling.
+  input: nero_ws/runs/bg_data_filted
+  output: data/train_episode/bg_data_filted
+  repo_id: bg_data_filted
+  max_episodes: null
+  no_videos: true
+  push_to_hub: false
+
+task: bg_data_filted
+master_timestamp_path: teleop/timestamp_us
+
+# fps is intentionally omitted. raw_index infers nominal LeRobot fps from the
+# median master-timestamp interval, while preserving every original H5 row.
+sampling:
+  mode: raw_index
+
+features:
+  observation.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    align: index
+
+  observation.velocity:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/dq_follower
+    align: index
+
+  observation.delta_q:
+    dtype: float32
+    shape: [7]
+    sources:
+      - h5_path: teleop/q_cmd
+        align: index
+      - h5_path: teleop/q_follower
+        align: index
+    combine: subtract
+
+  observation.torque:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_follower
+    align: index
+
+  # LeRobot's built-in timestamp is nominal frame_index/fps. Keep the exact
+  # acquisition timestamp separately so the original jitter is not lost.
+  timing.master_timestamp_us:
+    dtype: int64
+    shape: [1]
+    h5_path: teleop/timestamp_us
+    align: index
