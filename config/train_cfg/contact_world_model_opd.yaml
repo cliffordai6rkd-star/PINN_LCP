@@ -1,0 +1,168 @@
+# Contact WM OPD Student configuration.
+# Train the Teacher first with contact_world_model.yaml, then point
+# distillation.teacher_checkpoint_path to its best checkpoint directory/file.
+
+dataloader:
+  root: ../nero_ws/runs/wipe_board
+  backend: h5
+  h5_patterns: ["*.h5", "*.hdf5"]
+  max_cadence_error_s: 0.02
+
+  high_fps: 100
+  state_history_horizon: 50
+  prediction_horizon: 32
+  action_condition_horizon: 8
+  action_condition_features: [absolute_pose, current_ee_pose, relative_pose]
+  current_ee_pose_source: fk
+  pad_history: true
+  pad_future: false
+
+  expert_fps: 25.0
+  action_chunk_horizon: 8
+  inference_delay_s: 0.0
+  action_resample: nearest
+  action_condition_mode: composite
+
+  h5_timestamp_path: teleop/timestamp_us
+  h5_timestamp_unit: us
+  h5_anchor_timestamp_path: cameras/wrist/timestamp_us
+  h5_anchor_timestamp_unit: us
+  h5_high_fields:
+    q: teleop/q_follower
+    dq: null
+    ddq: null
+    tau: teleop/tau_follower
+    wrench: teleop/wrench_cal
+    tau_ext: teleop/tau_ext_cal
+    reference_pose:
+      path: teleop/ee_pose_follower
+      transform: ee_pose_matrix_to_quaternion
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys: [q, tau, target_relative_pose]
+
+contact_gate:
+  enabled: true
+  label_mode: three_phase
+  metric: force_xyz_l2
+  thresholds:
+    force_xyz_l2: {"off": 0.3, "on": 1.5}
+    tau_ext_l1: {"off": 0.15, "on": 0.75}
+  consecutive_frames: 5
+  class_weights: auto
+  max_class_weight: 20.0
+
+model:
+  state_contract: q_tau_contact
+  joint_dim: 7
+  wrench_dim: 0
+  action_dim: 21
+  hidden_dim: 128
+  state_layers: 2
+  action_layers: 2
+  attention_heads: 4
+  dropout: 0.05
+  flow_layers: 4
+  flow_attention_heads: 4
+  flow_ffn_multiplier: 4
+  # Student uses 2 ODE evaluations; the Teacher checkpoint is loaded at 8.
+  flow_inference_steps: 2
+  flow_solver: heun
+  contact_logit_scale: 4.0
+  state_estimator:
+    sampling_dt: 0.01
+    q_mean_window_samples: 10
+    q_lowpass_cutoff_hz: 10
+    dq_lowpass_cutoff_hz: 6
+    ddq_lowpass_cutoff_hz: 3
+
+loss:
+  flow_weight: 1.0
+  flow_q_weight: 1.0
+  flow_tau_weight: 1.0
+  flow_contact_weight: 1.0
+  q_weight: 1.0
+  tau_weight: 1.0
+  contact_weight: 1.0
+  contact_class_weights: auto
+  dq_weight: 0.2
+  ddq_weight: 0
+  derived_warmup_steps: 20000
+  standardize_derived_residuals: true
+  wrench_weight: 0.0
+
+physics:
+  rnea:
+    enabled: false
+  rnea_rollout:
+    enabled: false
+
+distillation:
+  enabled: true
+  teacher_checkpoint_path: outputs/contact_world_model_opd_sweep/20260819_113728/teacher/checkpoints/step_00100000.pt
+  teacher_steps: 8
+  student_steps: 2
+  weight: 1.0
+  # Contact logits are distilled in addition to q/tau endpoint matching.
+  contact_weight: 1.0
+  rollout_weight: 1.0
+  rollout_steps: 4
+  curriculum:
+    enabled: true
+    epochs: 100
+    teacher_weight_start: 1.0
+    teacher_weight_end: 0.5
+    rollout_weight_start: 0.0
+    rollout_weight_end: 1.0
+
+train:
+  device: cuda:0
+  batch_size: 128
+  num_workers: 8
+  pin_memory: true
+  non_blocking_transfer: true
+  persistent_workers: true
+  prefetch_factor: 2
+  amp:
+    enabled: true
+    dtype: bfloat16
+  # 132021 train samples / batch_size=128 is about 1032 batches per epoch.
+  # Match the 100-epoch OPD curriculum instead of reaching the LR floor halfway.
+  max_train_steps: 105000
+  checkpoint_every_steps: 5000
+  val_ratio: 0.0
+  val_episode_indices: [15, 50, 90]
+  split_mode: episode
+  seed: 42
+  lr: 0.0001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  validation_flow_time: 0.5
+  output_dir: outputs/contact_world_model_opd
+  monitor_key: val_loss
+  top_k: 5
+  save_latest_checkpoint: true
+  ema:
+    enabled: true
+    decay: 0.999
+    update_after_step: 0
+    update_every: 1
+    use_for_validation: true
+  scheduler:
+    name: cosine
+    T_max: 105000
+    eta_min: 0.000001
+  early_stopping:
+    # Keep val_loss logging, but use the fixed optimizer-step budget by default.
+    enabled: false
+    patience: 30
+    warmup_epochs: 20
+    min_delta: 0.000001
+  wandb:
+    enabled: false
+    project: contact-world-model
+    name: contact-wm-opd-student
+    group: contact-world-model-opd
+    tags: [q-tau, contact-three-phase, flow-distillation, opd]
+    mode: online
+    log_every_steps: 10

@@ -169,6 +169,62 @@ def future_joint_state_from_position(
     }
 
 
+def causal_joint_acceleration_from_velocity(
+    dq: torch.Tensor,
+    config: CausalStateEstimatorConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return raw dq and causally filtered ddq for ``[B,T,D]`` velocity."""
+
+    if dq.ndim != 3:
+        raise ValueError(f"dq must have shape [B, T, D], got {tuple(dq.shape)}")
+    if dq.shape[1] < 1 or dq.shape[2] < 1:
+        raise ValueError("dq time and feature dimensions must be positive")
+    if not dq.is_floating_point():
+        raise TypeError("dq must be a floating-point tensor")
+
+    dt = dq.new_tensor(config.sampling_dt)
+    ddq_alpha = _lowpass_alpha(dq, config.ddq_lowpass_cutoff_hz, dt)
+    previous_dq = dq[:, 0]
+    previous_ddq = torch.zeros_like(previous_dq)
+
+    ddq_values = [previous_ddq]
+    for time_index in range(1, dq.shape[1]):
+        dq_value = dq[:, time_index]
+        ddq_raw = (dq_value - previous_dq) / dt
+        ddq_filtered = _apply_one_pole(ddq_raw, previous_ddq, ddq_alpha)
+        ddq_values.append(ddq_filtered)
+        previous_dq = dq_value
+        previous_ddq = ddq_filtered
+
+    return dq, torch.stack(ddq_values, dim=1)
+
+
+def future_joint_acceleration_from_velocity(
+    dq_history: torch.Tensor,
+    dq_future: torch.Tensor,
+    config: CausalStateEstimatorConfig,
+) -> torch.Tensor:
+    """Warm the causal ddq estimator on observed dq and return future ddq."""
+
+    if dq_history.ndim != 3 or dq_future.ndim != 3:
+        raise ValueError("dq_history and dq_future must have shape [B, T, D]")
+    if (
+        dq_history.shape[0] != dq_future.shape[0]
+        or dq_history.shape[2] != dq_future.shape[2]
+    ):
+        raise ValueError("dq history and future batch/feature dimensions differ")
+    if dq_history.shape[1] < 1 or dq_future.shape[1] < 1:
+        raise ValueError("dq history and future horizons must be positive")
+
+    future_horizon = dq_future.shape[1]
+    dq_complete = torch.cat((dq_history, dq_future), dim=1)
+    _, ddq_complete = causal_joint_acceleration_from_velocity(
+        dq_complete,
+        config,
+    )
+    return ddq_complete[:, -future_horizon:]
+
+
 def _optional_float(value):
     return None if value is None else float(value)
 

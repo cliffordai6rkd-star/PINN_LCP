@@ -47,18 +47,18 @@ class Normalizer:
 
     
     def gaussian_normalize(self, key, x):
-        mean = self.stats[key]["mean"]
-        std = self.stats[key]["std"]
+        mean = self.stats[key]["mean"].to(device=x.device, dtype=x.dtype)
+        std = self.stats[key]["std"].to(device=x.device, dtype=x.dtype)
         return (x - mean) / (std + self.eps)
 
     def limit_normalize(self, key, x):
-        min_v = self.stats[key]["min"]
-        max_v = self.stats[key]["max"]
+        min_v = self.stats[key]["min"].to(device=x.device, dtype=x.dtype)
+        max_v = self.stats[key]["max"].to(device=x.device, dtype=x.dtype)
         return 2 * (x - min_v) / (max_v - min_v + self.eps) - 1
 
     def quantile_normalize(self, key ,x):
-        q01 = self.stats[key]["q01"]
-        q99 = self.stats[key]["q99"]
+        q01 = self.stats[key]["q01"].to(device=x.device, dtype=x.dtype)
+        q99 = self.stats[key]["q99"].to(device=x.device, dtype=x.dtype)
         x = 2 * (x - q01) / (q99 - q01 + self.eps) - 1
         return torch.clamp(x, -1.0, 1.0)
 

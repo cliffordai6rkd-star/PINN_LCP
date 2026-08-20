@@ -41,15 +41,19 @@ def parse_args():
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path("data/train_episode/wipe_board/wipe_board_lerobotv3"),
+        default=Path("data/train_episode/wipe_board_lbv3"),
         help="LeRobot dataset root to visualize.",
     )
     parser.add_argument(
         "--repo-id",
-        default="wipe_board_lerobotv3",
+        default="wipe_board_lbv3",
         help="LeRobot repo id to visualize.",
     )
-    parser.add_argument("--video-backend", default="torchcodec")
+    parser.add_argument(
+        "--video-backend",
+        default="pyav",
+        help="LeRobot video decoder backend (default: pyav).",
+    )
     parser.add_argument(
         "--start-episode",
         type=int,
@@ -129,11 +133,29 @@ def build_rerun_blueprint():
         ),
         column_shares=[1, 1, 1],
     )
+    feature_row_3 = rrb.Horizontal(
+        rrb.TimeSeriesView(
+            name="Joint Position",
+            origin="signals/features/joint",
+            contents="$origin/**",
+        ),
+        rrb.TimeSeriesView(
+            name="Action Joint",
+            origin="signals/features/action_joint",
+            contents="$origin/**",
+        ),
+        column_shares=[1, 1],
+    )
 
     return rrb.Blueprint(
         rrb.Horizontal(
             rrb.Vertical(
-                rrb.Vertical(feature_row_1, feature_row_2, row_shares=[1, 1]),
+                rrb.Vertical(
+                    feature_row_1,
+                    feature_row_2,
+                    feature_row_3,
+                    row_shares=[1, 1, 1],
+                ),
                 rrb.Horizontal(
                     rrb.Spatial3DView(
                         name="EE Matrix",
@@ -156,8 +178,8 @@ def build_rerun_blueprint():
                     contents="$origin/**",
                 ),
                 rrb.Spatial2DView(
-                    name="Current Side 1",
-                    origin="current/cameras/side_1",
+                    name="Current Side",
+                    origin="current/cameras/side",
                     contents="$origin/**",
                 ),
                 rrb.Spatial2DView(
@@ -232,25 +254,38 @@ class RerunLeRobotVisualizer:
         self.ee_quat7_trajectory = []
         self.image_path_map = {
             "observation.images.wrist": "cameras/wrist",
-            "observation.images.side_1": "cameras/side_1",
+            "observation.images.side": "cameras/side",
+            "observation.images.side_1": "cameras/side",
             "observation.images.side_2": "cameras/side_2",
         }
         self.current_image_path_map = {
             "observation.images.wrist": "current/cameras/wrist",
-            "observation.images.side_1": "current/cameras/side_1",
+            "observation.images.side": "current/cameras/side",
+            "observation.images.side_1": "current/cameras/side",
             "observation.images.side_2": "current/cameras/side_2",
         }
+        self.wrench_feature_keys = (
+            "observation.wrench_ext",
+            "observation.wrench_cal",
+            "observation.ft_window",
+        )
+        self.ee_pose_feature_keys = (
+            "observation.ee_state.ee_pose",
+            "action.ee_pose",
+        )
         self.force_names = ["fx", "fy", "fz", "tx", "ty", "tz"]
         self.gripper_path_map = {
             "observation.ee_state.gripper": "signals/gripper/observation",
             "action.gripper_state": "signals/gripper/action",
         }
         self.lowdim_feature_map = {
+            "observation.joint": ("joint", [f"q{i}" for i in range(7)]),
             "observation.velocity": ("velocity", [f"v{i}" for i in range(7)]),
             "observation.acceleration": ("acceleration", [f"a{i}" for i in range(7)]),
             "observation.torque": ("torque", [f"tau{i}" for i in range(7)]),
             "observation.ee_velocity": ("ee_velocity", ["vx", "vy", "vz", "wx", "wy", "wz"]),
             "observation.ee_acceleration": ("ee_acceleration", ["ax", "ay", "az", "alphax", "alphay", "alphaz"]),
+            "action.joint": ("action_joint", [f"q{i}" for i in range(7)]),
         }
 
     def reset_episode_state(self):
@@ -322,8 +357,8 @@ class RerunLeRobotVisualizer:
         return image
 
     def log_force_window(self, sample):
-        key = "observation.ft_window"
-        if key not in sample:
+        key = next((key for key in self.wrench_feature_keys if key in sample), None)
+        if key is None:
             return
 
         ft = np.asarray(self.reader._to_numpy(sample[key]))
@@ -403,8 +438,8 @@ class RerunLeRobotVisualizer:
                 rr.log(f"signals/features/{feature_name}/{channel_name}", rr.Scalars(float(value)))
 
     def log_ee_pose(self, sample):
-        key = "observation.ee_state.ee_pose"
-        if key not in sample:
+        key = next((key for key in self.ee_pose_feature_keys if key in sample), None)
+        if key is None:
             return
 
         pose = np.asarray(self.reader._to_numpy(sample[key]))

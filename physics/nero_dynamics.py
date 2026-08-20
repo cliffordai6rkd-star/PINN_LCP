@@ -371,6 +371,44 @@ class PinocchioDynamics:
             dtype=q.dtype if dtype is None else dtype,
         )
 
+    def frame_poses(
+        self,
+        q: Tensor,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Tensor:
+        """Return configured frame poses as ``[..., 7]`` ``xyz+xyzw``.
+
+        This is forward kinematics only. It does not evaluate RNEA, torque
+        dynamics, or any physics loss, so it remains usable for action
+        condition construction when the RNEA rollout is disabled.
+        """
+
+        shape = _same_state_shape({"q": q})
+        self._ensure_initialized()
+        if shape[-1] != self._model.nq:
+            raise ValueError(
+                f"Joint dimension {shape[-1]} does not match reduced "
+                f"Pinocchio nq={self._model.nq}."
+            )
+        q_np = q.detach().cpu().to(torch.float64).numpy().reshape(-1, shape[-1])
+        poses = np.empty((q_np.shape[0], 7), dtype=np.float64)
+        for index, q_value in enumerate(q_np):
+            self._pin.framesForwardKinematics(self._model, self._data, q_value)
+            placement = self._data.oMf[self._frame_id]
+            quaternion = np.asarray(
+                self._pin.Quaternion(placement.rotation).coeffs(),
+                dtype=np.float64,
+            )
+            poses[index, :3] = np.asarray(placement.translation, dtype=np.float64)
+            poses[index, 3:] = quaternion
+        return torch.as_tensor(
+            poses.reshape(*shape[:-1], 7),
+            device=q.device if device is None else device,
+            dtype=q.dtype if dtype is None else dtype,
+        )
+
     def build_cache(
         self,
         q: Tensor,
@@ -473,12 +511,16 @@ class FrozenTauFPredictor(nn.Module):
         normalizer_payload: Mapping[str, Any] | None = None,
         normalize_mode: str | None = None,
         history_horizon: int = 50,
+        max_model_batch_size: int = 1024,
     ):
         super().__init__()
         if history_horizon <= 0:
             raise ValueError("tau_f history_horizon must be positive.")
+        if max_model_batch_size <= 0:
+            raise ValueError("tau_f max_model_batch_size must be positive.")
         self.model = model
         self.history_horizon = int(history_horizon)
+        self.max_model_batch_size = int(max_model_batch_size)
         self.normalizer = _CheckpointNormalizer(
             normalizer_payload,
             fallback_mode=normalize_mode,
@@ -585,17 +627,30 @@ class FrozenTauFPredictor(nn.Module):
             self.history_horizon,
             device=window_starts.device,
         )
-        window_indices = window_starts[:, None] + window_offsets[None, :]
-        model_batch = {
-            key: value[:, window_indices]
-            .reshape(
-                batch_size * future_steps,
-                self.history_horizon,
-                value.shape[-1],
+        total_windows = batch_size * future_steps
+        chunk_outputs = []
+        for start in range(0, total_windows, self.max_model_batch_size):
+            end = min(start + self.max_model_batch_size, total_windows)
+            flat_indices = torch.arange(
+                start,
+                end,
+                device=window_starts.device,
             )
-            for key, value in complete_inputs.items()
-        }
-        normalized_tau_f = self.model(model_batch)["tau_f_pred"].reshape(
+            batch_indices = torch.div(
+                flat_indices,
+                future_steps,
+                rounding_mode="floor",
+            )
+            future_indices = flat_indices - batch_indices * future_steps
+            window_indices = (
+                future_indices[:, None] + 1 + window_offsets[None, :]
+            )
+            model_batch = {
+                key: value[batch_indices[:, None], window_indices]
+                for key, value in complete_inputs.items()
+            }
+            chunk_outputs.append(self.model(model_batch)["tau_f_pred"])
+        normalized_tau_f = torch.cat(chunk_outputs, dim=0).reshape(
             batch_size,
             future_steps,
             -1,
@@ -607,6 +662,7 @@ def load_tau_f_predictor(
     checkpoint_path: str | Path,
     *,
     device: torch.device | str = "cpu",
+    max_model_batch_size: int = 1024,
 ) -> FrozenTauFPredictor:
     """Load a frozen sequence regressor and its training normalizer."""
 
@@ -627,6 +683,7 @@ def load_tau_f_predictor(
         normalizer_payload=normalizer_payload,
         normalize_mode=dataloader_config.get("normalize_mode"),
         history_horizon=int(dataloader_config.get("horizon", 50)),
+        max_model_batch_size=max_model_batch_size,
     )
     return predictor.to(device)
 

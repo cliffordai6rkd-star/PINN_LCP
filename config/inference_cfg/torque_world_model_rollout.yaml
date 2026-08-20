@@ -1,0 +1,49 @@
+# A checkpoint file can be given directly. For step-based Flow WM directories,
+# the newest step_*.pt is selected; legacy val_loss files still use lowest loss.
+checkpoint_path: outputs/torque_world_model_opd/checkpoints
+
+dataset:
+  backend: lerobot
+  repo_id: wipe_board_wm_lbv3
+  root: data/train_episode/wipe_board_wm_lbv3
+  video_backend: pyav
+  high_fps: 100
+
+inference:
+  device: cuda:0
+  # "ema" loads checkpoint["model"], which is also used for validation.
+  # Use "raw" only when deliberately comparing the non-EMA weights.
+  weights: ema
+  batch_size: 8
+  num_workers: 0
+  # ODE integration parameters. Heun evaluates the Flow decoder twice per step.
+  flow_steps: 2
+  flow_solver: heun
+
+selection:
+  # null evaluates all episodes. Keep a short explicit list for quick plots.
+  episode_indices: [0]
+  # 32 rows gives non-overlapping 0.32 s windows at 100 Hz. Set 4 to emulate
+  # a 25 Hz receding-horizon refresh, or 1 to inspect every valid anchor.
+  sample_stride: 32
+  start_offset: 0
+  max_rollouts_per_episode: 8
+  max_total_rollouts: null
+
+physics:
+  # RNEA rollout is optional and disabled by default for the data-driven
+  # Teacher/Student model. Wrench can be read directly from model output.
+  enabled: false
+  # null inherits the matching values embedded in the world-model checkpoint.
+  tau_f_checkpoint_path: null
+  tau_f_window_batch_size: null
+  wrench_damping: null
+  ddq_q_blend: 0.2
+
+plot:
+  output_dir: outputs/torque_world_model_rollout
+  signals: [q, dq, ddq, tau, wrench]
+  dpi: 160
+  subplot_columns: 2
+  # Saves timestamps and all data/pred arrays beside the PNG files.
+  save_arrays: true

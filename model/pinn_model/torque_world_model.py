@@ -1,9 +1,8 @@
-"""Conditional Flow Matching world model for joint position and torque.
+"""Conditional Flow Matching world model for joint state and wrench.
 
-The neural condition is deliberately restricted to a high-rate ``q/tau``
-history and a future end-effector target chunk.  Derivatives, wrench, and
-contact labels are supervision-only quantities handled outside the condition
-encoder.
+The neural condition uses high-rate ``q/dq/tau/(wrench)`` history and a future
+end-effector target chunk. ``wrench_dim=0`` preserves the legacy contract;
+the production configuration enables the joint wrench output with ``6``.
 """
 
 from __future__ import annotations
@@ -137,28 +136,31 @@ class FlowDecoderBlock(nn.Module):
 
 
 class TorqueWorldModel(nn.Module):
-    """Generate future ``q``, ``tau``, and contact logits with CFM.
+    """Generate future ``q``, ``dq``, ``tau``, and optionally ``wrench`` with CFM.
 
     Condition keys:
 
     - ``q``: normalized joint-position history ``[B, H, D]``
+    - ``dq``: normalized joint-velocity history ``[B, H, D]``
     - ``tau``: normalized measured-torque history ``[B, H, D]``
-    - ``target_relative_pose``: normalized held action targets ``[B, A, U]``
+    - ``target_relative_pose``: normalized future action targets ``[B, A, U]``
     - ``target_relative_pose_mask``: optional valid-token mask ``[B, A]``
 
     ``H``, ``A``, and the generated future horizon ``T`` are independent.
-    Training additionally requires ``q_future``, ``tau_future``, and
-    ``contact_future`` targets, but none of those are condition-encoder inputs.
+    Training additionally requires ``q_future``, ``dq_future``, and
+    ``tau_future`` targets.
     """
 
     CONDITION_KEYS = (
         "q",
+        "dq",
         "tau",
+        "wrench",
         "target_relative_pose",
         "target_relative_pose_mask",
     )
-    TARGET_KEYS = ("q_future", "tau_future", "contact_future")
-    MODEL_VERSION = "torque_world_model_v1"
+    TARGET_KEYS = ("q_future", "dq_future", "tau_future", "wrench_future")
+    MODEL_VERSION = "torque_world_model_v3"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -186,6 +188,19 @@ class TorqueWorldModel(nn.Module):
             else int(configured_action_horizon)
         )
         self.joint_dim = int(model_config.get("joint_dim", 7))
+        self.state_contract = str(
+            model_config.get("state_contract", "q_dq_tau_wrench")
+        ).lower()
+        self.q_tau_contact_contract = self.state_contract == "q_tau_contact"
+        if self.state_contract not in {"q_dq_tau_wrench", "q_tau_contact"}:
+            raise ValueError(
+                "model.state_contract must be q_dq_tau_wrench or q_tau_contact"
+            )
+        self.wrench_dim = int(model_config.get("wrench_dim", 0))
+        if self.q_tau_contact_contract and self.wrench_dim:
+            raise ValueError(
+                "model.wrench_dim must be zero for state_contract=q_tau_contact"
+            )
         self.action_dim = int(model_config.get("action_dim", 7))
         self.hidden_dim = int(model_config.get("hidden_dim", 128))
         self.state_layers = int(
@@ -210,13 +225,21 @@ class TorqueWorldModel(nn.Module):
             model_config.get("contact_logit_scale", 4.0)
         )
         self.dropout = float(model_config.get("dropout", 0.1))
-        self.flow_dim = 2 * self.joint_dim + 1
+        self.contact_state_count = 3 if self.q_tau_contact_contract else 0
+        self.flow_dim = (
+            2 * self.joint_dim + self.contact_state_count
+            if self.q_tau_contact_contract
+            else 3 * self.joint_dim + self.wrench_dim
+        )
         self._validate_config()
 
         state_dropout = self.dropout if self.state_layers > 1 else 0.0
         action_dropout = self.dropout if self.action_layers > 1 else 0.0
+        state_input_dim = (
+            2 * self.joint_dim if self.q_tau_contact_contract else self.flow_dim
+        )
         self.state_encoder = nn.GRU(
-            input_size=2 * self.joint_dim,
+            input_size=state_input_dim,
             hidden_size=self.hidden_dim,
             num_layers=self.state_layers,
             dropout=state_dropout,
@@ -290,6 +313,8 @@ class TorqueWorldModel(nn.Module):
             "flow_ffn_multiplier": self.flow_ffn_multiplier,
             "flow_inference_steps": self.flow_inference_steps,
         }
+        if self.wrench_dim < 0:
+            raise ValueError("model.wrench_dim must be non-negative")
         if self.action_condition_horizon is not None:
             positive["action_condition_horizon"] = self.action_condition_horizon
         invalid = [name for name, value in positive.items() if value <= 0]
@@ -297,6 +322,8 @@ class TorqueWorldModel(nn.Module):
             raise ValueError(f"model dimensions must be positive: {invalid}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("model.dropout must be in [0, 1)")
+        if not math.isfinite(self.contact_logit_scale) or self.contact_logit_scale <= 0.0:
+            raise ValueError("model.contact_logit_scale must be positive")
         if self.hidden_dim % self.attention_heads != 0:
             raise ValueError(
                 "model.hidden_dim must be divisible by attention_heads"
@@ -307,9 +334,6 @@ class TorqueWorldModel(nn.Module):
             )
         if self.flow_solver not in {"euler", "heun"}:
             raise ValueError("model.flow_solver must be 'euler' or 'heun'")
-        if not math.isfinite(self.contact_logit_scale) or self.contact_logit_scale <= 0:
-            raise ValueError("model.contact_logit_scale must be positive")
-
     @staticmethod
     def _require_sequence(
         batch: Mapping[str, torch.Tensor],
@@ -344,24 +368,55 @@ class TorqueWorldModel(nn.Module):
             horizon=self.history_horizon,
             feature_dim=self.joint_dim,
         )
+        dq = None
+        if not self.q_tau_contact_contract:
+            dq = self._require_sequence(
+                batch,
+                "dq",
+                horizon=self.history_horizon,
+                feature_dim=self.joint_dim,
+            )
         tau = self._require_sequence(
             batch,
             "tau",
             horizon=self.history_horizon,
             feature_dim=self.joint_dim,
         )
+        wrench = None
+        if self.wrench_dim:
+            wrench = self._require_sequence(
+                batch,
+                "wrench",
+                horizon=self.history_horizon,
+                feature_dim=self.wrench_dim,
+            )
         action = self._require_sequence(
             batch,
             "target_relative_pose",
             horizon=self.action_condition_horizon,
             feature_dim=self.action_dim,
         )
-        if q.shape[0] != tau.shape[0] or q.shape[0] != action.shape[0]:
-            raise ValueError("q, tau, and action batch dimensions must match")
-        if q.device != tau.device or q.device != action.device:
-            raise ValueError("q, tau, and action must be on the same device")
-        if q.dtype != tau.dtype or q.dtype != action.dtype:
-            raise ValueError("q, tau, and action must use the same dtype")
+        if (
+            (dq is not None and q.shape[0] != dq.shape[0])
+            or q.shape[0] != tau.shape[0]
+            or q.shape[0] != action.shape[0]
+            or (wrench is not None and q.shape[0] != wrench.shape[0])
+        ):
+            raise ValueError("q, dq, tau, and action batch dimensions must match")
+        if (
+            (dq is not None and q.device != dq.device)
+            or q.device != tau.device
+            or q.device != action.device
+            or (wrench is not None and q.device != wrench.device)
+        ):
+            raise ValueError("q, dq, tau, and action must be on the same device")
+        if (
+            (dq is not None and q.dtype != dq.dtype)
+            or q.dtype != tau.dtype
+            or q.dtype != action.dtype
+            or (wrench is not None and q.dtype != wrench.dtype)
+        ):
+            raise ValueError("q, dq, tau, and action must use the same dtype")
 
         mask = batch.get("target_relative_pose_mask")
         if mask is None:
@@ -392,14 +447,18 @@ class TorqueWorldModel(nn.Module):
                 valid_action = mask > 0
         if torch.any(valid_action.sum(dim=1) == 0):
             raise ValueError("each sample must contain at least one valid action token")
-        return q, tau, action, valid_action
+        return q, dq, tau, wrench, action, valid_action
 
     def encode_conditions(
         self,
         batch: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        q, tau, action, valid_action = self._condition_inputs(batch)
-        state_input = torch.cat((q, tau), dim=-1)
+        q, dq, tau, wrench, action, valid_action = self._condition_inputs(batch)
+        if self.q_tau_contact_contract:
+            state_values = (q, tau)
+        else:
+            state_values = (q, dq, tau) if wrench is None else (q, dq, tau, wrench)
+        state_input = torch.cat(state_values, dim=-1)
         state_features, state_hidden = self.state_encoder(state_input)
 
         masked_action = action.masked_fill(~valid_action[..., None], 0.0)
@@ -479,23 +538,71 @@ class TorqueWorldModel(nn.Module):
             horizon=self.future_horizon,
             feature_dim=self.joint_dim,
         )
+        if self.q_tau_contact_contract:
+            tau_future = self._require_sequence(
+                batch,
+                "tau_future",
+                horizon=self.future_horizon,
+                feature_dim=self.joint_dim,
+            )
+            contact = self._require_sequence(
+                batch,
+                "contact_future",
+                horizon=self.future_horizon,
+                feature_dim=1,
+            )
+            for key, value in (
+                ("q_future", q_future),
+                ("tau_future", tau_future),
+                ("contact_future", contact),
+            ):
+                if value.shape[0] != reference.shape[0]:
+                    raise ValueError(f"{key!r} batch dimension does not match q")
+                if value.device != reference.device or value.dtype != reference.dtype:
+                    raise ValueError(
+                        f"{key!r} must match condition device/dtype "
+                        f"({value.device}/{value.dtype} != "
+                        f"{reference.device}/{reference.dtype})"
+                    )
+            if torch.any((contact < 0.0) | (contact > 2.0)):
+                raise ValueError("contact_future values must be in [0, 2]")
+            contact_index = contact.squeeze(-1).round().to(dtype=torch.long)
+            contact_target = q_future.new_full(
+                (*contact_index.shape, self.contact_state_count),
+                -float(self.contact_logit_scale),
+            )
+            contact_target.scatter_(-1, contact_index[..., None], float(self.contact_logit_scale))
+            return torch.cat((q_future, tau_future, contact_target), dim=-1)
+        dq_future = self._require_sequence(
+            batch,
+            "dq_future",
+            horizon=self.future_horizon,
+            feature_dim=self.joint_dim,
+        )
         tau_future = self._require_sequence(
             batch,
             "tau_future",
             horizon=self.future_horizon,
             feature_dim=self.joint_dim,
         )
-        contact = self._require_sequence(
-            batch,
-            "contact_future",
-            horizon=self.future_horizon,
-            feature_dim=1,
-        )
-        for key, value in (
+        values = [
             ("q_future", q_future),
+            ("dq_future", dq_future),
             ("tau_future", tau_future),
-            ("contact_future", contact),
-        ):
+        ]
+        if self.wrench_dim:
+            values.append(
+                (
+                    "wrench_future",
+                    self._require_sequence(
+                        batch,
+                        "wrench_future",
+                        horizon=self.future_horizon,
+                        feature_dim=self.wrench_dim,
+                    ),
+                )
+            )
+        for key, value in values:
             if value.shape[0] != reference.shape[0]:
                 raise ValueError(f"{key!r} batch dimension does not match q")
             if value.device != reference.device or value.dtype != reference.dtype:
@@ -505,10 +612,7 @@ class TorqueWorldModel(nn.Module):
                     f"{key!r} must match condition device/dtype "
                     f"({value_type} != {reference_type})"
                 )
-        if torch.any((contact < 0.0) | (contact > 1.0)):
-            raise ValueError("contact_future values must be in [0, 1]")
-        contact_latent = (2.0 * contact - 1.0) * self.contact_logit_scale
-        return torch.cat((q_future, tau_future, contact_latent), dim=-1)
+        return torch.cat(tuple(value for _, value in values), dim=-1)
 
     def _history_flow_source(
         self,
@@ -520,7 +624,7 @@ class TorqueWorldModel(nn.Module):
         cadence. When H < T, the first observation is left-padded. This keeps
         H and T independent without time-warping or introducing future data.
         """
-        q, tau, _, _ = self._condition_inputs(batch)
+        q, dq, tau, wrench, _, _ = self._condition_inputs(batch)
 
         def align_history(value):
             if value.shape[1] >= self.future_horizon:
@@ -532,10 +636,16 @@ class TorqueWorldModel(nn.Module):
 
         q_source = align_history(q)
         tau_source = align_history(tau)
-        contact_source = q_source.new_zeros(
-            q_source.shape[0], self.future_horizon, 1
-        )
-        return torch.cat((q_source, tau_source, contact_source), dim=-1)
+        if self.q_tau_contact_contract:
+            contact_source = q_source.new_zeros(
+                q_source.shape[0], self.future_horizon, self.contact_state_count
+            )
+            return torch.cat((q_source, tau_source, contact_source), dim=-1)
+        dq_source = align_history(dq)
+        values = (q_source, dq_source, tau_source)
+        if wrench is not None:
+            values = (*values, align_history(wrench))
+        return torch.cat(values, dim=-1)
 
     def _prepare_flow_time(
         self,
@@ -616,18 +726,44 @@ class TorqueWorldModel(nn.Module):
 
     def _decoded_output(self, flow_state: torch.Tensor) -> dict[str, torch.Tensor]:
         q_pred = flow_state[..., : self.joint_dim]
-        tau_pred = flow_state[..., self.joint_dim : 2 * self.joint_dim]
-        contact_logits = flow_state[..., 2 * self.joint_dim :]
-        return {
+        if self.q_tau_contact_contract:
+            tau_pred = flow_state[..., self.joint_dim : 2 * self.joint_dim]
+            contact_logits = flow_state[..., 2 * self.joint_dim :]
+            contact_probability = torch.softmax(contact_logits, dim=-1)
+            contact_state = contact_probability.argmax(dim=-1, keepdim=True).to(
+                dtype=flow_state.dtype
+            )
+            return {
+                "flow_state_pred": flow_state,
+                "joint_pred": flow_state[..., : 2 * self.joint_dim],
+                "q_pred": q_pred,
+                "tau_pred": tau_pred,
+                "state_pred": {
+                    "q": q_pred,
+                    "tau": tau_pred,
+                    "contact_state": contact_state,
+                },
+                "contact_logits": contact_logits,
+                "contact_phase_logits": contact_logits,
+                "contact_probability": contact_probability[..., 2:3],
+                "contact_phase_probability": contact_probability,
+                "contact_state_pred": contact_state,
+            }
+        dq_pred = flow_state[..., self.joint_dim : 2 * self.joint_dim]
+        tau_pred = flow_state[..., 2 * self.joint_dim : 3 * self.joint_dim]
+        result = {
             "flow_state_pred": flow_state,
-            "joint_pred": flow_state[..., : 2 * self.joint_dim],
+            "joint_pred": flow_state,
             "q_pred": q_pred,
+            "dq_pred": dq_pred,
             "tau_pred": tau_pred,
-            "state_pred": {"q": q_pred, "tau": tau_pred},
-            "contact_logit": contact_logits,
-            "contact_logits": contact_logits,
-            "contact_probability": torch.sigmoid(contact_logits),
+            "state_pred": {"q": q_pred, "dq": dq_pred, "tau": tau_pred},
         }
+        if self.wrench_dim:
+            wrench_pred = flow_state[..., 3 * self.joint_dim : self.flow_dim]
+            result["wrench_pred"] = wrench_pred
+            result["state_pred"]["wrench"] = wrench_pred
+        return result
 
     def forward(
         self,
@@ -718,7 +854,7 @@ class TorqueWorldModel(nn.Module):
         steps: int | None = None,
         solver: str | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Roll the complete aligned q/tau history into one future trajectory."""
+        """Roll the complete aligned q/dq/tau history into one future trajectory."""
 
         encoded = self.encode_conditions(batch)
         source = self._history_flow_source(batch)
@@ -732,6 +868,27 @@ class TorqueWorldModel(nn.Module):
             **encoded,
             "flow_source_state": source,
         }
+        result.update(self._decoded_output(generated))
+        return result
+
+    def predict_differentiable(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        steps: int | None = None,
+        solver: str | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run Flow integration with gradients enabled for distillation."""
+
+        encoded = self.encode_conditions(batch)
+        source = self._history_flow_source(batch)
+        generated = self.integrate_flow(
+            source,
+            encoded,
+            steps=steps,
+            solver=solver,
+        )
+        result = {**encoded, "flow_source_state": source}
         result.update(self._decoded_output(generated))
         return result
 

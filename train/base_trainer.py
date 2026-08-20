@@ -1,6 +1,7 @@
 import argparse
 import copy
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -143,9 +144,41 @@ class BaseTrainer:
 
         self.batch_size = int(self.train_config.get("batch_size", 64))
         self.num_workers = int(self.train_config.get("num_workers", 4))
+        self.pin_memory = bool(self.train_config.get("pin_memory", False))
+        self.non_blocking_transfer = bool(
+            self.train_config.get("non_blocking_transfer", self.pin_memory)
+        )
+        self.persistent_workers = bool(
+            self.train_config.get("persistent_workers", False)
+        )
+        self.prefetch_factor = int(self.train_config.get("prefetch_factor", 2))
+        if self.prefetch_factor < 1:
+            raise ValueError("train.prefetch_factor must be at least 1")
+        if self.persistent_workers and self.num_workers <= 0:
+            raise ValueError(
+                "train.persistent_workers requires train.num_workers > 0"
+            )
         self.lr = float(self.train_config.get("lr", 1e-4))
         self.weight_decay = float(self.train_config.get("weight_decay", 1e-4))
         self.num_epochs = int(self.train_config.get("num_epochs", 20))
+        configured_max_steps = self.train_config.get("max_train_steps")
+        self.max_train_steps = (
+            None if configured_max_steps is None else int(configured_max_steps)
+        )
+        self.checkpoint_every_steps = int(
+            self.train_config.get("checkpoint_every_steps", 0)
+        )
+        self.save_latest_checkpoint = bool(
+            self.train_config.get("save_latest_checkpoint", True)
+        )
+        self.step_based_training = (
+            self.max_train_steps is not None or self.checkpoint_every_steps > 0
+        )
+        self.max_optimizer_steps = None
+        if self.max_train_steps is not None and self.max_train_steps <= 0:
+            raise ValueError("train.max_train_steps must be positive")
+        if self.checkpoint_every_steps < 0:
+            raise ValueError("train.checkpoint_every_steps must be non-negative")
         gradient_clip_norm = self.train_config.get(
             "gradient_clip_norm",
             self.train_config.get("max_grad_norm"),
@@ -162,7 +195,10 @@ class BaseTrainer:
             "early_stopping_monitor_key",
             self.monitor_key,
         )
-        self.top_k = int(self.train_config.get("top_k", 3))
+        configured_top_k = self.train_config.get("top_k", 3)
+        self.top_k = 3 if configured_top_k is None else int(configured_top_k)
+        if self.top_k < 1:
+            raise ValueError("train.top_k must be at least 1")
         self.best_checkpoints = []
 
         early_stopping = self.train_config.get("early_stopping") or {}
@@ -184,6 +220,7 @@ class BaseTrainer:
         self.ckpt_dir = self.output_dir / "checkpoints"
 
         self.global_step = 0
+        self._last_step_checkpoint = None
         self.loss_history = []
         self.last_train_epoch_metrics = {}
         self.last_train_eval_epoch_metrics = {}
@@ -236,6 +273,28 @@ class BaseTrainer:
             raise ValueError("wandb.log_every_steps must be at least 1.")
         self.wandb_run = None
 
+        amp_config = self.train_config.get("amp") or {}
+        if not isinstance(amp_config, dict):
+            raise ValueError("train.amp must be a mapping or null")
+        self.amp_enabled = bool(amp_config.get("enabled", False))
+        amp_dtype = str(amp_config.get("dtype", "bfloat16")).lower()
+        amp_dtypes = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+        }
+        if amp_dtype not in amp_dtypes:
+            raise ValueError(
+                "train.amp.dtype must be bfloat16/bf16 or float16/fp16"
+            )
+        self.amp_dtype = amp_dtypes[amp_dtype]
+        if self.amp_enabled and not str(self.device).startswith("cuda"):
+            raise ValueError("train.amp.enabled requires a CUDA device")
+        self.amp_scaler = None
+        if self.amp_enabled and self.amp_dtype == torch.float16:
+            self.amp_scaler = torch.amp.GradScaler("cuda")
+
     def set_seed(self):
         import random
         import numpy as np
@@ -256,12 +315,37 @@ class BaseTrainer:
         for k, v in batch.items():
             if torch.is_tensor(v):
                 # log.info(f"{v} is tensor")
-                new_batch[k] = v.to(self.device)
+                new_batch[k] = v.to(
+                    self.device,
+                    non_blocking=self.non_blocking_transfer,
+                )
             else:
                 log.warning(f"{v} is not tensor")
                 new_batch[k] = v
 
         return new_batch
+
+    def autocast_context(self, enabled=None):
+        """Return the configured CUDA autocast context for model execution."""
+
+        if enabled is False or not self.amp_enabled:
+            return nullcontext()
+        return torch.autocast(
+            device_type="cuda",
+            dtype=self.amp_dtype,
+        )
+
+    def _dataloader_kwargs(self, *, shuffle):
+        kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": shuffle,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+        }
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = self.prefetch_factor
+            kwargs["persistent_workers"] = self.persistent_workers
+        return kwargs
     
     def build_dataset(self):
         raise NotImplementedError
@@ -610,18 +694,25 @@ class BaseTrainer:
 
         self.loader = torch.utils.data.DataLoader(
             train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
+            **self._dataloader_kwargs(shuffle=True),
         )
 
         if val_dataset is not None:
             self.val_loader = torch.utils.data.DataLoader(
                 val_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers,
+                **self._dataloader_kwargs(shuffle=False),
             )
+
+        if self.step_based_training:
+            if len(self.loader) < 1:
+                raise ValueError("step-based training requires a non-empty train loader")
+            self.max_optimizer_steps = (
+                self.max_train_steps
+                if self.max_train_steps is not None
+                else self.num_epochs * len(self.loader)
+            )
+            if self.checkpoint_every_steps <= 0:
+                self.checkpoint_every_steps = self.max_optimizer_steps
 
         self.model = self.build_model().to(self.device)
         if self.ema_enabled:
@@ -720,22 +811,44 @@ class BaseTrainer:
             leave=False,
         )
         for step, batch in enumerate(pbar):
+            if (
+                self.step_based_training
+                and self.max_optimizer_steps is not None
+                and self.global_step >= self.max_optimizer_steps
+            ):
+                break
             batch = self.batch_to_device(batch)
 
-            loss, out = self.compute_loss(batch)
+            with self.autocast_context():
+                loss, out = self.compute_loss(batch)
             batch_size = self._batch_size(batch)
 
             self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            if self.amp_scaler is not None:
+                self.amp_scaler.scale(loss).backward()
+                self.amp_scaler.unscale_(self.optimizer)
+            else:
+                loss.backward()
             if self.gradient_clip_norm is not None and self.gradient_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     max_norm=self.gradient_clip_norm,
                 )
-            self.optimizer.step()
+            if self.amp_scaler is not None:
+                self.amp_scaler.step(self.optimizer)
+                self.amp_scaler.update()
+            else:
+                self.optimizer.step()
             self.global_step += 1
             if self.ema is not None:
                 self.ema.update(self.model, self.global_step)
+            if (
+                self.step_based_training
+                and self.scheduler is not None
+                and self.scheduler_config.get("name", "none")
+                != "reduce_on_plateau"
+            ):
+                self.scheduler.step()
 
             total_loss += loss.item() * batch_size
             num_samples += batch_size
@@ -791,7 +904,8 @@ class BaseTrainer:
         try:
             for batch in pbar:
                 batch = self.batch_to_device(batch)
-                loss, out = self.compute_loss(batch)
+                with self.autocast_context():
+                    loss, out = self.compute_loss(batch)
                 batch_size = self._batch_size(batch)
 
                 total_loss += loss.item() * batch_size
@@ -851,8 +965,19 @@ class BaseTrainer:
 
         self.setup()
 
-        for epoch in range(self.num_epochs):
+        epoch = 0
+        while True:
+            if self.step_based_training:
+                if self.max_optimizer_steps is None or self.global_step >= self.max_optimizer_steps:
+                    break
+            elif epoch >= self.num_epochs:
+                break
+
+            step_before_epoch = self.global_step
             avg_loss = self.train_one_epoch(epoch)
+            if self.global_step == step_before_epoch:
+                log.warning("training loader produced no optimizer steps; stopping")
+                break
             train_eval_loss = self.evaluate_train_one_epoch(epoch)
             val_loss = self.validate_one_epoch(epoch)
 
@@ -890,7 +1015,7 @@ class BaseTrainer:
                     if monitor_loss is None:
                         monitor_loss = val_loss if val_loss is not None else avg_loss
                     self.scheduler.step(monitor_loss)
-                else:
+                elif not self.step_based_training:
                     self.scheduler.step()
 
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -976,7 +1101,11 @@ class BaseTrainer:
                 )
             self.log_wandb(epoch_metrics, step=self.global_step)
 
-            self.save_topk_checkpoint(epoch, metrics)
+            if self.step_based_training:
+                if self.global_step % self.checkpoint_every_steps == 0:
+                    self.save_step_checkpoint(epoch, metrics)
+            else:
+                self.save_topk_checkpoint(epoch, metrics)
 
             if self.should_stop_early(epoch, metrics):
                 log.info(
@@ -987,6 +1116,16 @@ class BaseTrainer:
                     self.early_stopping_patience,
                 )
                 break
+
+            epoch += 1
+
+        if (
+            self.step_based_training
+            and self.global_step > 0
+            and self._last_step_checkpoint != self.global_step
+        ):
+            final_metrics = self.loss_history[-1] if self.loss_history else {}
+            self.save_step_checkpoint(epoch, final_metrics)
 
         self.last_summary = {
             "num_epochs": len(self.loss_history),
@@ -1007,6 +1146,15 @@ class BaseTrainer:
             "early_stopping_monitor_key": self.early_stopping_monitor_key,
             "top_k": self.top_k,
             "best_checkpoints": self.best_checkpoints,
+            "max_train_steps": self.max_optimizer_steps,
+            "max_optimizer_steps": self.max_optimizer_steps,
+            "checkpoint_every_steps": self.checkpoint_every_steps,
+            "step_based_training": self.step_based_training,
+            "stopped_early": (
+                self.step_based_training
+                and self.max_optimizer_steps is not None
+                and self.global_step < self.max_optimizer_steps
+            ),
             "output_dir": self.output_dir,
             "ckpt_dir": self.ckpt_dir,
             "ema_enabled": self.ema_enabled,
@@ -1133,6 +1281,77 @@ class BaseTrainer:
         plt.close(fig)
 
         # log.info(f"saved loss plot: {path}")
+
+    def save_step_checkpoint(self, epoch, metrics):
+        """Save a step checkpoint and retain only the newest ``top_k`` files."""
+
+        if self.global_step <= 0:
+            return
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        step = int(self.global_step)
+        metrics = dict(metrics or {})
+        dataloader_config = self.config.get("dataloader") or {}
+        normalizer = getattr(self.dataset, "normalizer", None)
+        model_state = (
+            self.ema.model.state_dict() if self.ema is not None
+            else self.model.state_dict()
+        )
+        checkpoint = {
+            "checkpoint_type": "optimizer_step",
+            "epoch": int(epoch),
+            "global_step": step,
+            "metrics": metrics,
+            "avg_loss": metrics.get("avg_loss"),
+            "val_loss": metrics.get("val_loss"),
+            "model": model_state,
+            "model_raw": self.model.state_dict() if self.ema is not None else None,
+            "ema": self._ema_checkpoint_metadata(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "config": self.config,
+            "dataloader_filters": getattr(self.dataset, "filter_config", {}),
+            "sample_rate_hz": getattr(self.dataset, "sample_rate_hz", None),
+            "derived_target_config": getattr(
+                self, "derived_target_config", {"enabled": False}
+            ),
+            "normalizer": {
+                "stats": getattr(normalizer, "stats", {}),
+                "eps": getattr(normalizer, "eps", 1.0e-6),
+                "normalize_mode": dataloader_config.get("normalize_mode"),
+                "normalize_lowdim_keys": dataloader_config.get(
+                    "normalize_lowdim_keys"
+                ),
+            },
+        }
+        path = self.ckpt_dir / f"step_{step:08d}.pt"
+        torch.save(checkpoint, path)
+
+        self.best_checkpoints.append(
+            {
+                "score": None,
+                "epoch": int(epoch),
+                "global_step": step,
+                "path": path,
+                "metrics": metrics,
+            }
+        )
+        self.best_checkpoints.sort(key=lambda item: item["global_step"])
+        while len(self.best_checkpoints) > self.top_k:
+            removed = self.best_checkpoints.pop(0)
+            removed_path = Path(removed["path"])
+            if removed_path.exists():
+                removed_path.unlink()
+
+        if self.save_latest_checkpoint:
+            torch.save(checkpoint, self.ckpt_dir / "latest.pt")
+        self._last_step_checkpoint = step
+        log.info(
+            "saved optimizer-step checkpoint: step=%d path=%s retained=%s%s",
+            step,
+            path,
+            [item["global_step"] for item in self.best_checkpoints],
+            " latest.pt" if self.save_latest_checkpoint else "",
+        )
         
     def save_checkpoint(self, epoch, avg_loss, val_loss=None):
 
@@ -1250,9 +1469,9 @@ class BaseTrainer:
         lines.append("Training finished")
         lines.append(f"num_epochs: {summary['num_epochs']}")
         lines.append(f"global_step: {summary['global_step']}")
-        if "max_optimizer_steps" in summary:
+        if summary.get("max_train_steps") is not None:
             lines.append(
-                f"max_optimizer_steps: {summary['max_optimizer_steps']}"
+                f"max_train_steps: {summary['max_train_steps']}"
             )
             lines.append(f"stopped_early: {summary['stopped_early']}")
         lines.append(f"last_loss: {summary['last_loss']}")
@@ -1281,9 +1500,11 @@ class BaseTrainer:
                 if "global_step" in item
                 else ""
             )
+            score = item.get("score")
+            score_text = f" score={score:.6f}" if score is not None else ""
             lines.append(
-                f"  epoch={item['epoch']}{step_text} "
-                f"score={item['score']:.6f} path={item['path']}"
+                f"  epoch={item['epoch']}{step_text}{score_text} "
+                f"path={item['path']}"
             )
     
         return "\n".join(lines)

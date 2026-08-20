@@ -13,10 +13,14 @@ import torch
 @dataclass(frozen=True)
 class ContactGateConfig:
     enabled: bool = False
+    label_mode: str = "binary"
+    metric: str = "force_xyz_l2"
     wrench_key: str = "wrench"
     contact_key: str = "contact"
     force_on_threshold_n: float = 0.5
     force_off_threshold_n: float = 0.3
+    signal_on_threshold: float | None = None
+    signal_off_threshold: float | None = None
     consecutive_frames: int = 3
     head_hidden_dim: int = 64
     probability_threshold: float = 0.5
@@ -26,6 +30,22 @@ class ContactGateConfig:
     @classmethod
     def from_config(cls, config: Mapping):
         values = config.get("contact_gate") or {}
+        metric = str(values.get("metric", "force_xyz_l2")).lower()
+        threshold_sets = values.get("thresholds") or {}
+        metric_thresholds = threshold_sets.get(metric) or {}
+        # YAML 1.1 parses unquoted ``on``/``off`` as booleans.
+        configured_threshold_on = metric_thresholds.get(
+            "on", metric_thresholds.get(True)
+        )
+        configured_threshold_off = metric_thresholds.get(
+            "off", metric_thresholds.get(False)
+        )
+        configured_on = values.get("on_threshold")
+        if configured_on is None:
+            configured_on = configured_threshold_on
+        configured_off = values.get("off_threshold")
+        if configured_off is None:
+            configured_off = configured_threshold_off
         positive_weight = values.get("positive_class_weight", "auto")
         if isinstance(positive_weight, str):
             positive_weight = positive_weight.lower()
@@ -33,6 +53,8 @@ class ContactGateConfig:
             positive_weight = float(positive_weight)
         result = cls(
             enabled=bool(values.get("enabled", False)),
+            label_mode=str(values.get("label_mode", "binary")).lower(),
+            metric=metric,
             wrench_key=str(values.get("wrench_key", "wrench")),
             contact_key=str(values.get("contact_key", "contact")),
             force_on_threshold_n=float(
@@ -40,6 +62,16 @@ class ContactGateConfig:
             ),
             force_off_threshold_n=float(
                 values.get("force_off_threshold_n", 0.3)
+            ),
+            signal_on_threshold=(
+                None
+                if configured_on is None
+                else float(configured_on)
+            ),
+            signal_off_threshold=(
+                None
+                if configured_off is None
+                else float(configured_off)
             ),
             consecutive_frames=int(values.get("consecutive_frames", 3)),
             head_hidden_dim=int(values.get("head_hidden_dim", 64)),
@@ -57,12 +89,21 @@ class ContactGateConfig:
         return result
 
     def validate(self):
-        if self.force_off_threshold_n < 0.0:
-            raise ValueError("contact_gate.force_off_threshold_n must be non-negative")
-        if self.force_on_threshold_n <= self.force_off_threshold_n:
+        if self.label_mode not in {"binary", "three_phase"}:
             raise ValueError(
-                "contact_gate.force_on_threshold_n must be greater than "
-                "force_off_threshold_n"
+                "contact_gate.label_mode must be 'binary' or 'three_phase'"
+            )
+        if self.metric not in {"force_xyz_l2", "wrench_l2", "tau_ext_l1"}:
+            raise ValueError(
+                "contact_gate.metric must be force_xyz_l2, wrench_l2, or tau_ext_l1"
+            )
+        off_threshold = self.off_threshold
+        on_threshold = self.on_threshold
+        if off_threshold < 0.0:
+            raise ValueError("contact_gate.off_threshold must be non-negative")
+        if on_threshold <= off_threshold:
+            raise ValueError(
+                "contact_gate.on_threshold must be greater than off_threshold"
             )
         if not 0.0 < self.probability_threshold < 1.0:
             raise ValueError(
@@ -79,6 +120,22 @@ class ContactGateConfig:
             raise ValueError(
                 "contact_gate.positive_class_weight must be 'auto' or positive"
             )
+
+    @property
+    def on_threshold(self) -> float:
+        return (
+            self.force_on_threshold_n
+            if self.signal_on_threshold is None
+            else self.signal_on_threshold
+        )
+
+    @property
+    def off_threshold(self) -> float:
+        return (
+            self.force_off_threshold_n
+            if self.signal_off_threshold is None
+            else self.signal_off_threshold
+        )
 
 
 def hysteresis_binary_mask(
@@ -148,8 +205,124 @@ def contact_labels_from_wrench(
         force_norm = torch.linalg.vector_norm(values[start:end, :3], dim=-1)
         labels[start:end, 0] = hysteresis_binary_mask(
             force_norm,
-            on_threshold=config.force_on_threshold_n,
-            off_threshold=config.force_off_threshold_n,
+            on_threshold=config.on_threshold,
+            off_threshold=config.off_threshold,
+            consecutive_frames=config.consecutive_frames,
+            backfill=True,
+        )
+    return labels
+
+
+def hysteresis_three_phase_mask(
+    signal: torch.Tensor,
+    *,
+    on_threshold: float,
+    off_threshold: float,
+    consecutive_frames: int,
+    backfill: bool = True,
+) -> torch.Tensor:
+    """Create causal free/precontact/contact labels from a scalar signal.
+
+    State ``1`` is the rising transition band. Once ``on_threshold`` has been
+    observed for ``consecutive_frames``, the state becomes ``2`` and remains
+    contact until ``off_threshold`` is observed for the same confirmation
+    length. The confirmed transition can be backfilled because labels are
+    generated offline.
+    """
+
+    values = torch.as_tensor(signal)
+    if values.ndim != 1:
+        raise ValueError(f"hysteresis signal must have shape [T], got {values.shape}")
+    if not torch.isfinite(values).all():
+        raise ValueError("hysteresis signal must contain finite values")
+    if on_threshold <= off_threshold:
+        raise ValueError("on_threshold must be greater than off_threshold")
+    if consecutive_frames < 1:
+        raise ValueError("consecutive_frames must be positive")
+
+    labels = torch.zeros_like(values, dtype=torch.float32)
+    state = 0  # free=0, precontact=1, contact=2
+    candidate_count = 0
+    release_count = 0
+    for index in range(values.shape[0]):
+        value = float(values[index])
+        if state == 2:
+            labels[index] = 2.0
+            if value <= off_threshold:
+                release_count += 1
+            else:
+                release_count = 0
+            if release_count >= consecutive_frames:
+                state = 0
+                start = index - consecutive_frames + 1 if backfill else index
+                labels[start : index + 1] = 0.0
+                release_count = 0
+            continue
+
+        if value <= off_threshold:
+            state = 0
+            candidate_count = 0
+            labels[index] = 0.0
+            continue
+
+        # Values between the thresholds are explicitly exposed as the
+        # precontact class, rather than being collapsed into free/contact.
+        labels[index] = 1.0
+        if value >= on_threshold:
+            candidate_count += 1
+        else:
+            candidate_count = 0
+        if candidate_count >= consecutive_frames:
+            state = 2
+            start = index - consecutive_frames + 1 if backfill else index
+            labels[start : index + 1] = 2.0
+            candidate_count = 0
+
+    return labels
+
+
+def contact_phase_labels_from_wrench(
+    wrench: torch.Tensor,
+    episode_bounds: Sequence[tuple[int, int]],
+    config: ContactGateConfig,
+) -> torch.Tensor:
+    """Create [T, 1] three-phase labels from the measured wrench force."""
+
+    values = torch.as_tensor(wrench)
+    if values.ndim != 2 or values.shape[-1] != 6:
+        raise ValueError(f"wrench must have shape [T, 6], got {values.shape}")
+    if config.metric == "force_xyz_l2":
+        signal = torch.linalg.vector_norm(values[:, :3], dim=-1)
+    elif config.metric == "wrench_l2":
+        signal = torch.linalg.vector_norm(values, dim=-1)
+    else:
+        raise ValueError(
+            "tau_ext_l1 labels require a separate tau_ext tensor; use "
+            "contact_phase_labels_from_signal"
+        )
+    return contact_phase_labels_from_signal(signal, episode_bounds, config)
+
+
+def contact_phase_labels_from_signal(
+    signal: torch.Tensor,
+    episode_bounds: Sequence[tuple[int, int]],
+    config: ContactGateConfig,
+) -> torch.Tensor:
+    """Create [T, 1] three-phase labels while resetting each episode."""
+
+    values = torch.as_tensor(signal)
+    if values.ndim != 1:
+        raise ValueError(f"signal must have shape [T], got {values.shape}")
+    labels = torch.zeros((values.shape[0], 1), dtype=torch.float32)
+    for start, end in episode_bounds:
+        start = int(start)
+        end = int(end)
+        if start < 0 or end <= start or end > values.shape[0]:
+            raise ValueError(f"invalid episode bounds [{start}, {end})")
+        labels[start:end, 0] = hysteresis_three_phase_mask(
+            values[start:end],
+            on_threshold=config.on_threshold,
+            off_threshold=config.off_threshold,
             consecutive_frames=config.consecutive_frames,
             backfill=True,
         )
@@ -190,8 +363,8 @@ def save_contact_label_cache(
         temporary,
         contact=values,
         episode_bounds=bounds,
-        force_on_threshold_n=np.asarray(config.force_on_threshold_n),
-        force_off_threshold_n=np.asarray(config.force_off_threshold_n),
+        force_on_threshold_n=np.asarray(config.on_threshold),
+        force_off_threshold_n=np.asarray(config.off_threshold),
         consecutive_frames=np.asarray(config.consecutive_frames, dtype=np.int64),
     )
     temporary.replace(destination)
@@ -233,8 +406,8 @@ def load_contact_label_cache(
     if not np.array_equal(cached_bounds, expected_bounds):
         raise ValueError("contact label cache episode bounds do not match dataset")
     if (
-        cached_on != config.force_on_threshold_n
-        or cached_off != config.force_off_threshold_n
+        cached_on != config.on_threshold
+        or cached_off != config.off_threshold
         or cached_frames != config.consecutive_frames
     ):
         raise ValueError(

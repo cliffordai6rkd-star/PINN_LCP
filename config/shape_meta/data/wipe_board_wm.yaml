@@ -45,7 +45,7 @@ features:
     h5_path: teleop/tau_follower
     align: index
 
-  observation.wrench_cal:
+
 
   observation.wrench_ext:
     rate: state

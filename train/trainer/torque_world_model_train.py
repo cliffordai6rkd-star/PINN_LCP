@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train the q/tau history-to-future torque world model."
+        description="Train the q/dq/tau history-to-future torque world model."
     )
     parser.add_argument(
         "--config",
@@ -86,6 +86,38 @@ class TorqueWorldModelTrainer(BaseTrainer):
             self._build_dynamics_cache()
 
     def _fit_contact_weight(self, sample_indices):
+        if (
+            self.loss_calculator.q_tau_contact_contract
+            and self.loss_calculator.contact_class_weights_is_auto
+        ):
+            frame_indices = self.dataset.covered_raw_indices(sample_indices)
+            labels = self.dataset.contact.index_select(
+                0, torch.as_tensor(frame_indices, dtype=torch.long)
+            ).reshape(-1).round().to(dtype=torch.long)
+            counts = torch.bincount(labels, minlength=3).to(dtype=torch.float64)
+            if torch.any(counts <= 0):
+                raise ValueError(
+                    "automatic three-phase weighting requires all contact phases "
+                    "to be present in the training episodes"
+                )
+            total = counts.sum()
+            weights = total / (3.0 * counts)
+            max_weight = float(
+                (self.config.get("contact_gate") or {}).get(
+                    "max_class_weight", 20.0
+                )
+            )
+            weights = weights.clamp(max=max_weight)
+            self.loss_calculator.set_contact_class_weights(weights.tolist())
+            log.info(
+                "three-phase labels: free=%d precontact=%d contact=%d "
+                "class_weights=%s",
+                int(counts[0]),
+                int(counts[1]),
+                int(counts[2]),
+                [round(float(value), 4) for value in weights],
+            )
+            return
         if not self.loss_calculator.contact_positive_class_weight_is_auto:
             return
         frame_indices = self.dataset.covered_raw_indices(sample_indices)

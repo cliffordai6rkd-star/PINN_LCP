@@ -58,6 +58,8 @@ setup(
             "pinn-train-tau-f=train.trainer.tau_f_sequence_train:main",
             "pinn-train-tau-free-v2=train.trainer.tau_free_sequence_train_v2:main",
             "pinn-train-wm=train.trainer.torque_world_model_train:main",
+            "pinn-train-wm-opd=train.trainer.torque_world_model_opd_train:main",
+            "pinn-wm-rollout=data_process.tool.torque_world_model_rollout_visualizer:main",
         ]
     },
 )

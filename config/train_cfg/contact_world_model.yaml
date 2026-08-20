@@ -1,0 +1,150 @@
+dataloader:
+  root: ../nero_ws/runs/wipe_board
+  backend: h5
+  h5_patterns: ["*.h5", "*.hdf5"]
+  max_cadence_error_s: 0.02
+
+  high_fps: 100
+  state_history_horizon: 50
+  prediction_horizon: 32
+  action_condition_horizon: 7
+  action_condition_features: [absolute_pose, current_ee_pose, relative_pose]
+  current_ee_pose_source: fk
+  pad_history: true
+  pad_future: false
+
+  expert_fps: 25.0
+  action_chunk_horizon: 7
+  inference_delay_s: 0.0
+  action_resample: nearest
+  action_condition_mode: composite
+
+  h5_timestamp_path: teleop/timestamp_us
+  h5_timestamp_unit: us
+  h5_anchor_timestamp_path: cameras/wrist/timestamp_us
+  h5_anchor_timestamp_unit: us
+  h5_high_fields:
+    q: teleop/q_follower
+    dq: null
+    ddq: null
+    tau: teleop/tau_follower
+    wrench: teleop/wrench_cal
+    tau_ext: teleop/tau_ext_cal
+    reference_pose:
+      path: teleop/ee_pose_follower
+      transform: ee_pose_matrix_to_quaternion
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys: [q, tau, target_relative_pose]
+
+contact_gate:
+  enabled: true
+  label_mode: three_phase
+  metric: force_xyz_l2
+  # Selected from the H5 tau_ext/wrench statistics and validated with 5-frame
+  # hysteresis: free <= off, rising transition in between, contact >= on.
+  # Units follow metric: N for force_xyz_l2, N.m for tau_ext_l1. Selecting
+  # contact_gate.metric automatically selects the matching threshold pair.
+  thresholds:
+    force_xyz_l2: {"off": 0.3, "on": 1.5}
+    tau_ext_l1: {"off": 0.15, "on": 0.75}
+  consecutive_frames: 5
+  class_weights: auto
+  max_class_weight: 20.0
+
+model:
+  state_contract: q_tau_contact
+  joint_dim: 7
+  wrench_dim: 0
+  action_dim: 21
+  hidden_dim: 128
+  state_layers: 2
+  action_layers: 2
+  attention_heads: 4
+  dropout: 0.05
+
+  flow_layers: 4
+  flow_attention_heads: 4
+  flow_ffn_multiplier: 4
+  flow_inference_steps: 8
+  flow_solver: heun
+  contact_logit_scale: 4.0
+  state_estimator:
+    sampling_dt: 0.01
+    q_mean_window_samples: 10
+    q_lowpass_cutoff_hz: 10
+    dq_lowpass_cutoff_hz: 6
+    ddq_lowpass_cutoff_hz: 3
+
+loss:
+  flow_weight: 1.0
+  flow_q_weight: 1.0
+  flow_tau_weight: 1.0
+  flow_contact_weight: 1.0
+  q_weight: 1.0
+  tau_weight: 1.0
+  contact_weight: 1.0
+  contact_class_weights: auto
+  # Both sides are computed by the q-only causal state estimator in the loss.
+  dq_weight: 0.2
+  ddq_weight: 0
+  # Avoid unstable finite-difference gradients before q prediction is smooth.
+  derived_warmup_steps: 50000
+  standardize_derived_residuals: true
+  wrench_weight: 0.0
+
+physics:
+  rnea:
+    enabled: false
+  rnea_rollout:
+    enabled: false
+
+train:
+  device: cuda:0
+  batch_size: 512
+  num_workers: 2
+  # max_train_steps is the optimization budget; num_epochs is only a
+  # validation/logging cadence fallback and is ignored when this is set.
+  max_train_steps: 100000
+  checkpoint_every_steps: 5000
+  val_ratio: 0.0
+  val_episode_indices: [15, 50, 90]
+  split_mode: episode
+  seed: 42
+
+  lr: 0.0001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  validation_flow_time: 0.5
+  output_dir: outputs/contact_world_model_v1
+  monitor_key: val_loss
+  top_k: 5
+  save_latest_checkpoint: true
+
+  ema:
+    enabled: true
+    decay: 0.999
+    update_after_step: 0
+    update_every: 1
+    use_for_validation: true
+
+  scheduler:
+    name: cosine
+    T_max: 100000
+    eta_min: 0.000001
+
+  early_stopping:
+    # Keep val_loss logging, but use the fixed optimizer-step budget by default.
+    enabled: false
+    patience: 30
+    warmup_epochs: 20
+    min_delta: 0.000001
+
+  wandb:
+    enabled: false
+    project: contact-world-model
+    name: q-tau-action-three-phase-contact
+    group: contact-world-model
+    tags: [q-tau, action-composite, contact-three-phase, flow-matching]
+    mode: online
+    log_every_steps: 10
