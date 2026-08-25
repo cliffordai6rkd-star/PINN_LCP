@@ -14,8 +14,8 @@ train_data:
       repo_id: push_button_lerobot_v3
       root: ../../data/swm/push_button_lerobot_v3
     - name: cuccumber_peeling
-      repo_id: cuccumber_peeling_lerobot_v3
-      root: ../../data/swm/cuccumber_peeling_lerobot_v3
+      repo_id: cucumber_peeling_lerobot_v3
+      root: ../../data/swm/cucumber_peeling_lerobot_v3
 
 dataloader:
   backend: lerobot
