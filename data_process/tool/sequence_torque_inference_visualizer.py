@@ -22,17 +22,17 @@ from data_process.offline_tau_labels import (
     causal_median_one_pole_filter,
     estimate_joint_states_causal,
 )
-from data_process.tau_f_target_generation import (
-    build_causal_tau_f_target,
-    normalize_tau_f_target_generation,
-    resolve_tau_f_target_generation,
+from data_process.tau_other_target_generation import (
+    build_causal_tau_other_target,
+    normalize_tau_other_target_generation,
+    resolve_tau_other_target_generation,
     timestamps_to_seconds,
 )
 from data_process.torque_target_filter import (
     filter_torque_target_episode,
     torque_target_filter_config,
 )
-from model.tau_f_sequence import build_tau_f_sequence_model
+from model.tau_other_sequence import build_tau_other_sequence_model
 from physics.nero_dynamics import (
     PinocchioDynamics,
     damped_wrench_from_joint_torque,
@@ -189,13 +189,13 @@ def load_sequence_checkpoint(
 
     config = checkpoint["config"]
     model_config = config.get("model") or {}
-    target_key = str(model_config.get("target_key", "tau_f"))
+    target_key = str(model_config.get("target_key", "tau_other"))
     if target_key != expected_target_key:
         raise ValueError(
             f"Checkpoint target_key={target_key!r}, expected {expected_target_key!r}"
         )
 
-    model = build_tau_f_sequence_model(config)
+    model = build_tau_other_sequence_model(config)
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
     normalizer = CheckpointNormalizer(checkpoint, config)
@@ -262,7 +262,7 @@ def checkpoint_derived_target_config(
         if not isinstance(resolved, Mapping):
             raise ValueError("checkpoint derived_target_config must be a mapping")
         return dict(resolved)
-    return resolve_tau_f_target_generation(config, filters)
+    return resolve_tau_other_target_generation(config, filters)
 
 
 def apply_checkpoint_filters_to_episode(
@@ -343,7 +343,7 @@ def infer_sequence_columns(
             key: normalizer.normalize(key, device_columns[key][window_indices])
             for key in active_inputs
         }
-        normalized_prediction = model(model_batch)["tau_f_pred"]
+        normalized_prediction = model(model_batch)["tau_other_pred"]
         prediction = normalizer.denormalize(target_key, normalized_prediction)
         target = device_columns[target_key].index_select(0, positions_device)
         prediction_batches.append(prediction.cpu())
@@ -387,7 +387,7 @@ def torque_error_metrics(result: Mapping[str, np.ndarray]) -> dict[str, Any]:
 
 
 def _rollout_state_estimator_config(config: Mapping[str, Any]) -> KalmanRTSConfig:
-    target_generation = normalize_tau_f_target_generation(config)
+    target_generation = normalize_tau_other_target_generation(config)
     if target_generation["enabled"]:
         return KalmanRTSConfig(**target_generation["state_estimator"])
     rollout = config.get("rollout") or {}
@@ -516,10 +516,11 @@ def add_external_wrench_rollout(
     config: Mapping[str, Any],
     *,
     dynamics: PinocchioDynamics | None = None,
+    target_generation: Mapping[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
     """Reconstruct the deployment tau_ext and map it to tool wrench."""
 
-    if rollout_mode not in {"tau_f", "tau_free"}:
+    if rollout_mode not in {"tau_other", "tau_free"}:
         raise ValueError(f"Unknown torque rollout mode: {rollout_mode!r}")
     positions = np.asarray(result["target_frame"], dtype=np.int64)
     q = columns["q"].detach().cpu().to(torch.float64)
@@ -528,67 +529,33 @@ def add_external_wrench_rollout(
     if rollout_mode == "tau_free":
         tau_ext_nm = -np.asarray(result["error_nm"], dtype=np.float64)
     else:
-        required = {"dq", "tau", "timestamp"}
+        target_generation = (
+            dict(target_generation)
+            if target_generation is not None
+            else normalize_tau_other_target_generation(config)
+        )
+        gravity_contract = bool(
+            target_generation.get("enabled", False)
+            and target_generation.get("method") == "causal_gravity_residual_v1"
+        )
+        if not gravity_contract:
+            raise RuntimeError(
+                "tau_other rollout requires causal_gravity_residual_v1"
+            )
+        required = {"tau", "timestamp"}
         missing = sorted(required - set(columns))
         if missing:
-            raise KeyError(f"tau_f rollout is missing episode columns: {missing}")
-        timestamps_s = columns["timestamp"].detach().cpu().numpy().astype(np.float64)
-        q_np = q.numpy()
-        dq_np = columns["dq"].detach().cpu().numpy().astype(np.float64)
-        estimate = estimate_joint_states_causal(
-            timestamps_s,
-            q_np,
-            dq_np,
-            _rollout_state_estimator_config(config),
-        )
-        ddq_causal = torch.as_tensor(estimate.ddq_filtered, dtype=torch.float64)
-        dq = torch.as_tensor(dq_np, dtype=torch.float64)
-        tau_id = dynamics.inverse_dynamics(q, dq, ddq_causal).cpu().numpy()
-
-        filters = normalize_dataloader_filters(
-            config.get("dataloader") or {},
-            (config.get("dataloader") or {}).get("lowdim_keys") or {},
-        )
-        tau_filter = filters.get("tau") or {}
-        if bool(tau_filter.get("enabled", False)):
-            tau_id_filtered = filter_episode_values(
-                timestamps_s,
-                tau_id,
-                tau_filter["operations"],
-            )
-        else:
-            model_config = config.get("model") or {}
-            rollout_config = config.get("rollout") or {}
-            matched_filter = (
-                rollout_config.get("matched_torque_filter")
-                or model_config.get("target_filter")
-                or {}
-            )
-            cutoff_hz = float(matched_filter.get("cutoff_hz", 10.0))
-            median_window = int(matched_filter.get("median_window", 1))
-            tau_id_filtered = causal_median_one_pole_filter(
-                timestamps_s,
-                tau_id,
-                cutoff_hz=cutoff_hz,
-                median_window=median_window,
-            )
+            raise KeyError(f"tau_other rollout is missing episode columns: {missing}")
+        tau_g = dynamics.gravity_torque(q).cpu().numpy()
+        rollout_config = config.get("rollout") or {}
         tau_measured = columns["tau"].detach().cpu().numpy().astype(np.float64)
-        if not tau_filter and not bool(rollout_config.get("measured_tau_already_filtered", True)):
-            tau_measured = causal_median_one_pole_filter(
-                timestamps_s,
-                tau_measured,
-                cutoff_hz=cutoff_hz,
-                median_window=median_window,
-            )
         tau_ext_nm = (
             tau_measured[positions]
-            - tau_id_filtered[positions]
+            - tau_g[positions]
             - np.asarray(result["prediction_nm"], dtype=np.float64)
         )
-        result["ddq_causal"] = estimate.ddq_filtered[positions]
-        result["tau_id_causal_nm"] = tau_id[positions]
-        result["tau_id_filtered_nm"] = tau_id_filtered[positions]
-        result["tau_measured_filtered_nm"] = tau_measured[positions]
+        result["tau_g_nm"] = tau_g[positions]
+        result["tau_measured_nm"] = tau_measured[positions]
 
     tau_ext_raw_nm = np.asarray(tau_ext_nm, dtype=np.float64)
     rollout_config = config.get("rollout") or {}
@@ -1229,7 +1196,7 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
     active_inputs = list(model_config.get("inputs") or [])
     rollout_keys = ["q"] if task.rollout_mode == "tau_free" else ["q", "dq", "tau"]
     build_target_from_sources = bool(
-        task.rollout_mode == "tau_f"
+        task.rollout_mode == "tau_other"
         and derived_target_config.get("enabled", False)
         and derived_target_config.get("target_key") == task.target_key
     )
@@ -1264,7 +1231,7 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
         if build_target_from_sources
         else str(args.timestamp_key)
     )
-    dynamics = PinocchioDynamics(config) if task.rollout_mode == "tau_f" else None
+    dynamics = PinocchioDynamics(config) if task.rollout_mode == "tau_other" else None
     log.info(
         "%s inference: checkpoint=%s dataset=%s episodes=%s device=%s horizon=%d",
         task.name,
@@ -1293,11 +1260,11 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
         apply_checkpoint_filters_to_episode(columns, filters)
         if build_target_from_sources:
             source_keys = derived_target_config["source_keys"]
-            derived = build_causal_tau_f_target(
+            derived = build_causal_tau_other_target(
                 timestamps_s=columns["timestamp"].numpy(),
                 q=columns[source_keys["q"]],
                 dq=columns[source_keys["dq"]],
-                tau_filtered=columns[source_keys["tau"]],
+                tau_measured=columns[source_keys["tau"]],
                 episodes=[
                     {
                         "dataset_from_index": 0,
@@ -1308,7 +1275,7 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
                 dynamics=dynamics,
             )
             columns[source_keys["dq"]] = derived.dq
-            columns[task.target_key] = derived.tau_f
+            columns[task.target_key] = derived.tau_other
         target_filter = torque_target_filter_config(config)
         if (
             task.rollout_mode == "tau_free"
@@ -1340,6 +1307,7 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
             columns,
             config,
             dynamics=dynamics,
+            target_generation=derived_target_config,
         )
         metrics = torque_error_metrics(result)
         metrics["rollout"] = rollout_metrics(result)

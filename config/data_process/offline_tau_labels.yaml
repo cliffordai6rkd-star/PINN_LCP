@@ -21,8 +21,9 @@ keys:
   ddq_rts: teleop/ddq_follower
   ddq_rts_std: teleop/ddq_rts_std
   tau_id: teleop/tau_id_rts
+  tau_g: teleop/tau_g
   tau_id_filtered: teleop/tau_id_rts_filtered
-  tau_f: teleop/tau_f_cal
+  tau_other: teleop/tau_other_cal
 
 processing:
   timestamp_scale_to_s: 1.0e-6
@@ -31,8 +32,9 @@ processing:
   dq_sign: [1, 1, 1, 1, 1, 1, 1]
   # Preserve measured q/dq in RNEA and fill only NaN dropouts from RTS state.
   rnea_state_source: measured
-  # tau_follower is already filtered with this causal filter. Apply an
-  # independent filter with identical parameters to tau_id before subtraction.
+  # tau_follower is already filtered with this causal filter. The gravity
+  # residual uses the measured torque directly; this filter only validates the
+  # source dataset contract.
   torque_filter:
     cutoff_hz: 10.0
     median_window: 1

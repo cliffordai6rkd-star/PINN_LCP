@@ -3,107 +3,87 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from data_process.causal_data_filter import filter_episode_values
-from data_process.tau_f_target_generation import (
-    build_causal_tau_f_target,
-    normalize_tau_f_target_generation,
-    resolve_tau_f_target_generation,
+from data_process.tau_other_target_generation import (
+    build_causal_tau_other_target,
+    normalize_tau_other_target_generation,
+    resolve_tau_other_target_generation,
     timestamps_to_seconds,
 )
-from train.trainer.tau_f_sequence_train import TauFTrainer
+from train.trainer.tau_other_sequence_train import TauOtherTrainer
 
 
 class FakeDynamics:
     def inverse_dynamics(self, q, dq, ddq):
         return q + 2.0 * dq + 3.0 * ddq
 
+    def gravity_torque(self, q):
+        return q + 10.0
+
 
 def target_generation_config():
     return {
         "target_generation": {
             "enabled": True,
-            "method": "causal_rnea_residual_v1",
-            "target_key": "tau_f",
+            "method": "causal_gravity_residual_v1",
+            "target_key": "tau_other",
             "timestamp_key": "timestamp_us",
             "timestamp_unit": "us",
             "source_keys": {"q": "q", "dq": "dq", "tau": "tau"},
             "dq_sign": [1, -1],
-            "rnea_state_source": "measured",
             "torque_filter_key": "tau",
-            "state_estimator": {"max_gap_s": 0.1},
         }
     }
 
 
-def test_causal_target_generation_matches_filtered_rnea_residual_per_episode():
+def test_gravity_target_generation_matches_observation_torque_per_episode():
     config = target_generation_config()
-    lowpass = {"type": "lowpass", "cutoff_hz": 10.0}
-    resolved = resolve_tau_f_target_generation(
-        config,
-        {
-            "tau": {
-                "enabled": True,
-                "operations": [lowpass],
-                "dataset_preprocessed_operations": [],
-            }
-        },
-    )
+    resolved = resolve_tau_other_target_generation(config, {})
     timestamps = np.concatenate((np.arange(6) * 0.01, 1.0 + np.arange(6) * 0.01))
     q = torch.zeros(12, 2)
     dq = torch.stack(
         (torch.linspace(0.0, 0.5, 12), torch.linspace(0.2, 0.8, 12)), dim=-1
     )
-    tau_filtered = torch.full((12, 2), 4.0)
+    tau_measured = torch.full((12, 2), 4.0)
     episodes = [
         {"dataset_from_index": 0, "dataset_to_index": 6},
         {"dataset_from_index": 6, "dataset_to_index": 12},
     ]
 
-    result = build_causal_tau_f_target(
+    result = build_causal_tau_other_target(
         timestamps_s=timestamps,
         q=q,
         dq=dq,
-        tau_filtered=tau_filtered,
+        tau_measured=tau_measured,
         episodes=episodes,
         target_config=resolved,
         dynamics=FakeDynamics(),
     )
 
     expected_dq = dq * torch.tensor([1.0, -1.0])
-    raw_tau_id = q + 2.0 * expected_dq + 3.0 * result.ddq
-    expected_tau_f = torch.empty_like(tau_filtered)
-    for episode in episodes:
-        start = episode["dataset_from_index"]
-        stop = episode["dataset_to_index"]
-        filtered_tau_id = filter_episode_values(
-            timestamps[start:stop],
-            raw_tau_id[start:stop],
-            [lowpass],
-        )
-        expected_tau_f[start:stop] = tau_filtered[start:stop] - torch.as_tensor(
-            filtered_tau_id
-        )
+    expected_gravity = q + 10.0
+    expected_tau_other = tau_measured - expected_gravity
 
     torch.testing.assert_close(result.dq, expected_dq)
-    torch.testing.assert_close(result.tau_f, expected_tau_f)
-    assert resolved["ddq_source"] == "variable_dt_kalman_forward_filter"
-    assert resolved["residual_formula"] == "tau_f=tau_filtered-tau_id_filtered"
+    torch.testing.assert_close(result.tau_other, expected_tau_other)
+    torch.testing.assert_close(result.tau_g, expected_gravity)
+    assert resolved["ddq_source"] == "unused"
+    assert resolved["residual_formula"] == "tau_other=tau_measured-tau_g"
 
 
 def test_causal_target_prefix_does_not_change_when_future_measurements_change():
     config = target_generation_config()
-    resolved = resolve_tau_f_target_generation(config, {})
+    resolved = resolve_tau_other_target_generation(config, {})
     timestamps = np.arange(12, dtype=np.float64) * 0.01
     q = torch.zeros(12, 2)
     dq = torch.zeros(12, 2)
     tau = torch.ones(12, 2)
     episode = [{"dataset_from_index": 0, "dataset_to_index": 12}]
 
-    baseline = build_causal_tau_f_target(
+    baseline = build_causal_tau_other_target(
         timestamps_s=timestamps,
         q=q,
         dq=dq,
-        tau_filtered=tau,
+        tau_measured=tau,
         episodes=episode,
         target_config=resolved,
         dynamics=FakeDynamics(),
@@ -112,22 +92,46 @@ def test_causal_target_prefix_does_not_change_when_future_measurements_change():
     changed_dq = dq.clone()
     changed_q[8:] = 100.0
     changed_dq[8:] = -100.0
-    changed = build_causal_tau_f_target(
+    changed = build_causal_tau_other_target(
         timestamps_s=timestamps,
         q=changed_q,
         dq=changed_dq,
-        tau_filtered=tau,
+        tau_measured=tau,
         episodes=episode,
         target_config=resolved,
         dynamics=FakeDynamics(),
     )
 
     torch.testing.assert_close(changed.ddq[:8], baseline.ddq[:8])
-    torch.testing.assert_close(changed.tau_f[:8], baseline.tau_f[:8])
+    torch.testing.assert_close(changed.tau_other[:8], baseline.tau_other[:8])
+
+
+def test_gravity_target_generation_uses_rnea_g_of_q_only():
+    config = target_generation_config()
+    resolved = resolve_tau_other_target_generation(config, {})
+    timestamps = np.arange(6, dtype=np.float64) * 0.01
+    q = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    dq = torch.zeros_like(q)
+    tau = torch.full_like(q, 20.0)
+
+    result = build_causal_tau_other_target(
+        timestamps_s=timestamps,
+        q=q,
+        dq=dq,
+        tau_measured=tau,
+        episodes=[{"dataset_from_index": 0, "dataset_to_index": 6}],
+        target_config=resolved,
+        dynamics=FakeDynamics(),
+    )
+
+    expected_gravity = q + 10.0
+    torch.testing.assert_close(result.tau_g, expected_gravity)
+    torch.testing.assert_close(result.tau_other, tau - expected_gravity)
+    assert resolved["residual_formula"] == "tau_other=tau_measured-tau_g"
 
 
 def test_timestamp_units_and_tau_input_leakage_contract():
-    normalized = normalize_tau_f_target_generation(target_generation_config())
+    normalized = normalize_tau_other_target_generation(target_generation_config())
     timestamps = timestamps_to_seconds(torch.tensor([0, 10_000, 20_000]), "us")
 
     np.testing.assert_allclose(timestamps, [0.0, 0.01, 0.02])
@@ -141,21 +145,21 @@ def test_timestamp_units_and_tau_input_leakage_contract():
                 "architecture": "lstm",
                 "inputs": ["q", "dq", "tau"],
                 "input_dims": {"q": 2, "dq": 2, "tau": 2},
-                "target_key": "tau_f",
+                "target_key": "tau_other",
             },
             "loss": {},
             "train": {},
         }
     )
     try:
-        TauFTrainer(trainer_config)
+        TauOtherTrainer(trainer_config)
     except ValueError as exc:
-        assert "leaks the tau_f supervision target" in str(exc)
+        assert "leaks the tau_other supervision target" in str(exc)
     else:
         raise AssertionError("Measured tau must be rejected as a model input")
 
 
-def test_trainer_builds_derived_target_without_dataset_tau_f_column():
+def test_trainer_builds_derived_target_without_dataset_tau_other_column():
     config = target_generation_config()
     config.update(
         {
@@ -164,14 +168,14 @@ def test_trainer_builds_derived_target_without_dataset_tau_f_column():
                 "architecture": "lstm",
                 "inputs": ["q", "dq"],
                 "input_dims": {"q": 2, "dq": 2},
-                "target_key": "tau_f",
+                "target_key": "tau_other",
             },
             "loss": {},
             "train": {"device": "cpu"},
         }
     )
-    trainer = TauFTrainer(config)
-    trainer.tau_f_dynamics = FakeDynamics()
+    trainer = TauOtherTrainer(config)
+    trainer.tau_other_dynamics = FakeDynamics()
     trainer.dataset = SimpleNamespace(
         filter_config={},
         dataset=SimpleNamespace(
@@ -187,10 +191,10 @@ def test_trainer_builds_derived_target_without_dataset_tau_f_column():
         "tau": torch.ones(6, 2),
     }
 
-    trainer._build_derived_target(cpu_cache, "tau_f")
+    trainer._build_derived_target(cpu_cache, "tau_other")
 
-    assert set(cpu_cache) == {"q", "dq", "tau", "tau_f"}
-    torch.testing.assert_close(cpu_cache["tau_f"], torch.ones(6, 2))
+    assert set(cpu_cache) == {"q", "dq", "tau", "tau_other"}
+    torch.testing.assert_close(cpu_cache["tau_other"], torch.full((6, 2), -9.0))
 
 
 def test_checkpoint_explicitly_stores_resolved_target_generation(tmp_path):
@@ -202,16 +206,16 @@ def test_checkpoint_explicitly_stores_resolved_target_generation(tmp_path):
                 "architecture": "lstm",
                 "inputs": ["q", "dq"],
                 "input_dims": {"q": 2, "dq": 2},
-                "target_key": "tau_f",
+                "target_key": "tau_other",
             },
             "loss": {},
             "train": {"device": "cpu", "output_dir": str(tmp_path)},
         }
     )
-    trainer = TauFTrainer(config)
+    trainer = TauOtherTrainer(config)
     trainer.derived_target_config = {
         **trainer.derived_target_config,
-        "torque_filter_operations": [{"type": "lowpass", "cutoff_hz": 10.0}],
+        "torque_filter_operations": [],
     }
     trainer.model = torch.nn.Linear(1, 1)
     trainer.optimizer = torch.optim.AdamW(trainer.model.parameters())
@@ -230,4 +234,4 @@ def test_checkpoint_explicitly_stores_resolved_target_generation(tmp_path):
     )
 
     assert checkpoint["derived_target_config"] == trainer.derived_target_config
-    assert checkpoint["derived_target_config"]["method"] == "causal_rnea_residual_v1"
+    assert checkpoint["derived_target_config"]["method"] == "causal_gravity_residual_v1"

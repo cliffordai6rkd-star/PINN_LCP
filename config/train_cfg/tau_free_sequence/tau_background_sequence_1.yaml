@@ -16,7 +16,7 @@ dataloader:
     # ddq: observation.acceleration
     delta_q: observation.delta_q
     tau: observation.torque
-    # tau_f: observation.tau_f
+    # tau_other: observation.tau_other
 
   normalize_mode: gaussian
   normalize_lowdim_keys:

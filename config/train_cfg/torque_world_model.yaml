@@ -1,162 +1,167 @@
-dataloader:
-  repo_id: wipe_board_wm_lbv3
-  root: data/train_episode/wipe_board_wm_lbv3
-  backend: lerobot
-  video_backend: pyav
+wm_v3_only: true
 
-  # H and T are 100 Hz state steps. One 25 Hz action token covers four state
-  # steps, so 8 future camera actions supervise a 32-step rollout.
+train_data:
+  # The converter writes one LeRobot v3 WM dataset per task. Point this
+  # config at the task selected for the run; do not train from raw H5.
+  format: lerobot_v3
+  v3_fields:
+    q: observation.joint
+    dq: observation.velocity
+    delta_q: observation.delta_q
+    tau: observation.torque
+    tau_ext: observation.tau_ext
+    action: action.joint
+  raw_h5_fields:
+    q: teleop/q_follower
+    dq: teleop/dq_follower
+    delta_q: {operation: subtract, paths: [teleop/q_cmd, teleop/q_follower]}
+    tau: teleop/tau_follower
+    tau_ext: teleop/tau_ext_cal
+    action: teleop/q_cmd
+
+dataloader:
+  repo_id: push_button_lerobot_v3
+  root: ../nero_ws/runs/push_button_lerobot_v3
+  backend: lerobot
+  v3_only: true
+  video_backend: pyav
   high_fps: 100
-  enforce_uniform_high_timestamps: false
-  max_high_timestamp_jitter_s: 0.0005
   state_history_horizon: 50
   prediction_horizon: 32
+  # Eight future actions at 25 Hz condition a rolling 100 Hz state window.
   action_condition_horizon: 8
-  # Each action token contains absolute target, current EE pose, and signed
-  # target-minus-current relative pose (7 dims each).
-  action_condition_features: [absolute_pose, current_ee_pose, relative_pose]
-  current_ee_pose_source: fk
-  pad_history: true
-  pad_future: false
-
-  # action.ee_pose is already the DP-style "next" action label held on the
-  # 100 Hz rows, so the first token sampled at the current camera anchor is
-  # a_cam[k+1], followed by the next seven camera actions.
-  expert_fps: 25.0
   action_chunk_horizon: 8
+  # Token 0 is the command already held at the anchor state; start with the
+  # next 25 Hz command while still sliding anchors at 100 Hz.
+  action_start_offset: 1
+  expert_fps: 25.0
   inference_delay_s: 0.0
   action_resample: nearest
-  action_condition_mode: composite
-
+  action_condition_mode: direct
+  action_key: action.joint
   high_timestamp_key: timing.state_timestamp_ns
   anchor_timestamp_key: timing.action_anchor_timestamp_ns
   high_keys:
     q: observation.joint
     dq: observation.velocity
-    ddq: null
+    delta_q: observation.delta_q
     tau: observation.torque
-    wrench: observation.wrench_ext
-    reference_pose: action.ee_pose
-
+    tau_ext: observation.tau_ext
+    action: action.joint
+  filters:
+    q:
+      enabled: true
+      source_already_filtered: true
+      operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]
+    dq:
+      enabled: true
+      source_already_filtered: true
+      operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]
+    delta_q:
+      enabled: true
+      source_already_filtered: true
+      operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]
+    tau:
+      enabled: true
+      source_already_filtered: true
+      operations: [{type: lowpass, cutoff_hz: 20.0, order: 2}]
+  filter_timestamp_unit: ns
   normalize_mode: gaussian
-  normalize_lowdim_keys:
-    [q, dq, tau, wrench, target_relative_pose]
+  normalize_lowdim_keys: [q, dq, delta_q, tau, action]
+  pad_history: true
+  pad_future: false
 
 contact_gate:
-  enabled: false
-  force_on_threshold_n: 0.3
-  force_off_threshold_n: 0.1
+  enabled: true
+  label_mode: three_phase
+  metric: tau_ext_l1
+  thresholds:
+    force_xyz_l2: {off: 0.3, on: 1.5}
+    tau_ext_l1: {off: 0.15, on: 0.75}
+    tau_ext_l2: {off: 0.15, on: 0.75}
   consecutive_frames: 5
-  positive_class_weight: 1.0
-  probability_threshold: 0.5
+  class_weights: auto
+  max_class_weight: 20.0
 
 model:
+  # This list controls history conditioning only. Outputs always contain all
+  # four state streams plus the three contact-phase logits.
+  inputs: [q, dq, delta_q, tau]
   joint_dim: 7
-  # Joint Flow state is [q(7), dq(7), tau(7), wrench(6)].
-  wrench_dim: 6
-  action_dim: 21
+  action_dim: 7
+  contact_state_count: 3
   hidden_dim: 128
   state_layers: 2
   action_layers: 2
   attention_heads: 4
   dropout: 0.05
-
   flow_layers: 4
   flow_attention_heads: 4
   flow_ffn_multiplier: 4
   flow_inference_steps: 8
   flow_solver: heun
-  # ddq is reconstructed causally from predicted dq, with a small q-derived
-  # blend configured under loss.ddq_q_blend.
-  state_estimator:
-    sampling_dt: 0.01
-    q_mean_window_samples: 10
-    q_lowpass_cutoff_hz: 10
-    dq_lowpass_cutoff_hz: 6
-    ddq_lowpass_cutoff_hz: 3
+  flow_source_mode: gaussian
+  contact_logit_scale: 4.0
 
 loss:
   flow_weight: 1.0
   flow_q_weight: 1.0
   flow_dq_weight: 1.0
+  flow_delta_q_weight: 1.0
   flow_tau_weight: 1.0
-  flow_wrench_weight: 1.0
   q_weight: 1.0
   dq_weight: 0.5
+  delta_q_weight: 1.0
   tau_weight: 1.0
-  # Direct supervised wrench prediction. RNEA consistency is independent.
-  wrench_observation_weight: 1.0
-  ddq_weight: 0.0
-  wrench_weight: 0.1
-  wrench_warmup_steps: 3000
-  ddq_q_blend: 0.2
-  standardize_derived_residuals: true
-  standardize_wrench_residual: true
-
-physics:
-  rnea:
-    # Runtime/training RNEA rollout is intentionally disabled for the first
-    # data-driven Teacher/Student experiment.
-    enabled: false
-  rnea_rollout:
-    enabled: false
-  # This is a local RNEA expansion around recorded future states.
-  tau_f_checkpoint_path: outputs/tau_f_sequence/ep1/checkpoints/epoch_075_val_loss_0.001229.pt
-  tau_f_window_batch_size: 1024
-  wrench_damping: 0.02
-  soft_contact_gate: false
-  cache_chunk_size: 2048
-  pinocchio:
-    urdf_path: sim_mesh/nero/nero_with_gripper.urdf
-    frame_name: gripper_tcp
-    reference_frame: LOCAL
-    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+  contact_weight: 1.0
+  contact_class_weights: auto
+  # q/dq measurements are strongly correlated but noisy; keep this soft.
+  kinematic_consistency_weight: 0.05
+  ddq_smoothness_weight: 0.05
+  ddq_smoothness_warmup_steps: 1000
+  ddq_smoothness_huber_delta: 1.0
+  ddq_smoothness_normalize: true
+  dt: 0.01
 
 train:
   device: cuda:0
   batch_size: 256
   num_workers: 8
-  # max_train_steps is the optimization budget; epoch only controls how often
-  # validation and aggregate logging are run.
-  max_train_steps: 50000
-  checkpoint_every_steps: 5000
+  num_epochs: 3000
+  checkpoint_every_epochs: 500
   val_ratio: 0.1
   split_mode: episode
   seed: 42
-
   lr: 0.0001
   weight_decay: 0.0001
   gradient_clip_norm: 1.0
   validation_flow_time: 0.5
-  output_dir: outputs/torque_world_model_test2
+  output_dir: outputs/torque_world_model_v4
   monitor_key: val_loss
-  top_k: 2
-  save_latest_checkpoint: true
-
+  top_k: 3
+  save_latest_checkpoint: false
+  contact_sampling:
+    enabled: true
+    future_phase_reduction: max
+    phase_weights: [1.0, 2.0, 3.0]
+    replacement: true
   ema:
     enabled: true
     decay: 0.999
     update_after_step: 0
     update_every: 1
     use_for_validation: true
-
   scheduler:
     name: cosine
-    T_max: 50000
+    T_max: 3000
     eta_min: 0.000001
-
   early_stopping:
-    # Keep val_loss logging, but use the fixed optimizer-step budget by default.
     enabled: false
-    patience: 30
-    warmup_epochs: 20
-    min_delta: 0.000001
-
   wandb:
     enabled: false
     project: torque-world-model
-    name: history-action-cfm
+    name: q-dq-deltaq-tau-action-cfm
     group: torque-world-model
-    tags: [q-dq-tau, action-chunk, flow-matching, rnea, tau-f]
+    tags: [q-dq-deltaq-tau, direct-action, contact-three-phase, flow-matching]
     mode: online
     log_every_steps: 10

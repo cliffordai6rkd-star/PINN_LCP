@@ -45,7 +45,7 @@ def _config(*, physics=False):
             "standardize_wrench_residual": False,
         },
         "physics": {
-            "tau_f_checkpoint_path": "unused-test-checkpoint.pt",
+            "tau_other_checkpoint_path": "unused-test-checkpoint.pt",
             "wrench_damping": 0.1,
             "soft_contact_gate": True,
         },
@@ -113,7 +113,7 @@ def test_configured_dt_drives_q_derived_velocity_and_acceleration():
     )
 
 
-class _FakeTauF:
+class _FakeTauOther:
     def __call__(self, history, future):
         del history
         return 0.05 * (
@@ -124,7 +124,7 @@ class _FakeTauF:
 def test_local_rnea_wrench_loss_reaches_q_tau_and_contact():
     config = _config(physics=True)
     calculator = TorqueWorldModelLoss(config)
-    calculator.tau_f_predictor = _FakeTauF()
+    calculator.tau_other_predictor = _FakeTauOther()
     batch = _batch()
     batch_size, horizon, joints = batch["q_future"].shape
     identity = torch.eye(joints).expand(batch_size, horizon, joints, joints)
@@ -161,4 +161,4 @@ def test_local_rnea_wrench_loss_reaches_q_tau_and_contact():
     assert q_pred.grad is not None and q_pred.grad.abs().sum() > 0
     assert tau_pred.grad is not None and tau_pred.grad.abs().sum() > 0
     assert contact_logits.grad is not None and contact_logits.grad.abs().sum() > 0
-    assert "wrench_pred" in out and "tau_f_pred" in out
+    assert "wrench_pred" in out and "tau_other_pred" in out

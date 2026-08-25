@@ -92,3 +92,35 @@ def test_step_training_defaults_null_top_k(tmp_path):
     trainer = _Trainer(config)
 
     assert trainer.top_k == 3
+
+
+def test_epoch_training_retains_latest_scheduled_topk(tmp_path):
+    config = {
+        "train": {
+            "device": "cpu",
+            "batch_size": 2,
+            "num_workers": 0,
+            "num_epochs": 6,
+            "checkpoint_every_epochs": 2,
+            "top_k": 3,
+            "save_latest_checkpoint": False,
+            "val_ratio": 0.0,
+            "output_dir": str(tmp_path),
+            "scheduler": {"name": "cosine", "T_max": 6, "eta_min": 0.0},
+            "ema": {"enabled": False},
+            "wandb": {"enabled": False},
+        }
+    }
+    trainer = _Trainer(config)
+    trainer.save_loss_plot = lambda: None
+    summary = trainer.train()
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    assert sorted(path.name for path in checkpoint_dir.glob("epoch_*.pt")) == [
+        "epoch_0000002.pt",
+        "epoch_0000004.pt",
+        "epoch_0000006.pt",
+    ]
+    assert [item["epoch"] for item in summary["best_checkpoints"]] == [2, 4, 6]
+    assert summary["checkpoint_every_epochs"] == 2
+    assert not (checkpoint_dir / "latest.pt").exists()

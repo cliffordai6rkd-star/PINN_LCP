@@ -1,16 +1,16 @@
-"""GRU branch for independent fixed-length tau_f history windows."""
+"""LSTM branch for independent fixed-length tau_other history windows."""
 
 import torch.nn as nn
 
-from model.tau_f_sequence import TauFSequenceModelBase, _model_config
+from model.tau_other_sequence import TauOtherSequenceModelBase, _model_config
 
 
-class TauFGRURegressor(TauFSequenceModelBase):
+class TauOtherLSTMRegressor(TauOtherSequenceModelBase):
     def __init__(self, config):
-        super().__init__(config, architecture="gru")
+        super().__init__(config, architecture="lstm")
         model_config = _model_config(config)
         recurrent_dropout = self.dropout if self.num_layers > 1 else 0.0
-        self.recurrent = nn.GRU(
+        self.recurrent = nn.LSTM(
             input_size=self.input_dim,
             hidden_size=self.hidden_dim,
             num_layers=self.num_layers,

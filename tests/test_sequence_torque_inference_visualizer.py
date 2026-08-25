@@ -99,7 +99,7 @@ def test_checkpoint_directory_selects_lowest_numeric_score(tmp_path):
     checkpoint = {
         "config": {
             "model": {
-                "target_key": "tau_f",
+                "target_key": "tau_other",
                 "architecture": "gru",
                 "inputs": ["q"],
             },
@@ -186,7 +186,7 @@ def test_visualizer_prefers_checkpoint_resolved_target_generation_contract():
     resolved = {
         "enabled": True,
         "method": "causal_rnea_residual_v1",
-        "target_key": "tau_f",
+        "target_key": "tau_other",
         "torque_filter_operations": [{"type": "lowpass", "cutoff_hz": 10.0}],
     }
 
@@ -204,11 +204,11 @@ def test_inference_uses_only_complete_history_and_returns_physical_arrays():
         active_inputs = ("q",)
 
         def forward(self, batch):
-            return {"tau_f_pred": batch["q"][:, -1]}
+            return {"tau_other_pred": batch["q"][:, -1]}
 
     columns = {
         "q": torch.arange(6, dtype=torch.float32).reshape(6, 1),
-        "tau_f": torch.arange(6, dtype=torch.float32).reshape(6, 1),
+        "tau_other": torch.arange(6, dtype=torch.float32).reshape(6, 1),
         "timestamp": torch.arange(6, dtype=torch.float64) * 0.01,
     }
     normalizer = CheckpointNormalizer(
@@ -220,7 +220,7 @@ def test_inference_uses_only_complete_history_and_returns_physical_arrays():
         LastValueModel(),
         normalizer,
         columns,
-        target_key="tau_f",
+        target_key="tau_other",
         horizon=3,
         start_frame=0,
         end_frame=None,
@@ -253,6 +253,9 @@ def test_torque_error_metrics_reports_joint_physical_metrics():
 class FakeRolloutDynamics:
     def inverse_dynamics(self, q, dq, ddq, **kwargs):
         return torch.ones_like(q)
+
+    def gravity_torque(self, q, **kwargs):
+        return torch.full_like(q, 0.25)
 
     def frame_jacobians(self, q, **kwargs):
         return torch.eye(6, 7, dtype=q.dtype).expand(len(q), 6, 7).clone()
@@ -435,7 +438,7 @@ def test_hampel_butterworth_tau_ext_filter_runs_before_wrench_mapping():
     assert rollout_metrics(output)["hampel_replacement_ratio"] > 0.0
 
 
-def test_tau_f_rollout_replays_causal_rnea_filter_before_wrench_mapping():
+def test_tau_other_rollout_replays_causal_rnea_filter_before_wrench_mapping():
     result = {
         "target_frame": torch.tensor([2, 3]).numpy(),
         "timestamp_s": torch.tensor([0.02, 0.03]).numpy(),
@@ -455,7 +458,7 @@ def test_tau_f_rollout_replays_causal_rnea_filter_before_wrench_mapping():
     }
 
     output = add_external_wrench_rollout(
-        "tau_f",
+        "tau_other",
         result,
         columns,
         config,
@@ -474,4 +477,43 @@ def test_tau_f_rollout_replays_causal_rnea_filter_before_wrench_mapping():
     torch.testing.assert_close(
         torch.from_numpy(output["wrench_ext"]),
         torch.full((2, 6), expected_wrench, dtype=torch.float64),
+    )
+
+
+def test_tau_other_rollout_replays_gravity_target_contract():
+    result = {
+        "target_frame": torch.tensor([2, 3]).numpy(),
+        "timestamp_s": torch.tensor([0.02, 0.03]).numpy(),
+        "prediction_nm": torch.full((2, 7), 0.5).numpy(),
+        "error_nm": torch.zeros(2, 7).numpy(),
+    }
+    columns = {
+        "q": torch.zeros(5, 7),
+        "tau": torch.full((5, 7), 2.0),
+        "timestamp": torch.arange(5, dtype=torch.float64) * 0.01,
+    }
+    config = {
+        "target_generation": {
+            "enabled": True,
+            "method": "causal_gravity_residual_v1",
+        },
+        "rollout": {"measured_tau_already_filtered": True},
+        "physics": {"wrench_damping": 0.02},
+    }
+
+    output = add_external_wrench_rollout(
+        "tau_other",
+        result,
+        columns,
+        config,
+        dynamics=FakeRolloutDynamics(),
+    )
+
+    torch.testing.assert_close(
+        torch.from_numpy(output["tau_id_filtered_nm"]),
+        torch.full((2, 7), 0.25, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        torch.from_numpy(output["tau_ext_nm"]),
+        torch.full((2, 7), 1.25, dtype=torch.float64),
     )

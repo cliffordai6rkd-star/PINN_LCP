@@ -1,7 +1,7 @@
-"""Add 50 Hz causal RNEA residual ``tau_f`` labels to LeRobot datasets.
+"""Add 50 Hz causal RNEA residual ``tau_other`` labels to LeRobot datasets.
 
 Each phase dataset is processed independently, using the same filtered dataset
-view and target-generation function as ``TauFTrainer``.  No 100 Hz H5 signal is
+view and target-generation function as ``TauOtherTrainer``.  No 100 Hz H5 signal is
 used to estimate acceleration or inverse dynamics.
 """
 
@@ -25,9 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_process.tau_f_target_generation import (  # noqa: E402
-    build_causal_tau_f_target,
-    resolve_tau_f_target_generation,
+from data_process.tau_other_target_generation import (  # noqa: E402
+    build_causal_tau_other_target,
+    resolve_tau_other_target_generation,
     timestamps_to_seconds,
 )
 from data_process.tool.lerobot_add_feature import (  # noqa: E402
@@ -50,8 +50,8 @@ DEFAULT_PHASE_ROOTS = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compute causal tau_f independently on each 50 Hz phase dataset "
-            "with the same preprocessing contract as TauFTrainer."
+            "Compute causal tau_other independently on each 50 Hz phase dataset "
+            "with the same preprocessing contract as TauOtherTrainer."
         )
     )
     parser.add_argument(
@@ -64,11 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=REPO_ROOT / "config/train_cfg/tau_f_sequence.yaml",
+        default=REPO_ROOT / "config/train_cfg/tau_other_sequence.yaml",
         help="Training config defining target_generation, filters, and Pinocchio.",
     )
-    parser.add_argument("--tau-f-key", default="observation.tau_f")
-    parser.add_argument("--tau-id-key", default="observation.tau_id")
+    parser.add_argument("--tau-other-key", default="observation.tau_other")
+    parser.add_argument("--tau-g-key", default="observation.tau_g")
     parser.add_argument("--ddq-key", default="observation.ddq")
     parser.add_argument(
         "--no-backup",
@@ -151,7 +151,7 @@ def compute_phase_labels(
     )
     phase_config["dataloader"] = data_config
     dataset = PINNDataset(phase_config, compute_normalizer=False)
-    target_config = resolve_tau_f_target_generation(
+    target_config = resolve_tau_other_target_generation(
         phase_config, dataset.filter_config
     )
     if not target_config.get("enabled"):
@@ -168,25 +168,22 @@ def compute_phase_labels(
     timestamps_s = timestamps_to_seconds(
         timestamp_values, target_config["timestamp_unit"]
     )
-    result = build_causal_tau_f_target(
+    result = build_causal_tau_other_target(
         timestamps_s=timestamps_s,
         q=columns["q"],
         dq=columns["dq"],
-        tau_filtered=columns["tau"],
+        tau_measured=columns["tau"],
         episodes=dataset.dataset.meta.episodes,
         target_config=target_config,
         dynamics=PinocchioDynamics(phase_config),
     )
-    tau_f = result.tau_f.numpy()
+    tau_other = result.tau_other.numpy()
     ddq = result.ddq.numpy()
-    # The input feature is the raw RNEA output. The separately available
-    # tau_id_filtered is used only by the tau_f residual contract.
-    tau_filtered = columns["tau"].detach().cpu().to(torch.float32).numpy()
-    tau_id = result.tau_id.numpy()
-    tau_id_filtered = result.tau_id_filtered.numpy()
+    tau_measured = columns["tau"].detach().cpu().to(torch.float32).numpy()
+    tau_g = result.tau_g.numpy()
     values_by_name = {
-        "tau_f": [row for row in tau_f],
-        "tau_id": [row for row in tau_id],
+        "tau_other": [row for row in tau_other],
+        "tau_g": [row for row in tau_g],
         "ddq": [row for row in ddq],
     }
     expected_rows: list[tuple[int, int]] = []
@@ -200,9 +197,9 @@ def compute_phase_labels(
     if any(len(values) != len(expected_rows) for values in values_by_name.values()):
         raise ValueError("Generated labels do not cover all 50 Hz dataset rows.")
     if not np.allclose(
-        tau_f, tau_filtered - tau_id_filtered, rtol=1e-6, atol=1e-6
+        tau_other, tau_measured - tau_g, rtol=1e-6, atol=1e-6
     ):
-        raise ValueError("Generated tau_f/tau_id residual identity check failed.")
+        raise ValueError("Generated tau_other/tau_g residual identity check failed.")
     return values_by_name, expected_rows
 
 
@@ -284,9 +281,9 @@ def write_phase(
 
 def main() -> None:
     args = parse_args()
-    output_keys = [args.tau_f_key, args.tau_id_key, args.ddq_key]
+    output_keys = [args.tau_other_key, args.tau_g_key, args.ddq_key]
     if any(not key for key in output_keys) or len(set(output_keys)) != 3:
-        raise ValueError("tau_f, tau_id, and ddq output keys must be non-empty and distinct.")
+        raise ValueError("tau_other, tau_g, and ddq output keys must be non-empty and distinct.")
     roots = [path.resolve() for path in args.phase_roots]
     manifests = [load_manifest(root) for root in roots]
     validate_manifests(manifests)
@@ -295,16 +292,16 @@ def main() -> None:
     for root, manifest in zip(roots, manifests):
         values_by_name, expected_rows = compute_phase_labels(root=root, config=config)
         values_by_key = {
-            args.tau_f_key: values_by_name["tau_f"],
-            args.tau_id_key: values_by_name["tau_id"],
+            args.tau_other_key: values_by_name["tau_other"],
+            args.tau_g_key: values_by_name["tau_g"],
             args.ddq_key: values_by_name["ddq"],
         }
         phase = int(manifest["phase_index"])
-        tau_f_array = np.asarray(values_by_name["tau_f"])
+        tau_other_array = np.asarray(values_by_name["tau_other"])
         ddq_array = np.asarray(values_by_name["ddq"])
         print(
             f"phase={phase} root={root} frames={len(expected_rows)} "
-            f"tau_f_abs_p99={np.quantile(np.abs(tau_f_array), 0.99):.6f} "
+            f"tau_other_abs_p99={np.quantile(np.abs(tau_other_array), 0.99):.6f} "
             f"ddq_abs_p99={np.quantile(np.abs(ddq_array), 0.99):.6f}",
             flush=True,
         )

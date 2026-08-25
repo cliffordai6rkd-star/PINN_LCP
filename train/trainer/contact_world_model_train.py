@@ -1,4 +1,4 @@
-"""Training entry point for the q/tau/action -> contact WM."""
+"""Training entry point for the q/dq/delta_q/tau/action contact WM."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ log = logging.getLogger("contact_world_model_train")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train the q/tau/action-conditioned three-phase contact WM."
+        description="Train the q/dq/delta_q/tau/action-conditioned three-phase contact WM."
     )
     parser.add_argument(
         "--config",
@@ -43,9 +43,10 @@ def main():
     args = parse_args()
     with args.config.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
-    if (config.get("model") or {}).get("state_contract") != "q_tau_contact":
+    inputs = (config.get("model") or {}).get("inputs") or []
+    if "q" not in inputs or "delta_q" not in inputs:
         raise ValueError(
-            "contact_world_model_train requires model.state_contract=q_tau_contact"
+            "contact_world_model_train requires the unified q/dq/delta_q/tau inputs"
         )
     log.info("contact WM config: %s", config)
     trainer = ContactWorldModelTrainer(config)

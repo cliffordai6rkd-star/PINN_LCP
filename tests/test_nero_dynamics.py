@@ -6,12 +6,12 @@ import numpy as np
 import pytest
 import torch
 
-from model.tau_f_sequence import TauFSequenceRegressor
+from model.tau_other_sequence import TauOtherSequenceRegressor
 from physics.nero_dynamics import (
     NeroDynamicsCache,
     PinocchioDynamics,
     RNEALinearization,
-    load_tau_f_predictor,
+    load_tau_other_predictor,
     predict_nero_wrench,
 )
 
@@ -50,13 +50,13 @@ def test_synthetic_cache_wrench_is_differentiable_to_every_state():
         torch.full_like(reference, offset, requires_grad=True)
         for offset in (0.04, -0.03, 0.02, 0.05, -0.01)
     ]
-    q, dq, ddq, tau_measured, tau_f = values
+    q, dq, ddq, tau_measured, tau_other = values
     prediction = predict_nero_wrench(
         q=q,
         dq=dq,
         ddq=ddq,
         tau_measured=tau_measured,
-        tau_f=tau_f,
+        tau_other=tau_other,
         cache=cache,
         damping=0.02,
     )
@@ -67,7 +67,7 @@ def test_synthetic_cache_wrench_is_differentiable_to_every_state():
     torch.testing.assert_close(prediction.tau_id, expected_tau_id)
     torch.testing.assert_close(
         prediction.tau_external,
-        tau_measured - expected_tau_id - tau_f,
+        tau_measured - expected_tau_id - tau_other,
     )
     lhs = jacobian @ jacobian.transpose(-1, -2)
     lhs = lhs + 0.02**2 * torch.eye(2, dtype=dtype)
@@ -198,7 +198,34 @@ def test_batched_inverse_dynamics_skips_derivative_computation(tmp_path):
     torch.testing.assert_close(tau, q + 2.0 * dq + 3.0 * ddq)
 
 
-def _tau_f_checkpoint(path: Path, architecture="gru"):
+def test_batched_gravity_torque_uses_zero_velocity_and_acceleration(tmp_path):
+    urdf_path = tmp_path / "robot.urdf"
+    urdf_path.touch()
+    dynamics = PinocchioDynamics(
+        {
+            "pinocchio": {
+                "urdf_path": urdf_path,
+                "frame_name": "tool",
+                "locked_joint_names": ["gripper"],
+            }
+        }
+    )
+    q = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    pinocchio = _fake_pinocchio()
+    with patch(
+        "physics.nero_dynamics.importlib.import_module",
+        return_value=pinocchio,
+    ), patch.object(pinocchio, "rnea", wraps=pinocchio.rnea) as rnea:
+        gravity = dynamics.gravity_torque(q)
+
+    torch.testing.assert_close(gravity, q)
+    assert rnea.call_count == len(q)
+    for call in rnea.call_args_list:
+        assert np.allclose(call.args[3], np.zeros(2))
+        assert np.allclose(call.args[4], np.zeros(2))
+
+
+def _tau_other_checkpoint(path: Path, architecture="gru"):
     config = {
         "dataloader": {
             "horizon": 3,
@@ -216,7 +243,7 @@ def _tau_f_checkpoint(path: Path, architecture="gru"):
         },
     }
     torch.manual_seed(5)
-    model = TauFSequenceRegressor(config)
+    model = TauOtherSequenceRegressor(config)
     stats = {
         key: {
             "mean": torch.zeros(2),
@@ -226,7 +253,7 @@ def _tau_f_checkpoint(path: Path, architecture="gru"):
             "q01": -torch.ones(2),
             "q99": torch.ones(2),
         }
-        for key in ("q", "dq", "ddq", "tau", "tau_f")
+        for key in ("q", "dq", "ddq", "tau", "tau_other")
     }
     torch.save(
         {
@@ -243,13 +270,13 @@ def _tau_f_checkpoint(path: Path, architecture="gru"):
 
 
 @pytest.mark.parametrize("architecture", ["gru", "tcn"])
-def test_frozen_tau_f_checkpoint_uses_caller_histories_and_input_gradients(
+def test_frozen_tau_other_checkpoint_uses_caller_histories_and_input_gradients(
     tmp_path,
     architecture,
 ):
-    checkpoint_path = tmp_path / "tau_f.pt"
-    _tau_f_checkpoint(checkpoint_path, architecture=architecture)
-    predictor = load_tau_f_predictor(checkpoint_path)
+    checkpoint_path = tmp_path / "tau_other.pt"
+    _tau_other_checkpoint(checkpoint_path, architecture=architecture)
+    predictor = load_tau_other_predictor(checkpoint_path)
     history = {
         key: torch.randn(2, 4, 2, requires_grad=True)
         for key in predictor.active_inputs
@@ -258,11 +285,11 @@ def test_frozen_tau_f_checkpoint_uses_caller_histories_and_input_gradients(
         key: torch.randn(2, 3, 2, requires_grad=True)
         for key in predictor.active_inputs
     }
-    tau_f = predictor(history, future)
+    tau_other = predictor(history, future)
 
-    assert tau_f.shape == (2, 3, 2)
+    assert tau_other.shape == (2, 3, 2)
     assert not any(parameter.requires_grad for parameter in predictor.parameters())
-    tau_f.square().mean().backward()
+    tau_other.square().mean().backward()
     assert future["q"].grad is not None
     assert future["q"].grad.abs().sum() > 0
 
@@ -277,9 +304,9 @@ def test_frozen_predictor_matches_independent_sliding_windows(
     tmp_path,
     architecture,
 ):
-    checkpoint_path = tmp_path / "tau_f.pt"
-    _tau_f_checkpoint(checkpoint_path, architecture=architecture)
-    predictor = load_tau_f_predictor(checkpoint_path)
+    checkpoint_path = tmp_path / "tau_other.pt"
+    _tau_other_checkpoint(checkpoint_path, architecture=architecture)
+    predictor = load_tau_other_predictor(checkpoint_path)
     history = {
         key: torch.randn(2, 4, 2)
         for key in predictor.active_inputs
@@ -298,7 +325,7 @@ def test_frozen_predictor_matches_independent_sliding_windows(
             [normalized[:, offset + 1 : offset + 4] for offset in range(3)],
             dim=1,
         ).reshape(6, 3, 2)
-    expected = predictor.model(manual_batch)["tau_f_pred"].reshape(2, 3, 2)
-    expected = predictor.normalizer.denormalize("tau_f", expected)
+    expected = predictor.model(manual_batch)["tau_other_pred"].reshape(2, 3, 2)
+    expected = predictor.normalizer.denormalize("tau_other", expected)
 
     torch.testing.assert_close(prediction, expected)

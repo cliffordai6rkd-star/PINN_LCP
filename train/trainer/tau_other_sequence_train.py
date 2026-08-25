@@ -17,13 +17,13 @@ import torch.nn.functional as F
 import yaml
 from tqdm.auto import tqdm
 
-from data_process.tau_f_target_generation import (
-    build_causal_tau_f_target,
-    normalize_tau_f_target_generation,
-    resolve_tau_f_target_generation,
+from data_process.tau_other_target_generation import (
+    build_causal_tau_other_target,
+    normalize_tau_other_target_generation,
+    resolve_tau_other_target_generation,
     timestamps_to_seconds,
 )
-from model.tau_f_sequence import build_tau_f_sequence_model
+from model.tau_other_sequence import build_tau_other_sequence_model
 from physics.nero_dynamics import PinocchioDynamics
 from train.base_trainer import BaseTrainer
 from train.nomalizer import Normalizer
@@ -50,20 +50,20 @@ class SampleIndexDataset(torch.utils.data.Dataset):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Train a NEXT-style stateless-window LSTM, GRU, or TCN for tau_f."
+            "Train a NEXT-style stateless-window LSTM, GRU, or TCN for tau_other."
         )
     )
     parser.add_argument(
         "--config",
         "-c",
         type=Path,
-        default=Path("config/train_cfg/tau_f_sequence.yaml"),
+        default=Path("config/train_cfg/tau_other_sequence.yaml"),
         help="Path to the training config.",
     )
     return parser.parse_args()
 
 
-class TauFTrainer(BaseTrainer):
+class TauOtherTrainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
         loss_config = config.get("loss") or {}
@@ -77,23 +77,23 @@ class TauFTrainer(BaseTrainer):
         self.tensor_cache = None
         self.valid_raw_indices_device = None
         self.episode_starts_device = None
-        self.derived_target_config = normalize_tau_f_target_generation(config)
-        self.tau_f_dynamics = None
+        self.derived_target_config = normalize_tau_other_target_generation(config)
+        self.tau_other_dynamics = None
         if self.derived_target_config["enabled"]:
-            model_target = str((config.get("model") or {}).get("target_key", "tau_f"))
+            model_target = str((config.get("model") or {}).get("target_key", "tau_other"))
             derived_target = self.derived_target_config["target_key"]
             if model_target != derived_target:
                 raise ValueError(
                     "model.target_key must match target_generation.target_key; "
                     f"got {model_target!r} and {derived_target!r}"
                 )
-            # active_inputs = list((config.get("model") or {}).get("inputs") or [])
-            # tau_source = self.derived_target_config["source_keys"]["tau"]
-            # if tau_source in active_inputs:
-            #     raise ValueError(
-            #         "Measured tau is a target-generation source and must not be a "
-            #         "model input; doing so leaks the tau_f supervision target."
-            #     )
+            active_inputs = list((config.get("model") or {}).get("inputs") or [])
+            tau_source = self.derived_target_config["source_keys"]["tau"]
+            if tau_source in active_inputs:
+                raise ValueError(
+                    "Measured tau is a target-generation source and must not be a "
+                    "model input; doing so leaks the tau_other supervision target."
+                )
 
     def build_dataset(self):
         # Keep the optional LeRobot dependency out of model-only imports and tests.
@@ -138,7 +138,7 @@ class TauFTrainer(BaseTrainer):
     def _build_device_cache(self, training_frames):
         model_config = self.config.get("model") or {}
         active_inputs = list(model_config.get("inputs") or ["q", "dq", "delta_q"])
-        target_key = str(model_config.get("target_key", "tau_f"))
+        target_key = str(model_config.get("target_key", "tau_other"))
         requested_keys = active_inputs + list(self.dataset.normalize_lowdim_keys)
         if self.derived_target_config["enabled"]:
             requested_keys = [key for key in requested_keys if key != target_key]
@@ -207,7 +207,7 @@ class TauFTrainer(BaseTrainer):
         )
 
     def _build_derived_target(self, cpu_cache, target_key):
-        self.derived_target_config = resolve_tau_f_target_generation(
+        self.derived_target_config = resolve_tau_other_target_generation(
             self.config,
             self.dataset.filter_config,
         )
@@ -218,25 +218,25 @@ class TauFTrainer(BaseTrainer):
             self.derived_target_config["timestamp_unit"],
         )
         source_keys = self.derived_target_config["source_keys"]
-        if self.tau_f_dynamics is None:
-            self.tau_f_dynamics = PinocchioDynamics(self.config)
-        result = build_causal_tau_f_target(
+        if self.tau_other_dynamics is None:
+            self.tau_other_dynamics = PinocchioDynamics(self.config)
+        result = build_causal_tau_other_target(
             timestamps_s=timestamps_s,
             q=cpu_cache[source_keys["q"]],
             dq=cpu_cache[source_keys["dq"]],
-            tau_filtered=cpu_cache[source_keys["tau"]],
+            tau_measured=cpu_cache[source_keys["tau"]],
             episodes=self.dataset.dataset.meta.episodes,
             target_config=self.derived_target_config,
-            dynamics=self.tau_f_dynamics,
+            dynamics=self.tau_other_dynamics,
         )
         cpu_cache[source_keys["dq"]] = result.dq
-        cpu_cache[target_key] = result.tau_f
+        cpu_cache[target_key] = result.tau_other
         ddq_abs_p99 = torch.quantile(result.ddq.abs().reshape(-1), 0.99).item()
-        target_abs_p99 = torch.quantile(result.tau_f.abs().reshape(-1), 0.99).item()
+        target_abs_p99 = torch.quantile(result.tau_other.abs().reshape(-1), 0.99).item()
         log.info(
-            "derived causal tau_f target ready: frames=%d ddq_abs_p99=%.6f "
-            "tau_f_abs_p99=%.6f operations=%s",
-            len(result.tau_f),
+            "derived causal tau_other target ready: frames=%d ddq_abs_p99=%.6f "
+            "tau_other_abs_p99=%.6f operations=%s",
+            len(result.tau_other),
             ddq_abs_p99,
             target_abs_p99,
             self.derived_target_config["torque_filter_operations"],
@@ -372,7 +372,7 @@ class TauFTrainer(BaseTrainer):
 
         model = self.config.get("model") or {}
         active_inputs = list(model.get("inputs") or ["q", "dq", "delta_q"])
-        target_key = str(model.get("target_key", "tau_f"))
+        target_key = str(model.get("target_key", "tau_other"))
         batch = {
             key: self.tensor_cache[key][window_indices].masked_fill(
                 padding_mask.unsqueeze(-1),
@@ -384,7 +384,7 @@ class TauFTrainer(BaseTrainer):
         return batch
 
     def build_model(self):
-        return build_tau_f_sequence_model(self.config)
+        return build_tau_other_sequence_model(self.config)
 
     def _denormalize_target(self, value):
         """Convert the configured torque target back to its physical unit."""
@@ -393,7 +393,7 @@ class TauFTrainer(BaseTrainer):
             return value
 
         target_key = str(
-            (self.config.get("model") or {}).get("target_key", "tau_f")
+            (self.config.get("model") or {}).get("target_key", "tau_other")
         )
         normalize_mode = getattr(dataset, "normalize_mode", None)
         normalized_keys = getattr(dataset, "normalize_lowdim_keys", ())
@@ -439,10 +439,10 @@ class TauFTrainer(BaseTrainer):
         if "sample_idx" in batch:
             batch = self._cached_batch(batch["sample_idx"])
         out = self.model(batch)
-        prediction = out["tau_f_pred"]
-        target = out.get("tau_f_target")
+        prediction = out["tau_other_pred"]
+        target = out.get("tau_other_target")
         if target is None:
-            raise KeyError("Batch is missing the configured tau_f supervision target.")
+            raise KeyError("Batch is missing the configured tau_other supervision target.")
 
         squared_error = F.mse_loss(prediction, target, reduction="none")
         prediction_nm = self._denormalize_target(prediction)
@@ -698,7 +698,7 @@ def _write_cross_validation_report(output_dir, report):
     return report_path
 
 
-def run_purged_kfold_workflow(config, trainer_class=TauFTrainer):
+def run_purged_kfold_workflow(config, trainer_class=TauOtherTrainer):
     """Run all purged folds, aggregate them, then fit one full-data model."""
     train_config = config.get("train") or {}
     fold_config = train_config.get("purged_kfold") or {}
@@ -706,7 +706,7 @@ def run_purged_kfold_workflow(config, trainer_class=TauFTrainer):
     if num_folds < 2:
         raise ValueError("train.purged_kfold.num_folds must be at least 2")
     output_dir = Path(
-        train_config.get("output_dir", "outputs/tau_f_sequence")
+        train_config.get("output_dir", "outputs/tau_other_sequence")
     )
     group_name = str(
         (train_config.get("wandb") or {}).get("group")
@@ -833,7 +833,7 @@ def run_purged_kfold_workflow(config, trainer_class=TauFTrainer):
     return report
 
 
-def run_tau_sequence_training(config, trainer_class=TauFTrainer):
+def run_tau_sequence_training(config, trainer_class=TauOtherTrainer):
     train_config = config.get("train") or {}
     fold_config = train_config.get("purged_kfold") or {}
     if (
@@ -852,7 +852,7 @@ def main():
     with args.config.open("r", encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file)
 
-    log.info("tau_f sequence train config: %s", config)
+    log.info("tau_other sequence train config: %s", config)
     result = run_tau_sequence_training(config)
     if result.get("workflow") == "purged_kfold":
         log.info(

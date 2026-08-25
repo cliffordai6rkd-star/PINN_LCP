@@ -16,10 +16,8 @@ import yaml
 
 from data_process.offline_tau_labels import (
     KalmanRTSConfig,
-    causal_median_one_pole_filter,
     estimate_joint_states_rts,
     fill_missing_measurements,
-    residual_torque,
 )
 
 
@@ -27,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Estimate ddq with a variable-dt Kalman filter + RTS smoother, "
-            "then build tau_f = tau - RNEA(q, dq, ddq) in copied HDF5 files."
+            "then build tau_other = tau_measured - RNEA(q, 0, 0) in copied HDF5 files."
         )
     )
     parser.add_argument(
@@ -258,10 +256,11 @@ def process_episode(
         "ddq_rts": str(keys.get("ddq_rts", "teleop/ddq_follower")),
         "ddq_rts_std": str(keys.get("ddq_rts_std", "teleop/ddq_rts_std")),
         "tau_id": str(keys.get("tau_id", "teleop/tau_id_rts")),
+        "tau_g": str(keys.get("tau_g", "teleop/tau_g")),
         "tau_id_filtered": str(
             keys.get("tau_id_filtered", "teleop/tau_id_rts_filtered")
         ),
-        "tau_f": str(keys.get("tau_f", "teleop/tau_f_cal")),
+        "tau_other": str(keys.get("tau_other", "teleop/tau_other_cal")),
     }
     timestamp_scale = float(processing.get("timestamp_scale_to_s", 1.0e-6))
     if not np.isfinite(timestamp_scale) or timestamp_scale <= 0.0:
@@ -321,13 +320,15 @@ def process_episode(
                 dq_rnea,
                 estimate.ddq_smoothed,
             )
-            tau_id_filtered = causal_median_one_pole_filter(
-                timestamps_s,
-                tau_id,
-                cutoff_hz=torque_filter_hz,
-                median_window=torque_median_window,
+            tau_g = _batched_rnea(
+                pin,
+                model,
+                q_rnea,
+                np.zeros_like(q_rnea),
+                np.zeros_like(q_rnea),
             )
-            tau_f = residual_torque(tau_measured, tau_id_filtered)
+            tau_id_filtered = tau_id.copy()
+            tau_other = tau_measured - tau_g
 
             estimator_attrs = {
                 "estimator": "variable_dt_constant_acceleration_kalman_rts",
@@ -392,53 +393,48 @@ def process_episode(
                     "unit": "N*m",
                 },
             )
-            filter_attrs = {
-                "processing_method": "causal_median_then_one_pole_iir",
-                "causal": True,
-                "lowpass": True,
-                "lowpass_cutoff_hz": torque_filter_hz,
-                "median_window": torque_median_window,
-                "zero_phase": False,
-                "filter_timeline": key["timestamp"],
-                "filter_initialization": "first_sample",
-            }
+            _write_dataset(
+                h5_file,
+                key["tau_g"],
+                tau_g,
+                {
+                    **label_attrs,
+                    "definition": "RNEA(q,0,0) = tau_g",
+                    "processing_method": "pinocchio_gravity_rnea",
+                    "dq_source": "zero",
+                    "ddq_source": "zero",
+                    "unit": "N*m",
+                },
+            )
             _write_dataset(
                 h5_file,
                 key["tau_id_filtered"],
                 tau_id_filtered,
                 {
                     **label_attrs,
-                    **filter_attrs,
-                    "definition": "causal_lowpass(RNEA(q,dq,ddq_rts))",
+                    "definition": "duplicate of RNEA(q,dq,ddq_rts) = tau_id",
+                    "processing_method": "duplicate_full_rnea",
                     "source_dataset": key["tau_id"],
                     "unit": "N*m",
                 },
             )
             _write_dataset(
                 h5_file,
-                key["tau_f"],
-                tau_f,
+                key["tau_other"],
+                tau_other,
                 {
                     **label_attrs,
-                    "definition": "tau_measured_filtered-tau_id_rts_filtered",
-                    "formula": (
-                        "tau_f=tau_filtered-tau_id_filtered; "
-                        "tau_id_filtered=causal_lowpass(RNEA(q,dq,ddq_rts))"
-                    ),
-                    "target_contract": "matched_causal_torque_filter_v1",
+                    "definition": "tau_measured-tau_g",
+                    "formula": "tau_other=tau_measured-tau_g",
+                    "target_contract": "causal_gravity_residual_v1",
                     "tau_source_dataset": key["tau"],
-                    "tau_id_source_dataset": key["tau_id_filtered"],
-                    **filter_attrs,
+                    "tau_g_source_dataset": key["tau_g"],
                     "unit": "N*m",
                 },
             )
             h5_file.attrs["offline_tau_labels_built"] = True
-            h5_file.attrs["offline_tau_residual_convention"] = (
-                "tau_filtered_minus_tau_id_filtered"
-            )
-            h5_file.attrs["offline_tau_target_contract"] = (
-                "matched_causal_torque_filter_v1"
-            )
+            h5_file.attrs["offline_tau_residual_convention"] = "tau_measured_minus_tau_g"
+            h5_file.attrs["offline_tau_target_contract"] = "causal_gravity_residual_v1"
             h5_file.flush()
         os.replace(temporary_path, destination_path)
     except BaseException:
@@ -458,8 +454,9 @@ def process_episode(
         "ddq_abs_p99": float(np.quantile(np.abs(estimate.ddq_smoothed), 0.99)),
         "ddq_abs_max": float(np.max(np.abs(estimate.ddq_smoothed))),
         "ddq_std_p99": float(np.quantile(estimate.ddq_smoothed_std, 0.99)),
-        "tau_f_abs_p99": float(np.quantile(np.abs(tau_f), 0.99)),
-        "tau_f_abs_max": float(np.max(np.abs(tau_f))),
+        "tau_other_abs_p99": float(np.quantile(np.abs(tau_other), 0.99)),
+        "tau_other_abs_max": float(np.max(np.abs(tau_other))),
+        "tau_g_abs_p99": float(np.quantile(np.abs(tau_g), 0.99)),
         "tau_id_filter_cutoff_hz": torque_filter_hz,
         "tau_id_filter_median_window": torque_median_window,
     }
@@ -504,8 +501,8 @@ def main() -> None:
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "urdf_path": str(urdf_path),
-        "residual_convention": "tau_f=tau_filtered-tau_id_filtered",
-        "target_contract": "matched_causal_torque_filter_v1",
+        "residual_convention": "tau_other=tau_measured-tau_g",
+        "target_contract": "causal_gravity_residual_v1",
         "results": results,
     }
     manifest_path = output_dir / "offline_tau_label_manifest.json"

@@ -14,8 +14,8 @@ import yaml
 
 from physics.nero_dynamics import PinocchioDynamics
 from train.tau_free_wrench_loss import TauFreeTorqueWrenchLoss
-from train.trainer.tau_f_sequence_train import (
-    TauFTrainer,
+from train.trainer.tau_other_sequence_train import (
+    TauOtherTrainer,
     run_tau_sequence_training,
 )
 
@@ -41,7 +41,7 @@ def parse_args():
     return parser.parse_args()
 
 
-class TauFreeSequenceTrainerV2(TauFTrainer):
+class TauFreeSequenceTrainerV2(TauOtherTrainer):
     """Train stateless proprioceptive windows against free-space torque."""
 
     def __init__(self, config):
@@ -140,8 +140,8 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
             return super().compute_loss(batch)
 
         out = self.model(batch)
-        prediction = out["tau_f_pred"]
-        target = out.get("tau_f_target")
+        prediction = out["tau_other_pred"]
+        target = out.get("tau_other_target")
         if target is None:
             raise KeyError("Batch is missing the configured tau-free torque target.")
         if self.use_wrench_objective and "frame_jacobian" not in batch:
@@ -262,7 +262,7 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
             loss_config.get("joint_weight_mode", default_joint_weight_mode)
         ).lower()
 
-        allowed_inputs = {"q", "dq", "ddq", "tau_id", "tau_f", "delta_q"}
+        allowed_inputs = {"q", "dq", "ddq", "tau_id", "tau_other", "delta_q"}
         unknown_inputs = sorted(set(inputs) - allowed_inputs)
         if not inputs or inputs[0] != "q" or unknown_inputs:
             raise ValueError(
@@ -280,8 +280,8 @@ class TauFreeSequenceTrainerV2(TauFTrainer):
             raise ValueError(
                 "tau-free V2 model.architecture must be lstm, gru, or tcn."
             )
-        # if horizon != 50:
-        #     raise ValueError("tau-free V2 requires dataloader.horizon=50.")
+        if horizon != 50:
+            raise ValueError("tau-free V2 requires dataloader.horizon=50.")
         if pad_history:
             raise ValueError(
                 "tau-free V2 requires dataloader.pad_history=false so every "

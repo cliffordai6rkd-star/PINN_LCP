@@ -1,26 +1,19 @@
 io:
-  input: nero_ws/runs/wipe_board
-  output: data/train_episode/wipe_board_wm_lbv3
-  repo_id: wipe_board_wm_lbv3
+  input: ../nero_ws/runs/push_button
+  output: ../nero_ws/runs/swm/push_button_lerobot_v3
+  repo_id: push_button_lerobot_v3
   max_episodes: null
   no_videos: true
   push_to_hub: false
 
-task: wipe_board_world_model
-
-# LeRobot needs a nominal fps, but this converter does not create a 100 Hz
-# grid. It writes every action-labeled original teleop row exactly once and
-# preserves its physical timestamp in timing.state_timestamp_ns. Boundary rows
-# without a valid camera-anchor next action are discarded.
+task: push_button
 fps: 100
 
 timeline:
   mode: raw_lowdim_action_hold
   state_timestamp_path: teleop/timestamp_us
-  # Match wipe_board_dp.yaml: use every recorded wrist timestamp directly;
-  # each anchor selects the first teleop action at or after it.
-  action_fps: 25
   action_anchor_timestamp_path: cameras/wrist/timestamp_us
+  action_fps: 25
   max_action_gap_s: 0.020
 
 features:
@@ -30,32 +23,60 @@ features:
     shape: [7]
     h5_path: teleop/q_follower
     align: index
-
+    lowpass: false
+    # cutoff_hz: 15.0
+    # order: 2
   observation.velocity:
     rate: state
     dtype: float32
     shape: [7]
     h5_path: teleop/dq_follower
     align: index
-
+    lowpass: true
+    cutoff_hz: 20.0
+    order: 1
   observation.torque:
     rate: state
     dtype: float32
     shape: [7]
     h5_path: teleop/tau_follower
     align: index
-
-
-
-  observation.wrench_ext:
+    lowpass: true
+    cutoff_hz: 20.0
+    order: 1
+  observation.delta_q:
     rate: state
     dtype: float32
-    shape: [6]
-    h5_path: teleop/wrench_cal
+    shape: [7]
+    sources:
+      - h5_path: teleop/q_cmd
+        align: index
+      - h5_path: teleop/q_follower
+        align: index
+    combine: subtract
+    lowpass: false
+    # cutoff_hz: 15.0
+    # order: 2
+  observation.tau_ext:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_ext_pred
     align: index
-
-  # Sample exactly once on the same camera anchors used by wipe_board_dp.yaml,
-  # then hold that already-selected action over the raw teleop rows.
+  observation.ee_pose:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/ee_pose_follower
+    align: index
+    transform: ee_pose_matrix_to_quaternion
+  action.joint:
+    rate: action
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    timestamp_path: teleop/timestamp_us
+    resample: next
   action.ee_pose:
     rate: action
     dtype: float32
@@ -64,11 +85,3 @@ features:
     timestamp_path: teleop/timestamp_us
     resample: next
     transform: ee_pose_matrix_to_quaternion
-
-  action.joint:
-    rate: action
-    dtype: float32
-    shape: [7]
-    h5_path: teleop/q_follower
-    timestamp_path: teleop/timestamp_us
-    resample: next

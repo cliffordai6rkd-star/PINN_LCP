@@ -1,0 +1,105 @@
+io:
+  input: ../nero_ws/runs/cuccumber_peeling
+  output: ../nero_ws/runs/cuccumber_peeling_lerobotv3
+  repo_id: cuccumber_peeling_lerobotv3
+  max_episodes: null
+  no_videos: false
+  push_to_hub: false
+
+task: cuccumber_peeling
+fps: 25
+
+# One LeRobot row per recorded wrist-camera row. Both cameras are read using
+# that row's exact H5 index; no image timestamp lookup or uniform grid exists.
+master_timestamp_path: cameras/wrist/timestamp_us
+
+# Every numeric feature selects the newest teleop sample at or before the
+# master-camera timestamp. Reject unexpectedly stale teleop snapshots.
+master_timeline:
+  max_gap_s: 0.015
+  store_timestamps: true
+
+features:
+  observation.images.wrist:
+    dtype: video
+    shape: [192, 256, 3]
+    h5_path: cameras/wrist/frames
+    align: index
+
+  observation.images.side:
+    dtype: video
+    shape: [192, 256, 3]
+    h5_path: cameras/side/frames
+    align: index
+
+  observation.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  observation.velocity:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/dq_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  observation.torque:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  observation.delta_q:
+    dtype: float32
+    shape: [7]
+    sources:
+      - h5_path: teleop/q_cmd
+        timestamp_path: teleop/timestamp_us
+        align: previous
+      - h5_path: teleop/q_follower
+        timestamp_path: teleop/timestamp_us
+        align: previous
+    combine: subtract
+
+  observation.tau_ext:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_ext_cal
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  # observation.torque_ext:
+  #   dtype: float32
+  #   shape: [7]
+  #   h5_path: teleop/tau_ext_cal
+  #   timestamp_path: teleop/timestamp_us
+  #   align: previous
+
+  observation.ee_pose:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/ee_pose_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+    transform: ee_pose_matrix_to_quaternion
+
+  # The joint command is the direct action target; it is distinct from the
+  # measured follower position used by observation.joint.
+  action.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_cmd
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  action.ee_pose:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/ee_pose_follower
+    timestamp_path: teleop/timestamp_us
+    align: previous
+    transform: ee_pose_matrix_to_quaternion

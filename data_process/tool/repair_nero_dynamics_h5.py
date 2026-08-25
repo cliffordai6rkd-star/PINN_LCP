@@ -140,7 +140,7 @@ def repair_file(
             q = np.asarray(teleop["q_follower"], dtype=np.float64)
             dq_source = np.asarray(teleop["dq_follower"], dtype=np.float64)
             tau_measured = np.asarray(teleop["tau_follower"], dtype=np.float64)
-            tau_f_pred = np.asarray(teleop["tau_f_pred"], dtype=np.float64)
+            tau_other_pred = np.asarray(teleop["tau_other_pred"], dtype=np.float64)
 
             dq = dq_source * DEFAULT_DQ_SIGN[None, :]
             ddq_unfiltered = causal_derivative(dq, timestamps_s)
@@ -150,13 +150,27 @@ def repair_file(
                 ddq_lowpass_hz,
             )
             tau_id = batched_rnea(model, q, dq, ddq)
-            tau_f_cal = tau_measured - tau_id
-            tau_ext = tau_f_cal - tau_f_pred
+            tau_g = batched_rnea(
+                model,
+                q,
+                np.zeros_like(q),
+                np.zeros_like(q),
+            )
+            tau_other_cal = tau_measured - tau_g
+            tau_ext = tau_other_cal - tau_other_pred
 
             teleop["dq_follower"][:] = dq
             teleop["ddq_follower"][:] = ddq
-            teleop["tau_f_cal"][:] = tau_f_cal
+            teleop["tau_other_cal"][:] = tau_other_cal
             teleop["tau_ext"][:] = tau_ext
+            if "tau_g" in teleop:
+                teleop["tau_g"][:] = tau_g
+            else:
+                teleop.create_dataset("tau_g", data=tau_g)
+            if "tau_id" in teleop:
+                teleop["tau_id"][:] = tau_id
+            else:
+                teleop.create_dataset("tau_id", data=tau_id)
 
             sign_json = json.dumps(DEFAULT_DQ_SIGN.astype(int).tolist())
             write_attrs(
@@ -182,17 +196,38 @@ def repair_file(
                 },
             )
             residual_attrs = {
-                "definition": "tau_follower-tau_id(q,dq_repaired,ddq_repaired)",
-                "processing_method": "recomputed_measured_torque_minus_pinocchio_rnea",
+                "definition": "tau_follower-tau_g(q)",
+                "formula": "tau_other=tau_measured-tau_g",
+                "processing_method": "recomputed_measured_torque_minus_gravity_rnea",
                 "state_derivative_method": "sign_corrected_velocity_and_causal_acceleration",
                 "repair_source": str(backup_path),
             }
-            write_attrs(teleop["tau_f_cal"], residual_attrs)
+            write_attrs(
+                teleop["tau_g"],
+                {
+                    "definition": "RNEA(q,0,0) = tau_g",
+                    "processing_method": "pinocchio_gravity_rnea",
+                    "dq_source": "zero",
+                    "ddq_source": "zero",
+                    "repair_source": str(backup_path),
+                },
+            )
+            write_attrs(
+                teleop["tau_id"],
+                {
+                    "definition": "RNEA(q,dq,ddq) = tau_id",
+                    "processing_method": "pinocchio_full_rnea",
+                    "dq_source": "dq_follower",
+                    "ddq_source": "ddq_follower",
+                    "repair_source": str(backup_path),
+                },
+            )
+            write_attrs(teleop["tau_other_cal"], residual_attrs)
             write_attrs(
                 teleop["tau_ext"],
                 {
                     **residual_attrs,
-                    "definition": "tau_f_cal_repaired-tau_f_pred",
+                    "definition": "tau_other_cal_repaired-tau_other_pred",
                 },
             )
             h5_file.attrs["nero_dynamics_state_repaired"] = True
@@ -217,7 +252,7 @@ def repair_file(
         "frames": int(len(q)),
         "dq_qdot_correlation": dq_correlations,
         "ddq_abs_max": float(np.max(np.abs(ddq))),
-        "tau_f_cal_abs_max": float(np.max(np.abs(tau_f_cal))),
+        "tau_other_cal_abs_max": float(np.max(np.abs(tau_other_cal))),
     }
 
 
@@ -259,7 +294,7 @@ def main() -> None:
         "dq_sign": DEFAULT_DQ_SIGN.astype(int).tolist(),
         "ddq_lowpass_hz": args.ddq_lowpass_hz,
         "ddq_lowpass_discretization": "alpha=1-exp(-2*pi*cutoff_hz*dt)",
-        "residual_convention": "tau_f=tau_measured-tau_inverse_dynamics",
+        "residual_convention": "tau_other=tau_measured-tau_g",
         "results": results,
     }
     manifest_path = args.backup_dir / "repair_manifest.json"

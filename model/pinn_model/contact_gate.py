@@ -93,9 +93,9 @@ class ContactGateConfig:
             raise ValueError(
                 "contact_gate.label_mode must be 'binary' or 'three_phase'"
             )
-        if self.metric not in {"force_xyz_l2", "wrench_l2", "tau_ext_l1"}:
+        if self.metric not in {"force_xyz_l2", "wrench_l2", "tau_ext_l1", "tau_ext_l2"}:
             raise ValueError(
-                "contact_gate.metric must be force_xyz_l2, wrench_l2, or tau_ext_l1"
+                "contact_gate.metric must be force_xyz_l2, wrench_l2, tau_ext_l1, or tau_ext_l2"
             )
         off_threshold = self.off_threshold
         on_threshold = self.on_threshold

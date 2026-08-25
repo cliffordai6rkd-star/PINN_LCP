@@ -1,11 +1,12 @@
-# A checkpoint file can be given directly. For step-based Flow WM directories,
-# the newest step_*.pt is selected; legacy val_loss files still use lowest loss.
-checkpoint_path: outputs/torque_world_model_opd/checkpoints
+# A checkpoint file can be given directly. For epoch-based Flow WM directories,
+# the newest epoch_*.pt is selected; step and legacy loss files are fallbacks.
+checkpoint_path: outputs/torque_world_model_v4_opd/checkpoints
 
 dataset:
+  v3_only: true
   backend: lerobot
-  repo_id: wipe_board_wm_lbv3
-  root: data/train_episode/wipe_board_wm_lbv3
+  repo_id: push_button_lerobot_v3
+  root: ../nero_ws/runs/push_button_lerobot_v3
   video_backend: pyav
   high_fps: 100
 
@@ -30,19 +31,9 @@ selection:
   max_rollouts_per_episode: 8
   max_total_rollouts: null
 
-physics:
-  # RNEA rollout is optional and disabled by default for the data-driven
-  # Teacher/Student model. Wrench can be read directly from model output.
-  enabled: false
-  # null inherits the matching values embedded in the world-model checkpoint.
-  tau_f_checkpoint_path: null
-  tau_f_window_batch_size: null
-  wrench_damping: null
-  ddq_q_blend: 0.2
-
 plot:
   output_dir: outputs/torque_world_model_rollout
-  signals: [q, dq, ddq, tau, wrench]
+  signals: [q, dq, delta_q, tau, contact]
   dpi: 160
   subplot_columns: 2
   # Saves timestamps and all data/pred arrays beside the PNG files.

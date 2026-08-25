@@ -6,7 +6,7 @@ io:
   no_videos: True
   push_to_hub: false
 
-task: nero_tau_f
+task: nero_tau_other
 master_timestamp_path: teleop/timestamp_us
 fps: 100
 
@@ -101,10 +101,26 @@ features:
     align: pchip
     max_gap_s: 0.05
 
-  observation.tau_f:
+  observation.tau_g:
     dtype: float32
     shape: [7]
-    h5_path: teleop/tau_f_cal
+    h5_path: teleop/tau_g
+    timestamp_path: teleop/timestamp_us
+    align: pchip
+    max_gap_s: 0.05
+
+  observation.tau_id:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_id
+    timestamp_path: teleop/timestamp_us
+    align: pchip
+    max_gap_s: 0.05
+
+  observation.tau_other:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_other_pred
     timestamp_path: teleop/timestamp_us
     align: pchip
     max_gap_s: 0.05

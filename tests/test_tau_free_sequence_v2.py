@@ -11,7 +11,7 @@ from data_process.torque_target_filter import (
 )
 from train.tau_free_wrench_loss import TauFreeTorqueWrenchLoss
 from train.trainer.tau_free_sequence_train_v2 import TauFreeSequenceTrainerV2
-from train.trainer.tau_f_sequence_train import TauFTrainer
+from train.trainer.tau_other_sequence_train import TauOtherTrainer
 
 
 CONFIG_PATH = (
@@ -75,7 +75,7 @@ def test_v2_config_matches_q_history_to_measured_torque_contract():
     ("path", "value", "message"),
     [
         (("model", "inputs"), ["q", "tau"], "inputs"),
-        (("model", "target_key"), "tau_f", "target_key"),
+        (("model", "target_key"), "tau_other", "target_key"),
         (("model", "architecture"), "transformer", "architecture"),
         (("dataloader", "horizon"), 25, "horizon"),
         (("dataloader", "pad_history"), True, "pad_history"),
@@ -333,7 +333,7 @@ def test_v2_model_uses_configured_inputs_and_last_measured_torque():
     assert trainer.model.input_dim == 21
     assert trainer.model.recurrent.input_size == 21
     assert loss.ndim == 0
-    torch.testing.assert_close(out["tau_f_target"], tau[:, -1])
+    torch.testing.assert_close(out["tau_other_target"], tau[:, -1])
     torch.testing.assert_close(out["_target_nm"], tau[:, -1])
     assert "wrench_pred" not in out
     assert "wrench_mse_scaled" not in out["loss_dict"]
@@ -343,8 +343,8 @@ def test_v2_validation_reports_joint_normalized_mae_metrics():
     class FixedPredictionModel(torch.nn.Module):
         def forward(self, batch):
             return {
-                "tau_f_pred": batch["prediction"],
-                "tau_f_target": batch["target"],
+                "tau_other_pred": batch["prediction"],
+                "tau_other_target": batch["target"],
             }
 
     config = load_config()
@@ -449,7 +449,7 @@ def test_v2_reports_missing_optional_dataset_column_before_cache(monkeypatch):
             ]
         )
     )
-    monkeypatch.setattr(TauFTrainer, "build_dataset", lambda _self: dataset)
+    monkeypatch.setattr(TauOtherTrainer, "build_dataset", lambda _self: dataset)
     trainer = TauFreeSequenceTrainerV2(config)
 
     with pytest.raises(ValueError, match="meaningful q_cmd"):
@@ -479,7 +479,7 @@ def test_v2_windows_do_not_carry_hidden_state_between_samples():
 
     with torch.no_grad():
         model(first)
-        after_first = model(second)["tau_f_pred"]
-        repeated = model(second)["tau_f_pred"]
+        after_first = model(second)["tau_other_pred"]
+        repeated = model(second)["tau_other_pred"]
 
     torch.testing.assert_close(after_first, repeated)

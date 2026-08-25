@@ -16,9 +16,9 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from model.tau_f_sequence import (
-    TauFSequenceModelBase,
-    build_tau_f_sequence_model,
+from model.tau_other_sequence import (
+    TauOtherSequenceModelBase,
+    build_tau_other_sequence_model,
 )
 
 
@@ -72,11 +72,19 @@ class NeroDynamicsCache:
 
     rnea: RNEALinearization
     frame_jacobian: Tensor
+    # Optional for caches serialized before the explicit gravity branch was
+    # added.  New caches always populate this field from RNEA(q, 0, 0).
+    tau_g_reference: Tensor | None = None
 
     def to(self, *args, **kwargs) -> "NeroDynamicsCache":
         return NeroDynamicsCache(
             rnea=self.rnea.to(*args, **kwargs),
             frame_jacobian=self.frame_jacobian.to(*args, **kwargs),
+            tau_g_reference=(
+                None
+                if self.tau_g_reference is None
+                else self.tau_g_reference.to(*args, **kwargs)
+            ),
         )
 
 
@@ -85,7 +93,8 @@ class NeroWrenchPrediction:
     """Intermediate physical quantities exposed for losses and diagnostics."""
 
     tau_id: Tensor
-    tau_f: Tensor
+    tau_g: Tensor
+    tau_other: Tensor
     tau_external: Tensor
     wrench: Tensor
 
@@ -335,6 +344,44 @@ class PinocchioDynamics:
             dtype=q.dtype if dtype is None else dtype,
         )
 
+    def gravity_torque(
+        self,
+        q: Tensor,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Tensor:
+        """Evaluate the RNEA gravity term ``g(q)`` for batched positions."""
+
+        shape = _same_state_shape({"q": q})
+        self._ensure_initialized()
+        if shape[-1] != self._model.nq:
+            raise ValueError(
+                f"Joint dimension {shape[-1]} does not match reduced "
+                f"Pinocchio nq={self._model.nq}."
+            )
+
+        q_np = q.detach().cpu().to(torch.float64).numpy().reshape(-1, shape[-1])
+        zero_velocity = np.zeros(self._model.nv, dtype=np.float64)
+        gravity = np.empty_like(q_np)
+        for index, q_value in enumerate(q_np):
+            # RNEA(q, 0, 0) is the generalized gravity torque g(q).
+            gravity[index] = np.asarray(
+                self._pin.rnea(
+                    self._model,
+                    self._data,
+                    q_value,
+                    zero_velocity,
+                    zero_velocity,
+                ),
+                dtype=np.float64,
+            )
+        return torch.as_tensor(
+            gravity.reshape(shape),
+            device=q.device if device is None else device,
+            dtype=q.dtype if dtype is None else dtype,
+        )
+
     def frame_jacobians(
         self,
         q: Tensor,
@@ -433,6 +480,7 @@ class PinocchioDynamics:
                 device=device,
                 dtype=dtype,
             ),
+            tau_g_reference=self.gravity_torque(q, device=device, dtype=dtype),
         )
 
 
@@ -444,7 +492,7 @@ class _CheckpointNormalizer(nn.Module):
         payload = payload or {}
         self.mode = payload.get("normalize_mode", fallback_mode)
         if self.mode not in self._MODES:
-            raise ValueError(f"Unsupported tau_f normalize_mode: {self.mode!r}")
+            raise ValueError(f"Unsupported tau_other normalize_mode: {self.mode!r}")
         self.eps = float(payload.get("eps", 1e-6))
         self._buffer_lookup: dict[tuple[str, str], str] = {}
         statistics = (payload.get("stats") or {}).items()
@@ -462,7 +510,7 @@ class _CheckpointNormalizer(nn.Module):
             buffer_name = self._buffer_lookup[(key, statistic)]
         except KeyError as exc:
             raise KeyError(
-                f"tau_f checkpoint normalizer lacks {statistic!r} for {key!r}."
+                f"tau_other checkpoint normalizer lacks {statistic!r} for {key!r}."
             ) from exc
         return getattr(self, buffer_name).to(device=value.device, dtype=value.dtype)
 
@@ -501,26 +549,32 @@ class _CheckpointNormalizer(nn.Module):
         return (value + 1.0) * (q99 - q01 + self.eps) / 2.0 + q01
 
 
-class FrozenTauFPredictor(nn.Module):
+class FrozenTauOtherPredictor(nn.Module):
     """Frozen sequence branch that remains differentiable to its inputs."""
 
     def __init__(
         self,
-        model: TauFSequenceModelBase,
+        model: TauOtherSequenceModelBase,
         *,
         normalizer_payload: Mapping[str, Any] | None = None,
         normalize_mode: str | None = None,
         history_horizon: int = 50,
         max_model_batch_size: int = 1024,
+        target_generation_method: str | None = None,
+        target_key: str = "tau_other",
     ):
         super().__init__()
         if history_horizon <= 0:
-            raise ValueError("tau_f history_horizon must be positive.")
+            raise ValueError("tau_other history_horizon must be positive.")
         if max_model_batch_size <= 0:
-            raise ValueError("tau_f max_model_batch_size must be positive.")
+            raise ValueError("tau_other max_model_batch_size must be positive.")
         self.model = model
         self.history_horizon = int(history_horizon)
         self.max_model_batch_size = int(max_model_batch_size)
+        self.target_generation_method = target_generation_method
+        self.target_key = str(target_key)
+        if not self.target_key:
+            raise ValueError("tau_other target_key must not be empty")
         self.normalizer = _CheckpointNormalizer(
             normalizer_payload,
             fallback_mode=normalize_mode,
@@ -556,7 +610,7 @@ class FrozenTauFPredictor(nn.Module):
         history: Mapping[str, Tensor],
         future: Mapping[str, Tensor],
     ) -> Tensor:
-        """Predict tau_f for each future step from caller-provided states.
+        """Predict tau_other for each future step from caller-provided states.
 
         The caller must explicitly provide q/dq/ddq/tau histories whenever the
         checkpoint uses them. No finite differences or legacy world-model
@@ -568,7 +622,7 @@ class FrozenTauFPredictor(nn.Module):
         for key in self.active_inputs:
             if key not in history or key not in future:
                 raise KeyError(
-                    f"Frozen tau_f input {key!r} must be supplied in both "
+                    f"Frozen tau_other input {key!r} must be supplied in both "
                     "history and future mappings."
                 )
             history_value = history[key]
@@ -585,22 +639,22 @@ class FrozenTauFPredictor(nn.Module):
                 or future_value.shape[-1] != expected_dim
             ):
                 raise ValueError(
-                    f"tau_f input {key!r} must have D={expected_dim}, got "
+                    f"tau_other input {key!r} must have D={expected_dim}, got "
                     f"history D={history_value.shape[-1]} and future "
                     f"D={future_value.shape[-1]}."
                 )
             if history_steps < self.history_horizon:
                 raise ValueError(
-                    f"tau_f history needs at least {self.history_horizon} steps, "
+                    f"tau_other history needs at least {self.history_horizon} steps, "
                     f"got {history_steps}."
                 )
             if batch_size is None:
                 batch_size = history_batch
                 future_steps = key_future_steps
             if history_batch != batch_size or future_batch != batch_size:
-                raise ValueError("All tau_f inputs must share the same batch size.")
+                raise ValueError("All tau_other inputs must share the same batch size.")
             if key_future_steps != future_steps:
-                raise ValueError("All future tau_f inputs must share the same horizon.")
+                raise ValueError("All future tau_other inputs must share the same horizon.")
             complete = torch.cat(
                 (history_value[:, -self.history_horizon :], future_value),
                 dim=1,
@@ -612,8 +666,8 @@ class FrozenTauFPredictor(nn.Module):
             # identical to independent sliding windows, without materializing
             # B * F copies of the history.
             dense_prediction = self.model.forward_sequence(complete_inputs)
-            normalized_tau_f = dense_prediction[:, -future_steps:]
-            return self.normalizer.denormalize("tau_f", normalized_tau_f)
+            normalized_tau_other = dense_prediction[:, -future_steps:]
+            return self.normalizer.denormalize(self.target_key, normalized_tau_other)
 
         # Recurrent training treats every H-step window as an independent sample
         # with a fresh state. Build those same windows for every future target
@@ -649,41 +703,51 @@ class FrozenTauFPredictor(nn.Module):
                 key: value[batch_indices[:, None], window_indices]
                 for key, value in complete_inputs.items()
             }
-            chunk_outputs.append(self.model(model_batch)["tau_f_pred"])
-        normalized_tau_f = torch.cat(chunk_outputs, dim=0).reshape(
+            chunk_outputs.append(self.model(model_batch)["tau_other_pred"])
+        normalized_tau_other = torch.cat(chunk_outputs, dim=0).reshape(
             batch_size,
             future_steps,
             -1,
         )
-        return self.normalizer.denormalize("tau_f", normalized_tau_f)
+        return self.normalizer.denormalize(self.target_key, normalized_tau_other)
 
 
-def load_tau_f_predictor(
+def load_tau_other_predictor(
     checkpoint_path: str | Path,
     *,
     device: torch.device | str = "cpu",
     max_model_batch_size: int = 1024,
-) -> FrozenTauFPredictor:
+) -> FrozenTauOtherPredictor:
     """Load a frozen sequence regressor and its training normalizer."""
 
     path = Path(checkpoint_path)
     if not path.is_file():
-        raise FileNotFoundError(f"tau_f checkpoint does not exist: {path}")
+        raise FileNotFoundError(f"tau_other checkpoint does not exist: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     for key in ("config", "model"):
         if key not in checkpoint:
-            raise KeyError(f"tau_f checkpoint is missing required key {key!r}.")
+            raise KeyError(f"tau_other checkpoint is missing required key {key!r}.")
     config = checkpoint["config"]
-    model = build_tau_f_sequence_model(config)
+    model = build_tau_other_sequence_model(config)
     model.load_state_dict(checkpoint["model"])
     dataloader_config = config.get("dataloader") or {}
     normalizer_payload = checkpoint.get("normalizer")
-    predictor = FrozenTauFPredictor(
+    target_generation = checkpoint.get("derived_target_config")
+    if not isinstance(target_generation, Mapping):
+        target_generation = config.get("target_generation") or {}
+    target_generation_method = None
+    if bool(target_generation.get("enabled", False)):
+        target_generation_method = str(
+            target_generation.get("method", "causal_gravity_residual_v1")
+        ).lower()
+    predictor = FrozenTauOtherPredictor(
         model,
         normalizer_payload=normalizer_payload,
         normalize_mode=dataloader_config.get("normalize_mode"),
         history_horizon=int(dataloader_config.get("horizon", 50)),
         max_model_batch_size=max_model_batch_size,
+        target_generation_method=target_generation_method,
+        target_key=str((config.get("model") or {}).get("target_key", "tau_other")),
     )
     return predictor.to(device)
 
@@ -769,15 +833,15 @@ def predict_nero_wrench(
     dq: Tensor,
     ddq: Tensor,
     tau_measured: Tensor,
-    tau_f: Tensor,
+    tau_other: Tensor,
     cache: NeroDynamicsCache,
     damping: float = 0.02,
 ) -> NeroWrenchPrediction:
     """Map state and measured torque to wrench through local Nero dynamics.
 
-    The residual model follows ``tau_f = tau_measured - tau_id`` on free-space
+    The residual model follows ``tau_other = tau_measured - tau_g`` on free-space
     data.  With external contact, the remaining joint torque is therefore
-    ``tau_measured - tau_id - tau_f``.
+    ``tau_measured - tau_g - tau_other``.
     """
 
     shape = _same_state_shape(
@@ -786,7 +850,7 @@ def predict_nero_wrench(
             "dq": dq,
             "ddq": ddq,
             "tau_measured": tau_measured,
-            "tau_f": tau_f,
+            "tau_other": tau_other,
         }
     )
     expected_jacobian_shape = (
@@ -800,7 +864,18 @@ def predict_nero_wrench(
             f"{expected_jacobian_shape}."
         )
     tau_id = linearized_rnea(q, dq, ddq, cache.rnea)
-    tau_external = tau_measured - tau_id - tau_f
+    # Legacy caches did not carry a separate gravity reference.  Their RNEA
+    # reference represented the full free-space torque, so using tau_id keeps
+    # those checkpoints numerically compatible while new caches use the
+    # explicit gravity-only term.
+    tau_g = cache.tau_g_reference
+    if tau_g is None:
+        tau_g = tau_id
+    if tuple(tau_g.shape) != tuple(tau_id.shape):
+        raise ValueError(
+            f"tau_g_reference has {tuple(tau_g.shape)}, expected {tuple(tau_id.shape)}."
+        )
+    tau_external = tau_measured - tau_g - tau_other
     wrench = damped_wrench_from_joint_torque(
         cache.frame_jacobian,
         tau_external,
@@ -808,7 +883,8 @@ def predict_nero_wrench(
     )
     return NeroWrenchPrediction(
         tau_id=tau_id,
-        tau_f=tau_f,
+        tau_g=tau_g,
+        tau_other=tau_other,
         tau_external=tau_external,
         wrench=wrench,
     )

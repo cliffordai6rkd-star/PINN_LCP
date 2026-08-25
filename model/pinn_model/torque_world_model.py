@@ -1,8 +1,11 @@
-"""Conditional Flow Matching world model for joint state and wrench.
+"""Action-conditioned flow world model for robot joint state.
 
-The neural condition uses high-rate ``q/dq/tau/(wrench)`` history and a future
-end-effector target chunk. ``wrench_dim=0`` preserves the legacy contract;
-the production configuration enables the joint wrench output with ``6``.
+The public state contract is deliberately small and explicit: ``q``, ``dq``,
+``delta_q`` and ``tau`` are the only supported state streams. ``model.inputs``
+selects which streams are fed to the history encoder, while all four streams
+remain prediction targets. The action condition is the dataset's direct
+``action`` sequence from the dataset.  Pose-action aliases are intentionally
+not accepted by the model contract.
 """
 
 from __future__ import annotations
@@ -14,26 +17,13 @@ import torch
 import torch.nn as nn
 
 
-def _sinusoidal_position_encoding(
-    length: int,
-    width: int,
-    reference: torch.Tensor,
-) -> torch.Tensor:
-    """Return a device/dtype-matched ``[1, length, width]`` encoding."""
+SUPPORTED_INPUTS = ("q", "dq", "delta_q", "tau")
 
-    position = torch.arange(
-        length,
-        device=reference.device,
-        dtype=reference.dtype,
-    )[:, None]
+
+def _sinusoidal_position_encoding(length: int, width: int, reference: torch.Tensor):
+    position = torch.arange(length, device=reference.device, dtype=reference.dtype)[:, None]
     frequency = torch.exp(
-        torch.arange(
-            0,
-            width,
-            2,
-            device=reference.device,
-            dtype=reference.dtype,
-        )
+        torch.arange(0, width, 2, device=reference.device, dtype=reference.dtype)
         * (-math.log(10_000.0) / width)
     )
     angles = position * frequency[None, :]
@@ -44,24 +34,17 @@ def _sinusoidal_position_encoding(
 
 
 class FlowTimeEmbedding(nn.Module):
-    """Embed the scalar Flow time without coupling it to trajectory time."""
-
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.projection = nn.Sequential(
-            nn.Linear(5, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(5, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
 
     def forward(self, flow_time: torch.Tensor) -> torch.Tensor:
         if flow_time.ndim == 1:
             flow_time = flow_time[:, None]
         if flow_time.ndim != 2 or flow_time.shape[-1] != 1:
-            raise ValueError(
-                "flow_time must have shape [B] or [B, 1], got "
-                f"{tuple(flow_time.shape)}"
-            )
+            raise ValueError(f"flow_time must have shape [B] or [B, 1], got {tuple(flow_time.shape)}")
         features = torch.cat(
             (
                 flow_time,
@@ -76,29 +59,17 @@ class FlowTimeEmbedding(nn.Module):
 
 
 class FlowDecoderBlock(nn.Module):
-    """Non-causal trajectory attention followed by condition attention."""
+    """Non-causal future self-attention followed by condition cross-attention."""
 
-    def __init__(
-        self,
-        hidden_dim: int,
-        attention_heads: int,
-        ffn_multiplier: int,
-        dropout: float,
-    ):
+    def __init__(self, hidden_dim, attention_heads, ffn_multiplier, dropout):
         super().__init__()
         self.self_norm = nn.LayerNorm(hidden_dim)
         self.self_attention = nn.MultiheadAttention(
-            hidden_dim,
-            attention_heads,
-            dropout=dropout,
-            batch_first=True,
+            hidden_dim, attention_heads, dropout=dropout, batch_first=True
         )
         self.condition_norm = nn.LayerNorm(hidden_dim)
         self.condition_attention = nn.MultiheadAttention(
-            hidden_dim,
-            attention_heads,
-            dropout=dropout,
-            batch_first=True,
+            hidden_dim, attention_heads, dropout=dropout, batch_first=True
         )
         self.ffn_norm = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
@@ -109,21 +80,12 @@ class FlowDecoderBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        trajectory: torch.Tensor,
-        memory: torch.Tensor,
-        memory_padding_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
+    def forward(self, trajectory, memory, memory_padding_mask=None):
         normalized = self.self_norm(trajectory)
         attended, _ = self.self_attention(
-            query=normalized,
-            key=normalized,
-            value=normalized,
-            need_weights=False,
+            query=normalized, key=normalized, value=normalized, need_weights=False
         )
         trajectory = trajectory + self.dropout(attended)
-
         attended, _ = self.condition_attention(
             query=self.condition_norm(trajectory),
             key=memory,
@@ -136,31 +98,18 @@ class FlowDecoderBlock(nn.Module):
 
 
 class TorqueWorldModel(nn.Module):
-    """Generate future ``q``, ``dq``, ``tau``, and optionally ``wrench`` with CFM.
+    """Generate future q/dq/delta_q/tau and contact phase with CFM."""
 
-    Condition keys:
-
-    - ``q``: normalized joint-position history ``[B, H, D]``
-    - ``dq``: normalized joint-velocity history ``[B, H, D]``
-    - ``tau``: normalized measured-torque history ``[B, H, D]``
-    - ``target_relative_pose``: normalized future action targets ``[B, A, U]``
-    - ``target_relative_pose_mask``: optional valid-token mask ``[B, A]``
-
-    ``H``, ``A``, and the generated future horizon ``T`` are independent.
-    Training additionally requires ``q_future``, ``dq_future``, and
-    ``tau_future`` targets.
-    """
-
-    CONDITION_KEYS = (
-        "q",
-        "dq",
-        "tau",
-        "wrench",
-        "target_relative_pose",
-        "target_relative_pose_mask",
+    SUPPORTED_INPUTS = SUPPORTED_INPUTS
+    CONDITION_KEYS = ("q", "dq", "delta_q", "tau", "action", "action_mask")
+    TARGET_KEYS = (
+        "q_future",
+        "dq_future",
+        "delta_q_future",
+        "tau_future",
+        "contact_future",
     )
-    TARGET_KEYS = ("q_future", "dq_future", "tau_future", "wrench_future")
-    MODEL_VERSION = "torque_world_model_v3"
+    MODEL_VERSION = "torque_world_model_v4"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -168,137 +117,108 @@ class TorqueWorldModel(nn.Module):
             raise TypeError("config must be a mapping")
         data_config = config.get("dataloader") or {}
         model_config = config.get("model") or {}
-
-        self.history_horizon = int(
-            data_config.get(
-                "state_history_horizon",
-                data_config.get("history_horizon", 50),
-            )
-        )
-        self.future_horizon = int(
-            data_config.get(
-                "prediction_horizon",
-                data_config.get("future_horizon", 40),
-            )
-        )
-        configured_action_horizon = data_config.get("action_condition_horizon")
-        self.action_condition_horizon = (
-            None
-            if configured_action_horizon is None
-            else int(configured_action_horizon)
+        self.history_horizon = int(data_config.get("state_history_horizon", data_config.get("history_horizon", 50)))
+        self.future_horizon = int(data_config.get("prediction_horizon", data_config.get("future_horizon", 40)))
+        self.action_condition_horizon = int(
+            data_config.get("action_condition_horizon", data_config.get("action_horizon", 8))
         )
         self.joint_dim = int(model_config.get("joint_dim", 7))
-        self.state_contract = str(
-            model_config.get("state_contract", "q_dq_tau_wrench")
-        ).lower()
-        self.q_tau_contact_contract = self.state_contract == "q_tau_contact"
-        if self.state_contract not in {"q_dq_tau_wrench", "q_tau_contact"}:
+        self.action_dim = int(model_config.get("action_dim", self.joint_dim))
+
+        legacy_contract = str(model_config.get("state_contract", "")).lower()
+        configured_inputs = model_config.get("inputs")
+        if configured_inputs is None:
+            if legacy_contract == "q_tau_contact":
+                configured_inputs = ["q", "tau"]
+            elif legacy_contract == "q_dq_tau_wrench":
+                configured_inputs = ["q", "dq", "tau"]
+            else:
+                configured_inputs = list(SUPPORTED_INPUTS)
+        if isinstance(configured_inputs, str):
+            configured_inputs = [configured_inputs]
+        self.inputs = tuple(str(value).lower() for value in configured_inputs)
+        if not self.inputs:
+            raise ValueError("model.inputs must contain at least one state stream")
+        unknown = sorted(set(self.inputs) - set(SUPPORTED_INPUTS))
+        if unknown:
+            raise ValueError(f"model.inputs contains unsupported values {unknown}; choose from {list(SUPPORTED_INPUTS)}")
+        if len(set(self.inputs)) != len(self.inputs):
+            raise ValueError("model.inputs must not contain duplicates")
+
+        configured_wrench_dim = int(model_config.get("wrench_dim", 0) or 0)
+        if configured_wrench_dim != 0:
             raise ValueError(
-                "model.state_contract must be q_dq_tau_wrench or q_tau_contact"
+                "model.wrench_dim is no longer supported; use q/dq/delta_q/tau"
             )
-        self.wrench_dim = int(model_config.get("wrench_dim", 0))
-        if self.q_tau_contact_contract and self.wrench_dim:
-            raise ValueError(
-                "model.wrench_dim must be zero for state_contract=q_tau_contact"
-            )
-        self.action_dim = int(model_config.get("action_dim", 7))
+        # Kept as a compatibility attribute only. No wrench/RNEA path exists.
+        self.wrench_dim = 0
+        self.state_contract = "q_dq_delta_q_tau"
+        self.q_tau_contact_contract = legacy_contract == "q_tau_contact"
+        self.contact_state_count = int(model_config.get("contact_state_count", 3))
+        if self.contact_state_count < 0:
+            raise ValueError("model.contact_state_count must be non-negative")
+        self.contact_logit_scale = float(model_config.get("contact_logit_scale", 4.0))
         self.hidden_dim = int(model_config.get("hidden_dim", 128))
-        self.state_layers = int(
-            model_config.get("state_layers", model_config.get("num_layers", 2))
-        )
-        self.action_layers = int(
-            model_config.get("action_layers", model_config.get("num_layers", 2))
-        )
+        self.state_layers = int(model_config.get("state_layers", model_config.get("num_layers", 2)))
+        self.action_layers = int(model_config.get("action_layers", model_config.get("num_layers", 2)))
         self.attention_heads = int(model_config.get("attention_heads", 4))
         self.flow_layers = int(model_config.get("flow_layers", 4))
-        self.flow_attention_heads = int(
-            model_config.get("flow_attention_heads", self.attention_heads)
-        )
-        self.flow_ffn_multiplier = int(
-            model_config.get("flow_ffn_multiplier", 4)
-        )
-        self.flow_inference_steps = int(
-            model_config.get("flow_inference_steps", 8)
-        )
+        self.flow_attention_heads = int(model_config.get("flow_attention_heads", self.attention_heads))
+        self.flow_ffn_multiplier = int(model_config.get("flow_ffn_multiplier", 4))
+        self.flow_inference_steps = int(model_config.get("flow_inference_steps", 8))
         self.flow_solver = str(model_config.get("flow_solver", "heun")).lower()
-        self.contact_logit_scale = float(
-            model_config.get("contact_logit_scale", 4.0)
-        )
+        self.flow_source_mode = str(
+            model_config.get(
+                "flow_source_mode", model_config.get("flow_source", "gaussian")
+            )
+        ).lower()
         self.dropout = float(model_config.get("dropout", 0.1))
-        self.contact_state_count = 3 if self.q_tau_contact_contract else 0
-        self.flow_dim = (
-            2 * self.joint_dim + self.contact_state_count
-            if self.q_tau_contact_contract
-            else 3 * self.joint_dim + self.wrench_dim
-        )
+        self.flow_dim = 4 * self.joint_dim + self.contact_state_count
+        self.state_input_dim = len(self.inputs) * self.joint_dim
         self._validate_config()
 
         state_dropout = self.dropout if self.state_layers > 1 else 0.0
         action_dropout = self.dropout if self.action_layers > 1 else 0.0
-        state_input_dim = (
-            2 * self.joint_dim if self.q_tau_contact_contract else self.flow_dim
-        )
         self.state_encoder = nn.GRU(
-            input_size=state_input_dim,
-            hidden_size=self.hidden_dim,
-            num_layers=self.state_layers,
-            dropout=state_dropout,
-            batch_first=True,
+            self.state_input_dim, self.hidden_dim, self.state_layers,
+            dropout=state_dropout, batch_first=True
         )
         self.action_encoder = nn.GRU(
-            input_size=self.action_dim,
-            hidden_size=self.hidden_dim,
-            num_layers=self.action_layers,
-            dropout=action_dropout,
-            batch_first=True,
+            self.action_dim, self.hidden_dim, self.action_layers,
+            dropout=action_dropout, batch_first=True
         )
         self.state_token_norm = nn.LayerNorm(self.hidden_dim)
         self.action_token_norm = nn.LayerNorm(self.hidden_dim)
-
-        # This direction is intentional: current state tokens query the known
-        # future action target tokens.  The action sequence remains available
-        # separately in condition_memory after this operation.
         self.state_queries_action = nn.MultiheadAttention(
-            embed_dim=self.hidden_dim,
-            num_heads=self.attention_heads,
-            dropout=self.dropout,
-            batch_first=True,
+            self.hidden_dim, self.attention_heads, dropout=self.dropout, batch_first=True
         )
         self.state_action_dropout = nn.Dropout(self.dropout)
         self.state_action_norm = nn.LayerNorm(self.hidden_dim)
         self.state_action_ffn = nn.Sequential(
-            nn.Linear(self.hidden_dim, 2 * self.hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(2 * self.hidden_dim, self.hidden_dim),
+            nn.Linear(self.hidden_dim, 2 * self.hidden_dim), nn.SiLU(),
+            nn.Dropout(self.dropout), nn.Linear(2 * self.hidden_dim, self.hidden_dim)
         )
         self.state_action_ffn_norm = nn.LayerNorm(self.hidden_dim)
         self.global_condition_projection = nn.Sequential(
-            nn.Linear(2 * self.hidden_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Linear(2 * self.hidden_dim, self.hidden_dim), nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
-
         self.flow_input_projection = nn.Sequential(
-            nn.LayerNorm(self.flow_dim),
-            nn.Linear(self.flow_dim, self.hidden_dim),
+            nn.LayerNorm(self.flow_dim), nn.Linear(self.flow_dim, self.hidden_dim)
         )
         self.flow_time_embedding = FlowTimeEmbedding(self.hidden_dim)
         self.flow_blocks = nn.ModuleList(
             FlowDecoderBlock(
-                self.hidden_dim,
-                self.flow_attention_heads,
-                self.flow_ffn_multiplier,
-                self.dropout,
+                self.hidden_dim, self.flow_attention_heads,
+                self.flow_ffn_multiplier, self.dropout
             )
             for _ in range(self.flow_layers)
         )
         self.flow_output = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.flow_dim),
+            nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.flow_dim)
         )
 
-    def _validate_config(self) -> None:
+    def _validate_config(self):
         positive = {
             "state_history_horizon": self.history_horizon,
             "prediction_horizon": self.future_horizon,
@@ -312,488 +232,245 @@ class TorqueWorldModel(nn.Module):
             "flow_attention_heads": self.flow_attention_heads,
             "flow_ffn_multiplier": self.flow_ffn_multiplier,
             "flow_inference_steps": self.flow_inference_steps,
+            "action_condition_horizon": self.action_condition_horizon,
         }
-        if self.wrench_dim < 0:
-            raise ValueError("model.wrench_dim must be non-negative")
-        if self.action_condition_horizon is not None:
-            positive["action_condition_horizon"] = self.action_condition_horizon
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(f"model dimensions must be positive: {invalid}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("model.dropout must be in [0, 1)")
-        if not math.isfinite(self.contact_logit_scale) or self.contact_logit_scale <= 0.0:
+        if not math.isfinite(self.contact_logit_scale) or self.contact_logit_scale <= 0:
             raise ValueError("model.contact_logit_scale must be positive")
         if self.hidden_dim % self.attention_heads != 0:
-            raise ValueError(
-                "model.hidden_dim must be divisible by attention_heads"
-            )
+            raise ValueError("model.hidden_dim must be divisible by attention_heads")
         if self.hidden_dim % self.flow_attention_heads != 0:
-            raise ValueError(
-                "model.hidden_dim must be divisible by flow_attention_heads"
-            )
+            raise ValueError("model.hidden_dim must be divisible by flow_attention_heads")
         if self.flow_solver not in {"euler", "heun"}:
             raise ValueError("model.flow_solver must be 'euler' or 'heun'")
+        if self.flow_source_mode != "gaussian":
+            raise ValueError(
+                "model.flow_source_mode must be 'gaussian'; state-to-state "
+                "sources are no longer supported"
+            )
+
     @staticmethod
-    def _require_sequence(
-        batch: Mapping[str, torch.Tensor],
-        key: str,
-        *,
-        horizon: int | None,
-        feature_dim: int,
-    ) -> torch.Tensor:
+    def _require_sequence(batch, key, *, horizon=None, feature_dim=None):
         if key not in batch:
             raise KeyError(f"missing batch key {key!r}")
         value = batch[key]
         if not torch.is_tensor(value):
             raise TypeError(f"{key!r} must be a tensor")
-        if value.ndim != 3 or value.shape[-1] != feature_dim:
-            expected_horizon = "A" if horizon is None else str(horizon)
-            raise ValueError(
-                f"{key!r} must have shape [B, {expected_horizon}, "
-                f"{feature_dim}], got {tuple(value.shape)}"
-            )
+        if value.ndim != 3 or (feature_dim is not None and value.shape[-1] != feature_dim):
+            raise ValueError(f"{key!r} must have shape [B, H, {feature_dim}], got {tuple(value.shape)}")
         if horizon is not None and value.shape[1] != horizon:
-            raise ValueError(
-                f"{key!r} must have horizon {horizon}, got {value.shape[1]}"
-            )
+            raise ValueError(f"{key!r} must have horizon {horizon}, got {value.shape[1]}")
         if not value.is_floating_point():
-            raise TypeError(f"{key!r} must be a floating-point tensor")
+            raise TypeError(f"{key!r} must be floating point")
         return value
 
-    def _condition_inputs(self, batch: Mapping[str, torch.Tensor]):
-        q = self._require_sequence(
-            batch,
-            "q",
-            horizon=self.history_horizon,
-            feature_dim=self.joint_dim,
-        )
-        dq = None
-        if not self.q_tau_contact_contract:
-            dq = self._require_sequence(
-                batch,
-                "dq",
-                horizon=self.history_horizon,
-                feature_dim=self.joint_dim,
-            )
-        tau = self._require_sequence(
-            batch,
-            "tau",
-            horizon=self.history_horizon,
-            feature_dim=self.joint_dim,
-        )
-        wrench = None
-        if self.wrench_dim:
-            wrench = self._require_sequence(
-                batch,
-                "wrench",
-                horizon=self.history_horizon,
-                feature_dim=self.wrench_dim,
-            )
-        action = self._require_sequence(
-            batch,
-            "target_relative_pose",
-            horizon=self.action_condition_horizon,
-            feature_dim=self.action_dim,
-        )
-        if (
-            (dq is not None and q.shape[0] != dq.shape[0])
-            or q.shape[0] != tau.shape[0]
-            or q.shape[0] != action.shape[0]
-            or (wrench is not None and q.shape[0] != wrench.shape[0])
-        ):
-            raise ValueError("q, dq, tau, and action batch dimensions must match")
-        if (
-            (dq is not None and q.device != dq.device)
-            or q.device != tau.device
-            or q.device != action.device
-            or (wrench is not None and q.device != wrench.device)
-        ):
-            raise ValueError("q, dq, tau, and action must be on the same device")
-        if (
-            (dq is not None and q.dtype != dq.dtype)
-            or q.dtype != tau.dtype
-            or q.dtype != action.dtype
-            or (wrench is not None and q.dtype != wrench.dtype)
-        ):
-            raise ValueError("q, dq, tau, and action must use the same dtype")
+    def _state_history(self, batch, key, *, required=False):
+        value = batch.get(key)
+        if value is None:
+            if required or key in self.inputs:
+                raise KeyError(f"missing batch key {key!r}")
+            reference = next((v for v in batch.values() if torch.is_tensor(v) and v.ndim == 3), None)
+            if reference is None:
+                raise ValueError("cannot infer device for a missing state stream")
+            return reference.new_zeros(reference.shape[0], self.history_horizon, self.joint_dim)
+        return self._require_sequence(batch, key, horizon=self.history_horizon, feature_dim=self.joint_dim)
 
-        mask = batch.get("target_relative_pose_mask")
+    def _action_inputs(self, batch):
+        action = batch.get("action")
+        if action is None:
+            raise KeyError("missing batch key 'action'")
+        action = self._require_sequence(
+            {"action": action}, "action", horizon=self.action_condition_horizon, feature_dim=self.action_dim
+        )
+        mask = batch.get("action_mask")
         if mask is None:
-            valid_action = torch.ones(
-                action.shape[:2], device=action.device, dtype=torch.bool
-            )
+            valid = torch.ones(action.shape[:2], device=action.device, dtype=torch.bool)
         else:
             if not torch.is_tensor(mask) or tuple(mask.shape) != tuple(action.shape[:2]):
                 actual = None if not torch.is_tensor(mask) else tuple(mask.shape)
-                raise ValueError(
-                    "'target_relative_pose_mask' must have shape [B, A], got "
-                    f"{actual}"
-                )
-            mask = mask.to(device=action.device)
-            if mask.dtype == torch.bool:
-                valid_action = mask
-            else:
-                if not mask.is_floating_point() and mask.dtype not in (
-                    torch.uint8,
-                    torch.int8,
-                    torch.int16,
-                    torch.int32,
-                    torch.int64,
-                ):
-                    raise TypeError("target_relative_pose_mask must be bool or numeric")
-                if not torch.isfinite(mask.to(dtype=torch.float32)).all():
-                    raise ValueError("target_relative_pose_mask must be finite")
-                valid_action = mask > 0
-        if torch.any(valid_action.sum(dim=1) == 0):
-            raise ValueError("each sample must contain at least one valid action token")
-        return q, dq, tau, wrench, action, valid_action
+                raise ValueError(f"action_mask must have shape [B, A], got {actual}")
+            valid = mask.to(device=action.device)
+            if valid.dtype != torch.bool:
+                if not torch.isfinite(valid.to(dtype=torch.float32)).all():
+                    raise ValueError("action_mask must be finite")
+                valid = valid > 0
+        if torch.any(valid.sum(dim=1) == 0):
+            raise ValueError("each sample must contain at least one valid action")
+        return action, valid
 
-    def encode_conditions(
-        self,
-        batch: Mapping[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        q, dq, tau, wrench, action, valid_action = self._condition_inputs(batch)
-        if self.q_tau_contact_contract:
-            state_values = (q, tau)
-        else:
-            state_values = (q, dq, tau) if wrench is None else (q, dq, tau, wrench)
-        state_input = torch.cat(state_values, dim=-1)
+    def _condition_inputs(self, batch):
+        states = {key: self._state_history(batch, key, required=key in self.inputs) for key in SUPPORTED_INPUTS}
+        action, valid = self._action_inputs(batch)
+        reference = states[self.inputs[0]]
+        for key, value in states.items():
+            if value.shape[0] != reference.shape[0] or value.device != reference.device or value.dtype != reference.dtype:
+                raise ValueError(f"{key} does not match the active state batch")
+        if action.shape[0] != reference.shape[0] or action.device != reference.device or action.dtype != reference.dtype:
+            raise ValueError("action does not match the state batch")
+        return states, action, valid
+
+    def encode_conditions(self, batch: Mapping[str, torch.Tensor]):
+        states, action, valid_action = self._condition_inputs(batch)
+        state_input = torch.cat([states[key] for key in self.inputs], dim=-1)
         state_features, state_hidden = self.state_encoder(state_input)
-
         masked_action = action.masked_fill(~valid_action[..., None], 0.0)
         action_features, _ = self.action_encoder(masked_action)
-        state_tokens = self.state_token_norm(
-            state_features
-            + _sinusoidal_position_encoding(
-                state_features.shape[1], self.hidden_dim, state_features
-            )
-        )
-        action_tokens = self.action_token_norm(
-            action_features
-            + _sinusoidal_position_encoding(
-                action_features.shape[1], self.hidden_dim, action_features
-            )
-        )
-
+        state_tokens = self.state_token_norm(state_features + _sinusoidal_position_encoding(state_features.shape[1], self.hidden_dim, state_features))
+        action_tokens = self.action_token_norm(action_features + _sinusoidal_position_encoding(action_features.shape[1], self.hidden_dim, action_features))
         attended_action, attention_weights = self.state_queries_action(
-            query=state_tokens,
-            key=action_tokens,
-            value=action_tokens,
-            key_padding_mask=~valid_action,
-            need_weights=True,
-            average_attn_weights=False,
+            query=state_tokens, key=action_tokens, value=action_tokens,
+            key_padding_mask=~valid_action, need_weights=True, average_attn_weights=False
         )
-        state_action_features = self.state_action_norm(
-            state_tokens + self.state_action_dropout(attended_action)
-        )
-        state_action_features = self.state_action_ffn_norm(
-            state_action_features
-            + self.state_action_ffn(state_action_features)
-        )
-
-        # Preserve the action tokens instead of compressing the full plan into
-        # one vector.  Future Flow tokens can attend to either stream.
-        condition_memory = torch.cat(
-            (state_action_features, action_tokens), dim=1
-        )
+        state_action_features = self.state_action_norm(state_tokens + self.state_action_dropout(attended_action))
+        state_action_features = self.state_action_ffn_norm(state_action_features + self.state_action_ffn(state_action_features))
+        condition_memory = torch.cat((state_action_features, action_tokens), dim=1)
         memory_padding_mask = torch.cat(
             (
-                torch.zeros(
-                    q.shape[0],
-                    self.history_horizon,
-                    device=q.device,
-                    dtype=torch.bool,
-                ),
+                torch.zeros(state_tokens.shape[0], state_tokens.shape[1], device=state_tokens.device, dtype=torch.bool),
                 ~valid_action,
-            ),
-            dim=1,
+            ), dim=1
         )
-        action_denominator = valid_action.sum(dim=1, keepdim=True).to(q.dtype)
-        pooled_action = (
-            action_tokens * valid_action[..., None]
-        ).sum(dim=1) / action_denominator
-        global_condition = self.global_condition_projection(
-            torch.cat((state_hidden[-1], pooled_action), dim=-1)
-        )
+        denominator = valid_action.sum(dim=1, keepdim=True).to(action.dtype)
+        pooled_action = (action_tokens * valid_action[..., None]).sum(dim=1) / denominator
+        global_condition = self.global_condition_projection(torch.cat((state_hidden[-1], pooled_action), dim=-1))
         return {
             "state_features": state_tokens,
             "action_features": action_tokens,
             "state_action_features": state_action_features,
             "state_action_attention_weights": attention_weights,
-            "target_relative_pose_mask": valid_action,
+            "action_mask": valid_action,
             "condition_memory": condition_memory,
             "condition_memory_padding_mask": memory_padding_mask,
             "global_condition": global_condition,
         }
 
-    def _target_flow_state(
-        self,
-        batch: Mapping[str, torch.Tensor],
-        reference: torch.Tensor,
-    ) -> torch.Tensor:
-        q_future = self._require_sequence(
-            batch,
-            "q_future",
-            horizon=self.future_horizon,
-            feature_dim=self.joint_dim,
-        )
-        if self.q_tau_contact_contract:
-            tau_future = self._require_sequence(
-                batch,
-                "tau_future",
-                horizon=self.future_horizon,
-                feature_dim=self.joint_dim,
-            )
-            contact = self._require_sequence(
-                batch,
-                "contact_future",
-                horizon=self.future_horizon,
-                feature_dim=1,
-            )
-            for key, value in (
-                ("q_future", q_future),
-                ("tau_future", tau_future),
-                ("contact_future", contact),
-            ):
-                if value.shape[0] != reference.shape[0]:
-                    raise ValueError(f"{key!r} batch dimension does not match q")
-                if value.device != reference.device or value.dtype != reference.dtype:
-                    raise ValueError(
-                        f"{key!r} must match condition device/dtype "
-                        f"({value.device}/{value.dtype} != "
-                        f"{reference.device}/{reference.dtype})"
-                    )
-            if torch.any((contact < 0.0) | (contact > 2.0)):
-                raise ValueError("contact_future values must be in [0, 2]")
-            contact_index = contact.squeeze(-1).round().to(dtype=torch.long)
-            contact_target = q_future.new_full(
-                (*contact_index.shape, self.contact_state_count),
-                -float(self.contact_logit_scale),
-            )
-            contact_target.scatter_(-1, contact_index[..., None], float(self.contact_logit_scale))
-            return torch.cat((q_future, tau_future, contact_target), dim=-1)
-        dq_future = self._require_sequence(
-            batch,
-            "dq_future",
-            horizon=self.future_horizon,
-            feature_dim=self.joint_dim,
-        )
-        tau_future = self._require_sequence(
-            batch,
-            "tau_future",
-            horizon=self.future_horizon,
-            feature_dim=self.joint_dim,
-        )
-        values = [
-            ("q_future", q_future),
-            ("dq_future", dq_future),
-            ("tau_future", tau_future),
-        ]
-        if self.wrench_dim:
-            values.append(
-                (
-                    "wrench_future",
-                    self._require_sequence(
-                        batch,
-                        "wrench_future",
-                        horizon=self.future_horizon,
-                        feature_dim=self.wrench_dim,
-                    ),
-                )
-            )
-        for key, value in values:
-            if value.shape[0] != reference.shape[0]:
-                raise ValueError(f"{key!r} batch dimension does not match q")
-            if value.device != reference.device or value.dtype != reference.dtype:
-                value_type = f"{value.device}/{value.dtype}"
-                reference_type = f"{reference.device}/{reference.dtype}"
-                raise ValueError(
-                    f"{key!r} must match condition device/dtype "
-                    f"({value_type} != {reference_type})"
-                )
-        return torch.cat(tuple(value for _, value in values), dim=-1)
-
-    def _history_flow_source(
-        self,
-        batch: Mapping[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Causally align the latest observed history to the T-step source.
-
-        When H >= T, the source is the latest T observations at their original
-        cadence. When H < T, the first observation is left-padded. This keeps
-        H and T independent without time-warping or introducing future data.
-        """
-        q, dq, tau, wrench, _, _ = self._condition_inputs(batch)
-
-        def align_history(value):
-            if value.shape[1] >= self.future_horizon:
-                return value[:, -self.future_horizon :]
-            padding = value[:, :1].expand(
-                -1, self.future_horizon - value.shape[1], -1
-            )
-            return torch.cat((padding, value), dim=1)
-
-        q_source = align_history(q)
-        tau_source = align_history(tau)
-        if self.q_tau_contact_contract:
-            contact_source = q_source.new_zeros(
-                q_source.shape[0], self.future_horizon, self.contact_state_count
-            )
-            return torch.cat((q_source, tau_source, contact_source), dim=-1)
-        dq_source = align_history(dq)
-        values = (q_source, dq_source, tau_source)
-        if wrench is not None:
-            values = (*values, align_history(wrench))
+    def _target_flow_state(self, batch, reference):
+        values = []
+        for key in SUPPORTED_INPUTS:
+            value = self._require_sequence(batch, f"{key}_future", horizon=self.future_horizon, feature_dim=self.joint_dim)
+            if value.shape[0] != reference.shape[0] or value.device != reference.device or value.dtype != reference.dtype:
+                raise ValueError(f"{key}_future does not match the condition batch")
+            values.append(value)
+        if self.contact_state_count:
+            contact = batch.get("contact_future")
+            if contact is None:
+                raise KeyError("missing batch key 'contact_future'")
+            if not torch.is_tensor(contact) or contact.ndim != 3 or tuple(contact.shape[1:]) != (self.future_horizon, 1):
+                actual = None if not torch.is_tensor(contact) else tuple(contact.shape)
+                raise ValueError(f"contact_future must have shape [B, {self.future_horizon}, 1], got {actual}")
+            contact = contact.to(device=reference.device, dtype=reference.dtype)
+            if torch.any((contact < 0) | (contact >= self.contact_state_count)):
+                raise ValueError("contact_future contains an invalid phase")
+            index = contact.squeeze(-1).round().to(dtype=torch.long)
+            logits = reference.new_full((*index.shape, self.contact_state_count), -float(self.contact_logit_scale))
+            logits.scatter_(-1, index[..., None], float(self.contact_logit_scale))
+            values.append(logits)
         return torch.cat(values, dim=-1)
 
-    def _prepare_flow_time(
-        self,
-        reference: torch.Tensor,
-        flow_time: torch.Tensor | float | None,
-    ) -> torch.Tensor:
+    def _gaussian_flow_source(self, reference, source_noise=None):
+        """Return the independent Gaussian source for flow matching.
+
+        History observations remain conditions only.  They are deliberately
+        not copied into the source trajectory, so the model learns a genuine
+        noise-to-future transport and does not inherit a state-to-state
+        shortcut.  ``source_noise`` is injectable for OPD, where Teacher and
+        Student must see the same Monte-Carlo source.
+        """
+
+        if not torch.is_tensor(reference) or reference.ndim != 3:
+            raise ValueError("reference state must have shape [B, H, D]")
+        shape = (reference.shape[0], self.future_horizon, self.flow_dim)
+        if source_noise is None:
+            return torch.randn(shape, device=reference.device, dtype=reference.dtype)
+        if not torch.is_tensor(source_noise) or tuple(source_noise.shape) != shape:
+            actual = None if not torch.is_tensor(source_noise) else tuple(source_noise.shape)
+            raise ValueError(f"source_noise must have shape {shape}, got {actual}")
+        if source_noise.device != reference.device or source_noise.dtype != reference.dtype:
+            source_noise = source_noise.to(device=reference.device, dtype=reference.dtype)
+        if not torch.isfinite(source_noise).all():
+            raise ValueError("source_noise must be finite")
+        return source_noise
+
+    def _prepare_flow_time(self, reference, flow_time):
         batch_size = reference.shape[0]
         if flow_time is None:
-            if self.training:
-                result = torch.rand(
-                    batch_size,
-                    1,
-                    device=reference.device,
-                    dtype=reference.dtype,
-                )
-            else:
-                result = reference.new_full((batch_size, 1), 0.5)
+            result = torch.rand(batch_size, 1, device=reference.device, dtype=reference.dtype) if self.training else reference.new_full((batch_size, 1), 0.5)
         else:
-            result = torch.as_tensor(
-                flow_time,
-                device=reference.device,
-                dtype=reference.dtype,
-            )
+            result = torch.as_tensor(flow_time, device=reference.device, dtype=reference.dtype)
             if result.ndim == 0:
                 result = result.expand(batch_size).reshape(batch_size, 1)
             elif result.ndim == 1:
                 if result.numel() == 1:
                     result = result.expand(batch_size)
                 if result.shape[0] != batch_size:
-                    raise ValueError("flow_time batch dimension does not match q")
+                    raise ValueError("flow_time batch dimension does not match state")
                 result = result[:, None]
             elif tuple(result.shape) != (batch_size, 1):
                 raise ValueError("flow_time must be scalar, [B], or [B, 1]")
-        if not torch.isfinite(result).all() or torch.any(
-            (result < 0.0) | (result > 1.0)
-        ):
+        if not torch.isfinite(result).all() or torch.any((result < 0) | (result > 1)):
             raise ValueError("flow_time must be finite and in [0, 1]")
         return result
 
-    def flow_velocity(
-        self,
-        trajectory_state: torch.Tensor,
-        flow_time: torch.Tensor,
-        encoded: Mapping[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        expected = (
-            trajectory_state.shape[0],
-            self.future_horizon,
-            self.flow_dim,
-        )
+    def flow_velocity(self, trajectory_state, flow_time, encoded):
+        expected = (trajectory_state.shape[0], self.future_horizon, self.flow_dim)
         if trajectory_state.ndim != 3 or tuple(trajectory_state.shape) != expected:
-            raise ValueError(
-                "trajectory_state must have shape "
-                f"[B, {self.future_horizon}, {self.flow_dim}], got "
-                f"{tuple(trajectory_state.shape)}"
-            )
+            raise ValueError(f"trajectory_state must have shape [B, {self.future_horizon}, {self.flow_dim}], got {tuple(trajectory_state.shape)}")
         if tuple(flow_time.shape) != (trajectory_state.shape[0], 1):
             raise ValueError("flow_time must have shape [B, 1]")
-        memory = encoded["condition_memory"]
-        if memory.shape[0] != trajectory_state.shape[0]:
-            raise ValueError("condition memory batch does not match trajectory")
-        global_condition = encoded["global_condition"][:, None, :]
-        flow_features = (
+        features = (
             self.flow_input_projection(trajectory_state)
             + self.flow_time_embedding(flow_time)[:, None, :]
-            + _sinusoidal_position_encoding(
-                self.future_horizon, self.hidden_dim, trajectory_state
-            )
-            + global_condition
+            + _sinusoidal_position_encoding(self.future_horizon, self.hidden_dim, trajectory_state)
+            + encoded["global_condition"][:, None, :]
         )
         for block in self.flow_blocks:
-            flow_features = block(
-                flow_features,
-                memory,
-                encoded.get("condition_memory_padding_mask"),
-            )
-        return self.flow_output(flow_features), flow_features
+            features = block(features, encoded["condition_memory"], encoded.get("condition_memory_padding_mask"))
+        return self.flow_output(features), features
 
-    def _decoded_output(self, flow_state: torch.Tensor) -> dict[str, torch.Tensor]:
-        q_pred = flow_state[..., : self.joint_dim]
-        if self.q_tau_contact_contract:
-            tau_pred = flow_state[..., self.joint_dim : 2 * self.joint_dim]
-            contact_logits = flow_state[..., 2 * self.joint_dim :]
-            contact_probability = torch.softmax(contact_logits, dim=-1)
-            contact_state = contact_probability.argmax(dim=-1, keepdim=True).to(
-                dtype=flow_state.dtype
+    def _decoded_output(self, flow_state):
+        result = {"flow_state_pred": flow_state}
+        offset = 0
+        for key in SUPPORTED_INPUTS:
+            result[f"{key}_pred"] = flow_state[..., offset:offset + self.joint_dim]
+            offset += self.joint_dim
+        result["joint_pred"] = flow_state[..., :4 * self.joint_dim]
+        result["state_pred"] = {key: result[f"{key}_pred"] for key in SUPPORTED_INPUTS}
+        if self.contact_state_count:
+            logits = flow_state[..., offset:offset + self.contact_state_count]
+            probability = torch.softmax(logits, dim=-1)
+            state = probability.argmax(dim=-1, keepdim=True).to(flow_state.dtype)
+            result.update(
+                {
+                    "contact_logits": logits,
+                    "contact_phase_logits": logits,
+                    "contact_probability": probability,
+                    "contact_phase_probability": probability,
+                    "contact_state_pred": state,
+                    "contact_state": state,
+                }
             )
-            return {
-                "flow_state_pred": flow_state,
-                "joint_pred": flow_state[..., : 2 * self.joint_dim],
-                "q_pred": q_pred,
-                "tau_pred": tau_pred,
-                "state_pred": {
-                    "q": q_pred,
-                    "tau": tau_pred,
-                    "contact_state": contact_state,
-                },
-                "contact_logits": contact_logits,
-                "contact_phase_logits": contact_logits,
-                "contact_probability": contact_probability[..., 2:3],
-                "contact_phase_probability": contact_probability,
-                "contact_state_pred": contact_state,
-            }
-        dq_pred = flow_state[..., self.joint_dim : 2 * self.joint_dim]
-        tau_pred = flow_state[..., 2 * self.joint_dim : 3 * self.joint_dim]
-        result = {
-            "flow_state_pred": flow_state,
-            "joint_pred": flow_state,
-            "q_pred": q_pred,
-            "dq_pred": dq_pred,
-            "tau_pred": tau_pred,
-            "state_pred": {"q": q_pred, "dq": dq_pred, "tau": tau_pred},
-        }
-        if self.wrench_dim:
-            wrench_pred = flow_state[..., 3 * self.joint_dim : self.flow_dim]
-            result["wrench_pred"] = wrench_pred
-            result["state_pred"]["wrench"] = wrench_pred
+            result["state_pred"]["contact_state"] = state
         return result
 
-    def forward(
-        self,
-        batch: Mapping[str, torch.Tensor],
-        *,
-        flow_time: torch.Tensor | float | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Evaluate history-to-future conditional Flow Matching."""
-
+    def forward(self, batch, *, flow_time=None, source_noise=None):
         encoded = self.encode_conditions(batch)
-        target_state = self._target_flow_state(batch, batch["q"])
-        source_state = self._history_flow_source(batch)
+        reference = batch[self.inputs[0]]
+        target_state = self._target_flow_state(batch, reference)
+        source_state = self._gaussian_flow_source(reference, source_noise)
         time = self._prepare_flow_time(target_state, flow_time)
         interpolation_time = time[:, None, :]
-        interpolated = (
-            (1.0 - interpolation_time) * source_state
-            + interpolation_time * target_state
-        )
+        interpolated = (1.0 - interpolation_time) * source_state + interpolation_time * target_state
         velocity_target = target_state - source_state
-        velocity_pred, flow_features = self.flow_velocity(
-            interpolated,
-            time,
-            encoded,
-        )
-        endpoint_estimate = interpolated + (
-            1.0 - interpolation_time
-        ) * velocity_pred
+        velocity_pred, flow_features = self.flow_velocity(interpolated, time, encoded)
+        endpoint = interpolated + (1.0 - interpolation_time) * velocity_pred
         result = {
             **encoded,
             "flow_source_state": source_state,
+            "flow_source_noise": source_state,
             "flow_target_state": target_state,
             "flow_interpolated": interpolated,
             "flow_time": time,
@@ -803,19 +480,10 @@ class TorqueWorldModel(nn.Module):
             "velocity_target": velocity_target,
             "flow_features": flow_features,
         }
-        result.update(self._decoded_output(endpoint_estimate))
+        result.update(self._decoded_output(endpoint))
         return result
 
-    def integrate_flow(
-        self,
-        source_state: torch.Tensor,
-        encoded: Mapping[str, torch.Tensor],
-        *,
-        steps: int | None = None,
-        solver: str | None = None,
-    ) -> torch.Tensor:
-        """Integrate the learned ODE from observed history to future state."""
-
+    def integrate_flow(self, source_state, encoded, *, steps=None, solver=None):
         steps = self.flow_inference_steps if steps is None else int(steps)
         solver = self.flow_solver if solver is None else str(solver).lower()
         if steps <= 0:
@@ -825,73 +493,43 @@ class TorqueWorldModel(nn.Module):
         trajectory = source_state
         step_size = 1.0 / steps
         for step in range(steps):
-            flow_time = trajectory.new_full(
-                (trajectory.shape[0], 1), step / steps
-            )
-            first_velocity, _ = self.flow_velocity(
-                trajectory, flow_time, encoded
-            )
+            flow_time = trajectory.new_full((trajectory.shape[0], 1), step / steps)
+            first, _ = self.flow_velocity(trajectory, flow_time, encoded)
             if solver == "euler":
-                trajectory = trajectory + step_size * first_velocity
+                trajectory = trajectory + step_size * first
                 continue
-            proposal = trajectory + step_size * first_velocity
-            next_time = trajectory.new_full(
-                (trajectory.shape[0], 1), (step + 1) / steps
-            )
-            second_velocity, _ = self.flow_velocity(
-                proposal, next_time, encoded
-            )
-            trajectory = trajectory + 0.5 * step_size * (
-                first_velocity + second_velocity
-            )
+            proposal = trajectory + step_size * first
+            next_time = trajectory.new_full((trajectory.shape[0], 1), (step + 1) / steps)
+            second, _ = self.flow_velocity(proposal, next_time, encoded)
+            trajectory = trajectory + 0.5 * step_size * (first + second)
         return trajectory
 
     @torch.no_grad()
-    def predict(
-        self,
-        batch: Mapping[str, torch.Tensor],
-        *,
-        steps: int | None = None,
-        solver: str | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Roll the complete aligned q/dq/tau history into one future trajectory."""
-
+    def predict(self, batch, *, steps=None, solver=None, source_noise=None):
         encoded = self.encode_conditions(batch)
-        source = self._history_flow_source(batch)
-        generated = self.integrate_flow(
-            source,
-            encoded,
-            steps=steps,
-            solver=solver,
-        )
+        reference = batch[self.inputs[0]]
+        source = self._gaussian_flow_source(reference, source_noise)
+        generated = self.integrate_flow(source, encoded, steps=steps, solver=solver)
         result = {
             **encoded,
             "flow_source_state": source,
+            "flow_source_noise": source,
         }
         result.update(self._decoded_output(generated))
         return result
 
-    def predict_differentiable(
-        self,
-        batch: Mapping[str, torch.Tensor],
-        *,
-        steps: int | None = None,
-        solver: str | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Run Flow integration with gradients enabled for distillation."""
-
+    def predict_differentiable(self, batch, *, steps=None, solver=None, source_noise=None):
         encoded = self.encode_conditions(batch)
-        source = self._history_flow_source(batch)
-        generated = self.integrate_flow(
-            source,
-            encoded,
-            steps=steps,
-            solver=solver,
-        )
-        result = {**encoded, "flow_source_state": source}
+        reference = batch[self.inputs[0]]
+        source = self._gaussian_flow_source(reference, source_noise)
+        generated = self.integrate_flow(source, encoded, steps=steps, solver=solver)
+        result = {
+            **encoded,
+            "flow_source_state": source,
+            "flow_source_noise": source,
+        }
         result.update(self._decoded_output(generated))
         return result
 
 
-# Descriptive alias for callers that prefer the algorithm in the type name.
 ConditionalFlowTorqueWorldModel = TorqueWorldModel

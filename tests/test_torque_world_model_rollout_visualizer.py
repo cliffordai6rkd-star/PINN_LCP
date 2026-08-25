@@ -29,6 +29,21 @@ def test_checkpoint_directory_selects_newest_optimizer_step(tmp_path):
     assert resolve_checkpoint_path(tmp_path).name == "step_00050000.pt"
 
 
+def test_checkpoint_directory_selects_newest_scheduled_epoch(tmp_path):
+    (tmp_path / "epoch_0000500.pt").touch()
+    (tmp_path / "epoch_0001500.pt").touch()
+    (tmp_path / "epoch_0001000.pt").touch()
+
+    assert resolve_checkpoint_path(tmp_path).name == "epoch_0001500.pt"
+
+
+def test_checkpoint_directory_prefers_epoch_over_legacy_step(tmp_path):
+    (tmp_path / "step_00050000.pt").touch()
+    (tmp_path / "epoch_0000500.pt").touch()
+
+    assert resolve_checkpoint_path(tmp_path).name == "epoch_0000500.pt"
+
+
 def test_rollout_selection_is_episode_local_and_strided():
     episodes = [
         {"episode_index": 3, "dataset_from_index": 0, "dataset_to_index": 10},

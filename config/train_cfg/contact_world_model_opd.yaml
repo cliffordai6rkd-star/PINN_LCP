@@ -2,18 +2,27 @@
 # Train the Teacher first with contact_world_model.yaml, then point
 # distillation.teacher_checkpoint_path to its best checkpoint directory/file.
 
+wm_v3_only: true
+
+train_data:
+  format: lerobot_v3
+
 dataloader:
-  root: ../nero_ws/runs/wipe_board
-  backend: h5
-  h5_patterns: ["*.h5", "*.hdf5"]
-  max_cadence_error_s: 0.02
+  repo_id: push_button_lerobot_v3
+  root: ../nero_ws/runs/push_button_lerobot_v3
+  backend: lerobot
+  v3_only: true
 
   high_fps: 100
   state_history_horizon: 50
   prediction_horizon: 32
   action_condition_horizon: 8
-  action_condition_features: [absolute_pose, current_ee_pose, relative_pose]
-  current_ee_pose_source: fk
+  action_condition_mode: direct
+  action_key: action.joint
+  high_timestamp_key: timing.state_timestamp_ns
+  anchor_timestamp_key: timing.action_anchor_timestamp_ns
+  action_index_key: timing.action_index
+  action_start_offset: 1
   pad_history: true
   pad_future: false
 
@@ -21,42 +30,34 @@ dataloader:
   action_chunk_horizon: 8
   inference_delay_s: 0.0
   action_resample: nearest
-  action_condition_mode: composite
 
-  h5_timestamp_path: teleop/timestamp_us
-  h5_timestamp_unit: us
-  h5_anchor_timestamp_path: cameras/wrist/timestamp_us
-  h5_anchor_timestamp_unit: us
-  h5_high_fields:
-    q: teleop/q_follower
-    dq: null
-    ddq: null
-    tau: teleop/tau_follower
-    wrench: teleop/wrench_cal
-    tau_ext: teleop/tau_ext_cal
-    reference_pose:
-      path: teleop/ee_pose_follower
-      transform: ee_pose_matrix_to_quaternion
+  filters:
+    q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
+    dq: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
+    delta_q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
+    tau: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 20.0, order: 2}]}
+  filter_timestamp_unit: ns
 
   normalize_mode: gaussian
-  normalize_lowdim_keys: [q, tau, target_relative_pose]
+  normalize_lowdim_keys: [q, dq, delta_q, tau, action]
 
 contact_gate:
   enabled: true
   label_mode: three_phase
-  metric: force_xyz_l2
+  metric: tau_ext_l1
   thresholds:
     force_xyz_l2: {"off": 0.3, "on": 1.5}
     tau_ext_l1: {"off": 0.15, "on": 0.75}
+    tau_ext_l2: {"off": 0.15, "on": 0.75}
   consecutive_frames: 5
   class_weights: auto
   max_class_weight: 20.0
 
 model:
-  state_contract: q_tau_contact
+  inputs: [q, dq, delta_q, tau]
   joint_dim: 7
-  wrench_dim: 0
-  action_dim: 21
+  action_dim: 7
+  contact_state_count: 3
   hidden_dim: 128
   state_layers: 2
   action_layers: 2
@@ -68,45 +69,46 @@ model:
   # Student uses 2 ODE evaluations; the Teacher checkpoint is loaded at 8.
   flow_inference_steps: 2
   flow_solver: heun
+  flow_source_mode: gaussian
   contact_logit_scale: 4.0
-  state_estimator:
-    sampling_dt: 0.01
-    q_mean_window_samples: 10
-    q_lowpass_cutoff_hz: 10
-    dq_lowpass_cutoff_hz: 6
-    ddq_lowpass_cutoff_hz: 3
 
 loss:
   flow_weight: 1.0
   flow_q_weight: 1.0
+  flow_dq_weight: 1.0
+  flow_delta_q_weight: 1.0
   flow_tau_weight: 1.0
-  flow_contact_weight: 1.0
   q_weight: 1.0
   tau_weight: 1.0
   contact_weight: 1.0
   contact_class_weights: auto
-  dq_weight: 0.2
-  ddq_weight: 0
-  derived_warmup_steps: 20000
-  standardize_derived_residuals: true
-  wrench_weight: 0.0
-
-physics:
-  rnea:
-    enabled: false
-  rnea_rollout:
-    enabled: false
+  dq_weight: 0.5
+  delta_q_weight: 1.0
+  kinematic_consistency_weight: 0.05
+  ddq_smoothness_weight: 0.05
+  ddq_smoothness_warmup_steps: 1000
+  ddq_smoothness_huber_delta: 1.0
+  ddq_smoothness_normalize: true
+  dt: 0.01
 
 distillation:
   enabled: true
-  teacher_checkpoint_path: outputs/contact_world_model_opd_sweep/20260819_113728/teacher/checkpoints/step_00100000.pt
+  teacher_checkpoint_path: outputs/contact_world_model_v1/checkpoints
   teacher_steps: 8
   student_steps: 2
   weight: 1.0
-  # Contact logits are distilled in addition to q/tau endpoint matching.
-  contact_weight: 1.0
   rollout_weight: 1.0
   rollout_steps: 4
+  rollout_contact:
+    enabled: true
+    # Checkpoint must be trained with model.inputs=[q, dq, delta_q] and target_key=tau.
+    tau_free_checkpoint_path: outputs/tau_free_sequence/pure_teleop_1/checkpoints/epoch_128_val_tau_mse_nm2_0.005294.pt
+    weight: 0.2
+    physical_consistency_weight: 0.02
+    horizon: 32
+    backfill: false
+    temperature: 0.05
+    max_model_batch_size: 1024
   curriculum:
     enabled: true
     epochs: 100
@@ -126,10 +128,9 @@ train:
   amp:
     enabled: true
     dtype: bfloat16
-  # 132021 train samples / batch_size=128 is about 1032 batches per epoch.
-  # Match the 100-epoch OPD curriculum instead of reaching the LR floor halfway.
-  max_train_steps: 105000
-  checkpoint_every_steps: 5000
+  # Epoch-based budget and chronological checkpoint retention.
+  num_epochs: 3000
+  checkpoint_every_epochs: 500
   val_ratio: 0.0
   val_episode_indices: [15, 50, 90]
   split_mode: episode
@@ -140,8 +141,13 @@ train:
   validation_flow_time: 0.5
   output_dir: outputs/contact_world_model_opd
   monitor_key: val_loss
-  top_k: 5
-  save_latest_checkpoint: true
+  top_k: 3
+  save_latest_checkpoint: false
+  contact_sampling:
+    enabled: true
+    phase_weights: [1.0, 2.0, 3.0]
+    future_phase_reduction: max
+    replacement: true
   ema:
     enabled: true
     decay: 0.999
@@ -150,10 +156,10 @@ train:
     use_for_validation: true
   scheduler:
     name: cosine
-    T_max: 105000
+    T_max: 3000
     eta_min: 0.000001
   early_stopping:
-    # Keep val_loss logging, but use the fixed optimizer-step budget by default.
+    # Keep val_loss logging without stopping before the configured epoch budget.
     enabled: false
     patience: 30
     warmup_epochs: 20
@@ -163,6 +169,6 @@ train:
     project: contact-world-model
     name: contact-wm-opd-student
     group: contact-world-model-opd
-    tags: [q-tau, contact-three-phase, flow-distillation, opd]
+    tags: [q-dq-deltaq-tau, direct-action, contact-three-phase, flow-distillation, opd]
     mode: online
     log_every_steps: 10

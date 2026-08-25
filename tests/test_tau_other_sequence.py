@@ -6,19 +6,19 @@ from types import SimpleNamespace
 
 import torch
 
-from model.tau_f_gru import TauFGRURegressor
-from model.tau_f_lstm import TauFLSTMRegressor
-from model.tau_f_sequence import (
-    TauFSequenceRegressor,
-    build_tau_f_sequence_model,
+from model.tau_other_gru import TauOtherGRURegressor
+from model.tau_other_lstm import TauOtherLSTMRegressor
+from model.tau_other_sequence import (
+    TauOtherSequenceRegressor,
+    build_tau_other_sequence_model,
 )
-from model.tau_f_tcn import TauFTCNRegressor
+from model.tau_other_tcn import TauOtherTCNRegressor
 from train.base_trainer import BaseTrainer, ModelEMA
 from train.nomalizer import Normalizer
 from train.torque_sequence_peak_loss import TorqueSequencePeakLoss
-from train.trainer.tau_f_sequence_train import (
+from train.trainer.tau_other_sequence_train import (
     SampleIndexDataset,
-    TauFTrainer,
+    TauOtherTrainer,
     run_purged_kfold_workflow,
 )
 
@@ -31,7 +31,7 @@ def make_config(architecture="lstm", inputs=None):
             "inputs": inputs or ["q", "dq", "ddq", "tau"],
             "input_dims": {"q": 7, "dq": 7, "ddq": 7, "tau": 7},
             "output_dim": 7,
-            "target_key": "tau_f",
+            "target_key": "tau_other",
             "hidden_dim": 16,
             "num_layers": 2,
             "head_hidden_dim": 24,
@@ -52,23 +52,23 @@ def make_config(architecture="lstm", inputs=None):
 def make_batch(batch_size=4, horizon=8):
     return {
         key: torch.randn(batch_size, horizon, 7)
-        for key in ("q", "dq", "ddq", "tau", "tau_f")
+        for key in ("q", "dq", "ddq", "tau", "tau_other")
     }
 
 
-class TauFSequenceRegressorTest(unittest.TestCase):
+class TauOtherSequenceRegressorTest(unittest.TestCase):
     def test_trainer_rejects_conflicting_cudnn_modes(self):
         config = make_config()
         config["train"].update(deterministic=True, cudnn_benchmark=True)
 
         with self.assertRaisesRegex(ValueError, "incompatible"):
-            TauFTrainer(config)
+            TauOtherTrainer(config)
 
     def test_trainer_accepts_fast_seeded_cudnn_mode(self):
         config = make_config()
         config["train"].update(deterministic=False, cudnn_benchmark=True)
 
-        trainer = TauFTrainer(config)
+        trainer = TauOtherTrainer(config)
 
         self.assertFalse(trainer.deterministic)
         self.assertTrue(trainer.cudnn_benchmark)
@@ -85,7 +85,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
                 "min_delta": 0.0,
             },
         )
-        trainer = TauFTrainer(config)
+        trainer = TauOtherTrainer(config)
 
         self.assertFalse(
             trainer.should_stop_early(
@@ -122,33 +122,33 @@ class TauFSequenceRegressorTest(unittest.TestCase):
     def test_supported_architectures_forward_backward(self):
         for architecture in ("lstm", "gru", "tcn"):
             with self.subTest(architecture=architecture):
-                model = TauFSequenceRegressor(make_config(architecture))
+                model = TauOtherSequenceRegressor(make_config(architecture))
                 out = model(make_batch())
 
-                self.assertEqual(out["tau_f_pred"].shape, (4, 7))
-                self.assertEqual(out["tau_f_target"].shape, (4, 7))
-                out["tau_f_pred"].square().mean().backward()
+                self.assertEqual(out["tau_other_pred"].shape, (4, 7))
+                self.assertEqual(out["tau_other_target"].shape, (4, 7))
+                out["tau_other_pred"].square().mean().backward()
                 self.assertTrue(
                     any(parameter.grad is not None for parameter in model.parameters())
                 )
 
     def test_factory_dispatches_to_three_independent_model_types(self):
         expected_types = {
-            "lstm": TauFLSTMRegressor,
-            "gru": TauFGRURegressor,
-            "tcn": TauFTCNRegressor,
+            "lstm": TauOtherLSTMRegressor,
+            "gru": TauOtherGRURegressor,
+            "tcn": TauOtherTCNRegressor,
         }
 
         for architecture, expected_type in expected_types.items():
             with self.subTest(architecture=architecture):
-                model = build_tau_f_sequence_model(make_config(architecture))
+                model = build_tau_other_sequence_model(make_config(architecture))
                 self.assertIs(type(model), expected_type)
 
     def test_recurrent_last_prediction_is_bitwise_legacy_compatible(self):
         batch = make_batch()
         for architecture in ("lstm", "gru"):
             with self.subTest(architecture=architecture):
-                model = TauFSequenceRegressor(make_config(architecture)).eval()
+                model = TauOtherSequenceRegressor(make_config(architecture)).eval()
                 sequence = torch.cat(
                     [batch[key] for key in model.active_inputs],
                     dim=-1,
@@ -157,12 +157,12 @@ class TauFSequenceRegressorTest(unittest.TestCase):
                 with torch.no_grad():
                     recurrent_output, _ = model.recurrent(sequence)
                     legacy_prediction = model.head(recurrent_output[:, -1])
-                    prediction = model(batch)["tau_f_pred"]
+                    prediction = model(batch)["tau_other_pred"]
 
                 self.assertTrue(torch.equal(prediction, legacy_prediction))
 
     def test_configurable_input_subset_changes_recurrent_input_size(self):
-        model = TauFSequenceRegressor(make_config(inputs=["q", "tau"]))
+        model = TauOtherSequenceRegressor(make_config(inputs=["q", "tau"]))
         batch = make_batch()
         batch.pop("dq")
         batch.pop("ddq")
@@ -170,20 +170,20 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         out = model(batch)
 
         self.assertEqual(model.recurrent.input_size, 14)
-        self.assertEqual(out["tau_f_pred"].shape, (4, 7))
+        self.assertEqual(out["tau_other_pred"].shape, (4, 7))
 
     def test_target_is_last_window_frame(self):
-        model = TauFSequenceRegressor(make_config())
+        model = TauOtherSequenceRegressor(make_config())
         batch = make_batch(batch_size=2, horizon=5)
-        batch["tau_f"] = torch.arange(70, dtype=torch.float32).reshape(2, 5, 7)
+        batch["tau_other"] = torch.arange(70, dtype=torch.float32).reshape(2, 5, 7)
 
         out = model(batch)
 
-        torch.testing.assert_close(out["tau_f_target"], batch["tau_f"][:, -1])
+        torch.testing.assert_close(out["tau_other_target"], batch["tau_other"][:, -1])
 
     def test_tcn_is_strictly_causal_and_covers_the_configured_history(self):
         config = make_config("tcn")
-        model = TauFSequenceRegressor(config).eval()
+        model = TauOtherSequenceRegressor(config).eval()
         batch = make_batch(batch_size=2, horizon=8)
         changed = {key: value.clone() for key, value in batch.items()}
         for key in model.active_inputs:
@@ -203,21 +203,21 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         config["model"].update(tcn_kernel_size=2, tcn_dilations=[1, 2])
 
         with self.assertRaisesRegex(ValueError, "receptive field"):
-            TauFSequenceRegressor(config)
+            TauOtherSequenceRegressor(config)
 
     def test_tcn_can_add_causal_first_difference_to_current_skip(self):
         config = make_config("tcn")
         config["model"]["current_delta_skip"] = True
-        model = TauFSequenceRegressor(config)
+        model = TauOtherSequenceRegressor(config)
 
         out = model(make_batch())
 
         self.assertTrue(model.current_delta_skip)
         self.assertEqual(model.current_state_skip.in_features, 2 * model.input_dim)
-        self.assertEqual(out["tau_f_pred"].shape, (4, 7))
+        self.assertEqual(out["tau_other_pred"].shape, (4, 7))
 
     def test_trainer_computes_normalized_and_physical_mae(self):
-        trainer = TauFTrainer(make_config())
+        trainer = TauOtherTrainer(make_config())
         trainer.model = trainer.build_model()
 
         loss, out = trainer.compute_loss(make_batch())
@@ -242,14 +242,14 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         )
 
     def test_physical_mae_uses_target_denormalization(self):
-        trainer = TauFTrainer(make_config())
+        trainer = TauOtherTrainer(make_config())
         std = torch.arange(1, 8, dtype=torch.float32)
         trainer.dataset = SimpleNamespace(
             normalize_mode="gaussian",
-            normalize_lowdim_keys=["tau_f"],
+            normalize_lowdim_keys=["tau_other"],
             normalizer=Normalizer(
                 {
-                    "tau_f": {
+                    "tau_other": {
                         "mean": torch.arange(7, dtype=torch.float32),
                         "std": std,
                     }
@@ -273,8 +273,8 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         class FixedPredictionModel(torch.nn.Module):
             def forward(self, batch):
                 return {
-                    "tau_f_pred": batch["prediction"],
-                    "tau_f_target": batch["target"],
+                    "tau_other_pred": batch["prediction"],
+                    "tau_other_target": batch["target"],
                 }
 
         samples = [
@@ -284,7 +284,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
             }
             for error in (1.0, 1.0, 3.0)
         ]
-        trainer = TauFTrainer(make_config())
+        trainer = TauOtherTrainer(make_config())
         trainer.device = "cpu"
         trainer.dataset = SimpleNamespace(
             normalize_mode=None,
@@ -314,8 +314,8 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         class FixedPredictionModel(torch.nn.Module):
             def forward(self, batch):
                 return {
-                    "tau_f_pred": batch["prediction"],
-                    "tau_f_target": batch["target"],
+                    "tau_other_pred": batch["prediction"],
+                    "tau_other_target": batch["target"],
                 }
 
         target_levels = torch.tensor([0.0, 1.0, 2.0, 3.0])
@@ -326,7 +326,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
             }
             for level in target_levels
         ]
-        trainer = TauFTrainer(make_config())
+        trainer = TauOtherTrainer(make_config())
         trainer.device = "cpu"
         trainer.dataset = SimpleNamespace(
             normalize_mode=None,
@@ -400,7 +400,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
     def test_trainer_mse_mode_uses_normalized_values(self):
         config = make_config()
         config["loss"] = {"type": "mse", "joint_weights": None}
-        trainer = TauFTrainer(config)
+        trainer = TauOtherTrainer(config)
         trainer.model = trainer.build_model()
 
         loss, out = trainer.compute_loss(make_batch())
@@ -437,11 +437,11 @@ class TauFSequenceRegressorTest(unittest.TestCase):
                     else torch.zeros_like(batch["target"])
                 )
                 return {
-                    "tau_f_pred": prediction,
-                    "tau_f_target": batch["target"],
+                    "tau_other_pred": prediction,
+                    "tau_other_target": batch["target"],
                 }
 
-        trainer = TauFTrainer(make_config())
+        trainer = TauOtherTrainer(make_config())
         trainer.device = "cpu"
         trainer.train_eval_enabled = True
         trainer.dataset = SimpleNamespace(
@@ -461,25 +461,25 @@ class TauFSequenceRegressorTest(unittest.TestCase):
 
     def test_invalid_architecture_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "architecture"):
-            TauFSequenceRegressor(make_config(architecture="transformer"))
+            TauOtherSequenceRegressor(make_config(architecture="transformer"))
 
     def test_each_window_starts_from_a_fresh_recurrent_state(self):
         for architecture in ("lstm", "gru", "tcn"):
             with self.subTest(architecture=architecture):
-                model = TauFSequenceRegressor(make_config(architecture))
+                model = TauOtherSequenceRegressor(make_config(architecture))
                 model.eval()
                 batch = make_batch(batch_size=3, horizon=6)
 
-                first = model(batch)["tau_f_pred"]
+                first = model(batch)["tau_other_pred"]
                 model(make_batch(batch_size=3, horizon=6))
-                second = model(batch)["tau_f_pred"]
+                second = model(batch)["tau_other_pred"]
 
                 torch.testing.assert_close(first, second)
 
     def test_model_does_not_expose_a_streaming_hidden_state_api(self):
         for architecture in ("lstm", "gru", "tcn"):
             with self.subTest(architecture=architecture):
-                model = TauFSequenceRegressor(make_config(architecture))
+                model = TauOtherSequenceRegressor(make_config(architecture))
                 out = model(make_batch())
 
                 self.assertFalse(hasattr(model, "forward_step"))
@@ -496,7 +496,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
             head_num_layers=2,
         )
 
-        model = TauFSequenceRegressor(config)
+        model = TauOtherSequenceRegressor(config)
 
         self.assertIsInstance(model.recurrent, torch.nn.LSTM)
         self.assertEqual(model.recurrent.num_layers, 2)
@@ -511,7 +511,7 @@ class TauFSequenceRegressorTest(unittest.TestCase):
         config["model"]["history_mode"] = "stateful_stream"
 
         with self.assertRaisesRegex(ValueError, "stateless_sliding_window"):
-            TauFSequenceRegressor(config)
+            TauOtherSequenceRegressor(config)
 
 
 class FakeWindowDataset(torch.utils.data.Dataset):
@@ -806,14 +806,14 @@ class DeviceCacheTest(unittest.TestCase):
     def test_cached_batch_gathers_windows_and_current_target(self):
         config = make_config(inputs=["q", "tau"])
         config["dataloader"] = {"horizon": 3}
-        trainer = TauFTrainer(config)
+        trainer = TauOtherTrainer(config)
         trainer.dataset = SimpleNamespace(horizon=3)
 
         values = torch.arange(70, dtype=torch.float32).reshape(10, 7)
         trainer.tensor_cache = {
             "q": values,
             "tau": values + 100,
-            "tau_f": values + 200,
+            "tau_other": values + 200,
         }
         trainer.valid_raw_indices_device = torch.tensor([2, 3, 4])
         trainer.episode_starts_device = torch.tensor([0, 0, 0])
@@ -823,17 +823,17 @@ class DeviceCacheTest(unittest.TestCase):
         torch.testing.assert_close(batch["q"][0], values[0:3])
         torch.testing.assert_close(batch["q"][1], values[2:5])
         torch.testing.assert_close(
-            batch["tau_f"],
+            batch["tau_other"],
             torch.stack([values[2] + 200, values[4] + 200]),
         )
 
     def test_cached_batch_left_pads_early_history_with_zeros(self):
         config = make_config(inputs=["q"])
         config["dataloader"] = {"horizon": 3}
-        trainer = TauFTrainer(config)
+        trainer = TauOtherTrainer(config)
         trainer.dataset = SimpleNamespace(horizon=3)
         values = torch.arange(28, dtype=torch.float32).reshape(4, 7)
-        trainer.tensor_cache = {"q": values, "tau_f": values + 100}
+        trainer.tensor_cache = {"q": values, "tau_other": values + 100}
         trainer.valid_raw_indices_device = torch.tensor([0, 1])
         trainer.episode_starts_device = torch.tensor([0, 0])
 
@@ -848,12 +848,12 @@ class DeviceCacheTest(unittest.TestCase):
             torch.stack([torch.zeros(7), values[0], values[1]]),
         )
         torch.testing.assert_close(
-            batch["tau_f"],
+            batch["tau_other"],
             torch.stack([values[0] + 100, values[1] + 100]),
         )
 
     def test_normalizer_stats_use_training_frames_only(self):
-        trainer = TauFTrainer(make_config(inputs=["q"]))
+        trainer = TauOtherTrainer(make_config(inputs=["q"]))
         trainer.dataset = SimpleNamespace(
             normalize_mode="gaussian",
             normalize_lowdim_keys=["q"],

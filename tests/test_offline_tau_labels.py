@@ -150,7 +150,7 @@ def _write_episode(path: Path):
             }
         )
         teleop.create_dataset("ddq_follower", data=np.zeros_like(q))
-        teleop.create_dataset("tau_f_cal", data=np.zeros_like(q))
+        teleop.create_dataset("tau_other_cal", data=np.zeros_like(q))
 
 
 def test_h5_pipeline_copies_source_and_writes_self_describing_labels(tmp_path):
@@ -184,10 +184,10 @@ def test_h5_pipeline_copies_source_and_writes_self_describing_labels(tmp_path):
         teleop = output_h5["teleop"]
         tau = np.asarray(teleop["tau_follower"])
         tau_id = np.asarray(teleop["tau_id_rts_filtered"])
-        tau_f = np.asarray(teleop["tau_f_cal"])
-        np.testing.assert_allclose(tau_f, tau - tau_id)
-        assert teleop["tau_f_cal"].attrs["formula"].startswith(
-            "tau_f=tau_filtered-tau_id_filtered"
+        tau_other = np.asarray(teleop["tau_other_cal"])
+        np.testing.assert_allclose(tau_other, tau - tau_id)
+        assert teleop["tau_other_cal"].attrs["formula"].startswith(
+            "tau_other=tau_filtered-tau_id_filtered"
         )
         assert bool(teleop["tau_id_rts_filtered"].attrs["lowpass"])
         assert bool(teleop["ddq_follower"].attrs["offline_only"])

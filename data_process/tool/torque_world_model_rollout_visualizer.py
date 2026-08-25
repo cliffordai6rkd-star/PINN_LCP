@@ -1,10 +1,9 @@
 """Offline rollout inference and plots for the torque world model.
 
-The model is rolled out from real 100 Hz history windows with the future
-action chunk supplied by :class:`TorqueWorldModelDataset`.  Predicted q/dq/tau
-are denormalized, ddq is reconstructed with the same causal estimator used by
-training, and wrench is evaluated with exact Pinocchio RNEA/Jacobians at the
-predicted state.  No future ground-truth state is used to compute predictions.
+The model is rolled out from real 100 Hz history windows with the direct
+25 Hz action chunk supplied by :class:`TorqueWorldModelDataset`. Predictions
+are denormalized and plotted as q/dq/delta_q/tau plus contact phase. No
+derived delta_q or dynamics/RNEA quantity is introduced at inference time.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -36,19 +34,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from data_process.world_model_dataset import TorqueWorldModelDataset
-from model.pinn_model.causal_state import (
-    CausalStateEstimatorConfig,
-    causal_joint_acceleration_from_velocity,
-    causal_joint_state_from_position,
-    future_joint_acceleration_from_velocity,
-    future_joint_state_from_position,
-)
 from model.pinn_model.torque_world_model import TorqueWorldModel
-from physics.nero_dynamics import (
-    PinocchioDynamics,
-    damped_wrench_from_joint_torque,
-    load_tau_f_predictor,
-)
 from train.nomalizer import Normalizer
 
 
@@ -57,16 +43,16 @@ log = logging.getLogger(__name__)
 SIGNAL_LABELS = {
     "q": tuple(f"q{i}" for i in range(1, 8)),
     "dq": tuple(f"dq{i}" for i in range(1, 8)),
-    "ddq": tuple(f"ddq{i}" for i in range(1, 8)),
+    "delta_q": tuple(f"delta_q{i}" for i in range(1, 8)),
     "tau": tuple(f"tau{i}" for i in range(1, 8)),
-    "wrench": ("Fx", "Fy", "Fz", "Mx", "My", "Mz"),
+    "contact": ("free", "align", "contact"),
 }
 SIGNAL_UNITS = {
     "q": "rad",
     "dq": "rad/s",
-    "ddq": "rad/s^2",
+    "delta_q": "rad",
     "tau": "N m",
-    "wrench": "force / moment",
+    "contact": "phase",
 }
 
 
@@ -98,10 +84,11 @@ _CHECKPOINT_SCORE = re.compile(
     r"([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\.pt$"
 )
 _CHECKPOINT_STEP = re.compile(r"^step_(\d+)\.pt$")
+_CHECKPOINT_EPOCH = re.compile(r"^epoch_(\d+)\.pt$")
 
 
 def resolve_checkpoint_path(path: str | Path) -> Path:
-    """Resolve a file, newest step checkpoint, or lowest scored legacy file."""
+    """Resolve a file, newest epoch/step checkpoint, or best legacy file."""
 
     path = Path(path).expanduser()
     if path.is_file():
@@ -113,6 +100,7 @@ def resolve_checkpoint_path(path: str | Path) -> Path:
         raise FileNotFoundError(f"checkpoint directory has no .pt files: {path}")
     scored = []
     stepped = []
+    scheduled_epochs = []
     for candidate in candidates:
         match = _CHECKPOINT_SCORE.search(candidate.name)
         if match is not None:
@@ -120,6 +108,11 @@ def resolve_checkpoint_path(path: str | Path) -> Path:
         step_match = _CHECKPOINT_STEP.match(candidate.name)
         if step_match is not None:
             stepped.append((int(step_match.group(1)), candidate))
+        epoch_match = _CHECKPOINT_EPOCH.match(candidate.name)
+        if epoch_match is not None:
+            scheduled_epochs.append((int(epoch_match.group(1)), candidate))
+    if scheduled_epochs:
+        return max(scheduled_epochs, key=lambda item: (item[0], item[1].name))[1].resolve()
     if stepped:
         return max(stepped, key=lambda item: (item[0], item[1].name))[1].resolve()
     if scored:
@@ -215,17 +208,6 @@ def load_model_and_dataset(
         dict(effective_config.get("dataloader") or {}),
         dataset_overrides,
     )
-    physics_options = rollout_config.get("physics") or {}
-    physics_overrides = {
-        key: value
-        for key, value in physics_options.items()
-        if key not in {"enabled", "ddq_q_blend"} and value is not None
-    }
-    effective_config["physics"] = _deep_update(
-        dict(effective_config.get("physics") or {}),
-        physics_overrides,
-    )
-
     normalizer = _checkpoint_normalizer(checkpoint)
     dataset = TorqueWorldModelDataset(
         effective_config,
@@ -326,134 +308,6 @@ def _to_device(batch: Mapping, device: torch.device) -> dict:
         key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
         for key, value in batch.items()
     }
-
-
-@dataclass
-class RolloutPhysics:
-    """Exact, future-label-free wrench reconstruction for predicted states."""
-
-    config: Mapping
-    device: torch.device
-    ddq_q_blend: float
-
-    def __post_init__(self):
-        physics_config = self.config.get("physics") or {}
-        tau_f_path = physics_config.get("tau_f_checkpoint_path")
-        if not tau_f_path:
-            raise ValueError("physics.tau_f_checkpoint_path is required")
-        self.estimator_config = CausalStateEstimatorConfig.from_model_config(
-            self.config
-        )
-        if not 0.0 <= self.ddq_q_blend <= 1.0:
-            raise ValueError("physics.ddq_q_blend must be in [0, 1]")
-        self.wrench_damping = float(physics_config.get("wrench_damping", 0.02))
-        self.tau_f_predictor = load_tau_f_predictor(
-            tau_f_path,
-            device=self.device,
-            max_model_batch_size=int(
-                physics_config.get("tau_f_window_batch_size", 1024)
-            ),
-        )
-        self.dynamics = PinocchioDynamics(self.config)
-
-    def reconstruct_ddq(
-        self,
-        q_history: torch.Tensor,
-        dq_history: torch.Tensor,
-        q_future: torch.Tensor,
-        dq_future: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        _, ddq_history_from_dq = causal_joint_acceleration_from_velocity(
-            dq_history,
-            self.estimator_config,
-        )
-        _, _, ddq_history_from_q = causal_joint_state_from_position(
-            q_history,
-            self.estimator_config,
-        )
-        ddq_history = (
-            (1.0 - self.ddq_q_blend) * ddq_history_from_dq
-            + self.ddq_q_blend * ddq_history_from_q
-        )
-        ddq_future_from_dq = future_joint_acceleration_from_velocity(
-            dq_history,
-            dq_future,
-            self.estimator_config,
-        )
-        ddq_future_from_q = future_joint_state_from_position(
-            q_history,
-            q_future,
-            self.estimator_config,
-        )["a"]
-        ddq_future = (
-            (1.0 - self.ddq_q_blend) * ddq_future_from_dq
-            + self.ddq_q_blend * ddq_future_from_q
-        )
-        return ddq_history, ddq_future
-
-    @torch.no_grad()
-    def predict(
-        self,
-        q_history: torch.Tensor,
-        dq_history: torch.Tensor,
-        tau_history: torch.Tensor,
-        q_future: torch.Tensor,
-        dq_future: torch.Tensor,
-        tau_future: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        ddq_history, ddq_future = self.reconstruct_ddq(
-            q_history,
-            dq_history,
-            q_future,
-            dq_future,
-        )
-        q_complete = torch.cat((q_history, q_future), dim=1)
-        delta_q_complete = torch.zeros_like(q_complete)
-        delta_q_complete[:, 1:] = q_complete[:, 1:] - q_complete[:, :-1]
-        history_steps = q_history.shape[1]
-        tau_f = self.tau_f_predictor(
-            history={
-                "q": q_history,
-                "dq": dq_history,
-                "ddq": ddq_history,
-                "delta_q": delta_q_complete[:, :history_steps],
-                "tau": tau_history,
-            },
-            future={
-                "q": q_future,
-                "dq": dq_future,
-                "ddq": ddq_future,
-                "delta_q": delta_q_complete[:, history_steps:],
-                "tau": tau_future,
-            },
-        )
-        # Exact dynamics at the prediction, rather than the training-only
-        # first-order cache around future ground truth.
-        tau_id = self.dynamics.inverse_dynamics(
-            q_future,
-            dq_future,
-            ddq_future,
-            device=self.device,
-            dtype=q_future.dtype,
-        )
-        jacobian = self.dynamics.frame_jacobians(
-            q_future,
-            device=self.device,
-            dtype=q_future.dtype,
-        )
-        tau_external = tau_future - tau_id - tau_f
-        wrench = damped_wrench_from_joint_torque(
-            jacobian,
-            tau_external,
-            damping=self.wrench_damping,
-        )
-        return {
-            "ddq": ddq_future,
-            "tau_id": tau_id,
-            "tau_f": tau_f,
-            "tau_external": tau_external,
-            "wrench": wrench,
-        }
 
 
 class RunningSquaredError:
@@ -585,7 +439,6 @@ def run_rollout(rollout_config: Mapping) -> dict:
     )
     inference_config = rollout_config.get("inference") or {}
     plot_config = rollout_config.get("plot") or {}
-    physics_config = rollout_config.get("physics") or {}
     batch_size = int(inference_config.get("batch_size", 8))
     num_workers = int(inference_config.get("num_workers", 0))
     flow_steps = int(inference_config.get("flow_steps", model.flow_inference_steps))
@@ -602,31 +455,12 @@ def run_rollout(rollout_config: Mapping) -> dict:
     save_arrays = bool(plot_config.get("save_arrays", True))
     configured_signals = [
         str(value) for value in plot_config.get(
-            "signals", ["q", "dq", "ddq", "tau", "wrench"]
+            "signals", ["q", "dq", "delta_q", "tau", "contact"]
         )
     ]
     unknown_signals = sorted(set(configured_signals) - set(SIGNAL_LABELS))
     if unknown_signals:
         raise ValueError(f"unknown plot signals: {unknown_signals}")
-
-    physics_enabled = bool(physics_config.get("enabled", False))
-    ddq_q_blend = float(
-        physics_config.get(
-            "ddq_q_blend",
-            (effective_config.get("loss") or {}).get("ddq_q_blend", 0.2),
-        )
-    )
-    physics = (
-        RolloutPhysics(effective_config, device, ddq_q_blend)
-        if physics_enabled
-        else None
-    )
-    # With RNEA disabled, wrench is taken from the model when ``wrench_dim=6``.
-    # The plotting path below validates availability from the checkpoint output.
-    if physics is None and "wrench" in configured_signals and model.wrench_dim == 0:
-        raise ValueError(
-            "plot.signals requests wrench but the checkpoint has no direct wrench output"
-        )
 
     loader = DataLoader(
         Subset(dataset, selected_indices),
@@ -641,7 +475,6 @@ def run_rollout(rollout_config: Mapping) -> dict:
     episode_lookup = _sample_episode_lookup(dataset)
     metrics = RunningSquaredError()
     model_inference_seconds = 0.0
-    physics_seconds = 0.0
     rollout_count = 0
 
     log.info(
@@ -674,52 +507,16 @@ def run_rollout(rollout_config: Mapping) -> dict:
                     key,
                     output[f"{key}_pred"],
                 )
-                for key in ("q", "dq", "tau")
+                for key in ("q", "dq", "delta_q", "tau")
             }
-            if "wrench_pred" in output and physics is None:
-                prediction["wrench"] = _denormalize(
-                    normalizer,
-                    normalize_mode,
-                    "wrench",
-                    output["wrench_pred"],
-                )
-            q_history = _denormalize(normalizer, normalize_mode, "q", batch["q"])
-            dq_history = _denormalize(normalizer, normalize_mode, "dq", batch["dq"])
-            tau_history = _denormalize(normalizer, normalize_mode, "tau", batch["tau"])
-
-            if physics is not None:
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                started = time.perf_counter()
-                physical = physics.predict(
-                    q_history,
-                    dq_history,
-                    tau_history,
-                    prediction["q"],
-                    prediction["dq"],
-                    prediction["tau"],
-                )
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                physics_seconds += time.perf_counter() - started
-                prediction["ddq"] = physical["ddq"]
-                prediction["wrench"] = physical["wrench"]
-            else:
-                estimator = CausalStateEstimatorConfig.from_model_config(
-                    effective_config
-                )
-                prediction["ddq"] = future_joint_acceleration_from_velocity(
-                    dq_history,
-                    prediction["dq"],
-                    estimator,
-                )
+            prediction["contact"] = output["contact_state_pred"]
 
             data = {
                 "q": batch["q_future_raw"],
                 "dq": batch["dq_future_raw"],
-                "ddq": batch["ddq_future_raw"],
+                "delta_q": batch["delta_q_future_raw"],
                 "tau": batch["tau_future_raw"],
-                "wrench": batch["wrench_future_raw"],
+                "contact": batch["contact_future"],
             }
             for signal in configured_signals:
                 metrics.update(signal, data[signal], prediction[signal])
@@ -779,19 +576,8 @@ def run_rollout(rollout_config: Mapping) -> dict:
         "num_rollouts": rollout_count,
         "model_inference_total_s": model_inference_seconds,
         "model_inference_ms_per_rollout": 1000.0 * model_inference_seconds / rollout_count,
-        "physics_total_s": physics_seconds,
-        "physics_ms_per_rollout": 1000.0 * physics_seconds / rollout_count,
         "metrics": metric_result,
-        "ddq_data_source": (
-            "dataset feature"
-            if (effective_config.get("dataloader") or {}).get("high_keys", {}).get("ddq")
-            else "dataset loader causal reconstruction"
-        ),
-        "wrench_prediction": (
-            "exact Pinocchio at predicted q/dq/ddq"
-            if physics_enabled
-            else "direct model output"
-        ),
+        "state_prediction": "direct q/dq/delta_q/tau outputs",
     }
     _write_json(output_dir / "metrics.json", summary)
     with (output_dir / "resolved_rollout_config.yaml").open(

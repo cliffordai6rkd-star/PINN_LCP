@@ -8,12 +8,12 @@ from data_process.tool.sequence_torque_inference_visualizer import (
 
 
 TASK = TorqueVisualizationTask(
-    name="tau_f",
-    target_key="tau_f",
-    target_label="tau_f label",
-    prediction_label="tau_f prediction",
-    default_output_dir=Path("outputs/inference_visualization/tau_f"),
-    rollout_mode="tau_f",
+    name="tau_other",
+    target_key="tau_other",
+    target_label="tau_other label",
+    prediction_label="tau_other prediction",
+    default_output_dir=Path("outputs/inference_visualization/tau_other"),
+    rollout_mode="tau_other",
 )
 
 

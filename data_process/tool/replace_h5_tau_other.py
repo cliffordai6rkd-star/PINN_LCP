@@ -16,7 +16,7 @@ def natural_sort_key(path: Path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Rename teleop/tau_f to teleop/tau_f_cal in the last HDF5 files."
+            "Rename teleop/tau_other to teleop/tau_other_cal in the last HDF5 files."
         )
     )
     parser.add_argument(
@@ -32,8 +32,8 @@ def parse_args():
         default=5,
         help="Number of files to select from the end after natural sorting.",
     )
-    parser.add_argument("--source", default="teleop/tau_f")
-    parser.add_argument("--target", default="teleop/tau_f_cal")
+    parser.add_argument("--source", default="teleop/tau_other")
+    parser.add_argument("--target", default="teleop/tau_other_cal")
     parser.add_argument(
         "--apply",
         action="store_true",

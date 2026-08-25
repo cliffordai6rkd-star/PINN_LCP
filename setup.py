@@ -25,6 +25,9 @@ setup(
         "tqdm>=4.65,<5",
         "matplotlib>=3.7,<4",
         "h5py>=3.9,<4",
+        # Zarr v2 keeps the synchronous local-store API used by the training
+        # workers; Zarr v3's async bridge can block during group creation.
+        "zarr>=2.16,<3",
         "pandas>=2.0,<3",
         "pyarrow>=14,<20",
         "lerobot==0.4.0",
@@ -55,7 +58,7 @@ setup(
     entry_points={
         "console_scripts": [
             "pinn-build-offline-labels=data_process.tool.build_offline_tau_labels:main",
-            "pinn-train-tau-f=train.trainer.tau_f_sequence_train:main",
+            "pinn-train-tau-other=train.trainer.tau_other_sequence_train:main",
             "pinn-train-tau-free-v2=train.trainer.tau_free_sequence_train_v2:main",
             "pinn-train-wm=train.trainer.torque_world_model_train:main",
             "pinn-train-wm-opd=train.trainer.torque_world_model_opd_train:main",

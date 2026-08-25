@@ -20,9 +20,13 @@ STUDENT_OUTPUT_ROOT="${STUDENT_OUTPUT_ROOT:-$RUN_ROOT/students}"
 TEACHER_MAX_STEPS="${TEACHER_MAX_STEPS:-}"
 TEACHER_CHECKPOINT_EVERY="${TEACHER_CHECKPOINT_EVERY:-}"
 TEACHER_TOP_K="${TEACHER_TOP_K:-}"
+TEACHER_NUM_EPOCHS="${TEACHER_NUM_EPOCHS:-}"
+TEACHER_CHECKPOINT_EVERY_EPOCHS="${TEACHER_CHECKPOINT_EVERY_EPOCHS:-}"
 STUDENT_MAX_STEPS="${STUDENT_MAX_STEPS:-}"
 STUDENT_CHECKPOINT_EVERY="${STUDENT_CHECKPOINT_EVERY:-}"
 STUDENT_TOP_K="${STUDENT_TOP_K:-}"
+STUDENT_NUM_EPOCHS="${STUDENT_NUM_EPOCHS:-}"
+STUDENT_CHECKPOINT_EVERY_EPOCHS="${STUDENT_CHECKPOINT_EVERY_EPOCHS:-}"
 TEACHER_STEPS="${TEACHER_STEPS:-}"
 STUDENT_STEPS="2"
 
@@ -46,13 +50,17 @@ TEACHER_LOG="$RUN_ROOT/teacher.log"
 render_teacher_config() {
   "$PYTHON_BIN" - "$TEACHER_CONFIG" "$TEACHER_RENDERED_CONFIG" \
     "$TEACHER_OUTPUT_DIR" "$TEACHER_MAX_STEPS" \
-    "$TEACHER_CHECKPOINT_EVERY" "$TEACHER_TOP_K" "$TEACHER_STEPS" <<'PY'
+    "$TEACHER_CHECKPOINT_EVERY" "$TEACHER_TOP_K" "$TEACHER_STEPS" \
+    "$TEACHER_NUM_EPOCHS" "$TEACHER_CHECKPOINT_EVERY_EPOCHS" <<'PY'
 import sys
 from pathlib import Path
 
 import yaml
 
-source, destination, output_dir, max_steps, interval, top_k, teacher_steps = sys.argv[1:]
+(
+    source, destination, output_dir, max_steps, interval, top_k, teacher_steps,
+    num_epochs, checkpoint_every_epochs,
+) = sys.argv[1:]
 with Path(source).open("r", encoding="utf-8") as stream:
     config = yaml.safe_load(stream)
 if not isinstance(config, dict):
@@ -68,6 +76,10 @@ if top_k:
     train["top_k"] = int(top_k)
 if teacher_steps:
     config.setdefault("model", {})["flow_inference_steps"] = int(teacher_steps)
+if num_epochs:
+    train["num_epochs"] = int(num_epochs)
+if checkpoint_every_epochs:
+    train["checkpoint_every_epochs"] = int(checkpoint_every_epochs)
 
 Path(destination).parent.mkdir(parents=True, exist_ok=True)
 with Path(destination).open("w", encoding="utf-8") as stream:
@@ -82,7 +94,8 @@ render_student_config() {
   "$PYTHON_BIN" - "$OPD_CONFIG" "$destination" "$teacher_checkpoint" \
     "$student_output_dir" "$STUDENT_MAX_STEPS" \
     "$STUDENT_CHECKPOINT_EVERY" "$STUDENT_TOP_K" \
-    "$TEACHER_STEPS" "$STUDENT_STEPS" <<'PY'
+    "$TEACHER_STEPS" "$STUDENT_STEPS" \
+    "$STUDENT_NUM_EPOCHS" "$STUDENT_CHECKPOINT_EVERY_EPOCHS" <<'PY'
 import sys
 from pathlib import Path
 
@@ -98,6 +111,8 @@ import yaml
     top_k,
     teacher_steps,
     student_steps,
+    num_epochs,
+    checkpoint_every_epochs,
 ) = sys.argv[1:]
 with Path(source).open("r", encoding="utf-8") as stream:
     config = yaml.safe_load(stream)
@@ -122,6 +137,10 @@ if interval:
     train["checkpoint_every_steps"] = int(interval)
 if top_k:
     train["top_k"] = int(top_k)
+if num_epochs:
+    train["num_epochs"] = int(num_epochs)
+if checkpoint_every_epochs:
+    train["checkpoint_every_epochs"] = int(checkpoint_every_epochs)
 
 Path(destination).parent.mkdir(parents=True, exist_ok=True)
 with Path(destination).open("w", encoding="utf-8") as stream:
@@ -142,14 +161,20 @@ if [[ ! -d "$TEACHER_CHECKPOINT_DIR" ]]; then
 fi
 
 mapfile -t TEACHER_CHECKPOINTS < <(
-  find "$TEACHER_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'step_*.pt' -printf '%f\n' \
+  find "$TEACHER_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'epoch_*.pt' -printf '%f\n' \
     | sort -V
 )
+if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 ]]; then
+  mapfile -t TEACHER_CHECKPOINTS < <(
+    find "$TEACHER_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'step_*.pt' -printf '%f\n' \
+      | sort -V
+  )
+fi
 if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 && -f "$TEACHER_CHECKPOINT_DIR/latest.pt" ]]; then
   TEACHER_CHECKPOINTS=("latest.pt")
 fi
 if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 ]]; then
-  echo "No Teacher step checkpoints found under: $TEACHER_CHECKPOINT_DIR" >&2
+  echo "No Teacher epoch/step checkpoints found under: $TEACHER_CHECKPOINT_DIR" >&2
   exit 1
 fi
 

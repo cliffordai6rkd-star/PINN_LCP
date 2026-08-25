@@ -103,7 +103,7 @@ def normalize_dataloader_filters(
 def _normalize_operation(operation: Any, *, field: str) -> dict[str, Any]:
     if not isinstance(operation, Mapping):
         raise ValueError(f"{field}.operations entries must be mappings")
-    unknown = set(operation) - {"type", "window", "cutoff_hz"}
+    unknown = set(operation) - {"type", "window", "cutoff_hz", "order"}
     if unknown:
         raise ValueError(
             f"{field} filter operation has unknown options: {sorted(unknown)}"
@@ -131,6 +131,14 @@ def _normalize_operation(operation: Any, *, field: str) -> dict[str, Any]:
         if not math.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
             raise ValueError(f"{field} lowpass cutoff_hz must be positive and finite")
         normalized["cutoff_hz"] = cutoff_hz
+        has_order = "order" in operation
+        order = int(operation.get("order", 1))
+        if order < 1:
+            raise ValueError(f"{field} lowpass order must be positive")
+        # Preserve the historical canonical form when order was omitted.  The
+        # filter implementation still treats an omitted order as one stage.
+        if has_order:
+            normalized["order"] = order
     return normalized
 
 
@@ -166,11 +174,15 @@ def filter_episode_values(
                 filtered, window=int(operation["window"])
             )
         elif operation_type == "lowpass":
-            filtered = _causal_one_pole_lowpass(
-                timestamps,
-                filtered,
-                cutoff_hz=float(operation["cutoff_hz"]),
-            )
+            # A causal order-N low-pass is represented as an N-stage cascade.
+            # Each stage uses the measured interval, so timestamp jitter does
+            # not introduce a hidden future sample or a fixed-rate assumption.
+            for _ in range(int(operation.get("order", 1))):
+                filtered = _causal_one_pole_lowpass(
+                    timestamps,
+                    filtered,
+                    cutoff_hz=float(operation["cutoff_hz"]),
+                )
         else:  # pragma: no cover - normalized configs cannot reach this branch
             raise ValueError(f"unsupported causal filter operation {operation_type!r}")
     return filtered.reshape(original_shape).astype(original_dtype, copy=False)

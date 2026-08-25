@@ -5,7 +5,7 @@ dataloader:
   video_backend: torchcodec
 
   # Raw-index data is nominally 99 Hz, so 50 steps cover about 0.5 seconds.
-  horizon: 50
+  horizon: 25
   # Skip the first 49 targets so every sample has 50 real history frames.
   pad_history: false
 
@@ -16,8 +16,8 @@ dataloader:
     dq: observation.velocity
     ddq: observation.ddq
     delta_q: observation.delta_q
-    tau_id: observation.tau_id
-    tau_f: observation.tau_f
+    # tau_id: observation.tau_id
+    # tau_other: observation.tau_other
     tau: observation.torque
 
 
@@ -26,9 +26,9 @@ dataloader:
     - q
     - dq
     # - ddq
-    - tau_id
+    # - tau_id
     - delta_q
-    # - tau_f
+    # - tau_other
     - tau
 
   # Purely causal, episode-local preprocessing. Operations run in listed order
@@ -69,15 +69,15 @@ model:
     dq, 
     # ddq, 
     delta_q,
-    tau_id,
-    # tau_f
+    # tau_id,
+    # tau_other
     ]
   input_dims:
     q: 7
     dq: 7
     # ddq: 7
-    tau_id: 7
-    # tau_f: 7
+    # tau_id: 7
+    # tau_other: 7
     delta_q: 7
   output_dim: 7
   target_key: tau
@@ -118,7 +118,7 @@ train:
   # input/target statistics best match the remaining training episodes.
   # val_ratio: 0.2
   split_mode: episode
-  val_episode_indices: [21]
+  val_episode_indices: [2]
   seed: 42
   deterministic: false
   cudnn_benchmark: true
@@ -140,7 +140,7 @@ train:
     # This value is now in Nm^2 because the monitored metric is physical MSE.
     min_delta: 1.0e-5
 
-  output_dir: outputs/tau_free_sequence/qvad2t_ep1
+  output_dir: outputs/tau_free_sequence/pure_teleop_1
   monitor_key: val_tau_mse_nm2
   scheduler_monitor_key: val_tau_mse_nm2
   early_stopping_monitor_key: val_tau_mse_nm2

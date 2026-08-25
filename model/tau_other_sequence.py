@@ -1,4 +1,4 @@
-"""Factory and shared contract for tau_f sequence models.
+"""Factory and shared contract for tau_other sequence models.
 
 The temporal encoders live in separate modules because LSTM, GRU, and TCN
 have different state and receptive-field semantics.  This module deliberately
@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 
-SUPPORTED_TAU_F_ARCHITECTURES = ("gru", "lstm", "tcn")
+SUPPORTED_TAU_OTHER_ARCHITECTURES = ("gru", "lstm", "tcn")
 
 
 def _model_config(config):
@@ -21,17 +21,17 @@ def _model_config(config):
     return value
 
 
-def tau_f_architecture(config) -> str:
+def tau_other_architecture(config) -> str:
     architecture = str(_model_config(config).get("architecture", "lstm")).lower()
-    if architecture not in SUPPORTED_TAU_F_ARCHITECTURES:
+    if architecture not in SUPPORTED_TAU_OTHER_ARCHITECTURES:
         raise ValueError(
             "model.architecture must be one of "
-            f"{list(SUPPORTED_TAU_F_ARCHITECTURES)}, got {architecture!r}."
+            f"{list(SUPPORTED_TAU_OTHER_ARCHITECTURES)}, got {architecture!r}."
         )
     return architecture
 
 
-class TauFSequenceModelBase(nn.Module):
+class TauOtherSequenceModelBase(nn.Module):
     """Input, target, and prediction contract shared by all three branches."""
 
     DEFAULT_INPUT_DIMS = {
@@ -45,7 +45,7 @@ class TauFSequenceModelBase(nn.Module):
     def __init__(self, config, *, architecture: str):
         super().__init__()
         model_config = _model_config(config)
-        configured_architecture = tau_f_architecture(config)
+        configured_architecture = tau_other_architecture(config)
         if configured_architecture != architecture:
             raise ValueError(
                 f"{type(self).__name__} requires model.architecture={architecture!r}, "
@@ -79,14 +79,14 @@ class TauFSequenceModelBase(nn.Module):
         if self.history_mode != "stateless_sliding_window":
             raise ValueError(
                 "model.history_mode must be 'stateless_sliding_window'; "
-                "tau_f windows do not carry state between samples."
+                "tau_other windows do not carry state between samples."
             )
 
         self.hidden_dim = int(model_config.get("hidden_dim", 128))
         self.num_layers = int(model_config.get("num_layers", 2))
         self.output_dim = int(model_config.get("output_dim", 7))
         self.dropout = float(model_config.get("dropout", 0.1))
-        self.target_key = str(model_config.get("target_key", "tau_f"))
+        self.target_key = str(model_config.get("target_key", "tau_other"))
         self.input_dim = sum(int(self.input_dims[key]) for key in self.active_inputs)
         if self.hidden_dim <= 0 or self.num_layers <= 0 or self.output_dim <= 0:
             raise ValueError("hidden_dim, num_layers, and output_dim must be positive.")
@@ -162,11 +162,11 @@ class TauFSequenceModelBase(nn.Module):
         if value.ndim == 2:
             return value
         raise ValueError(
-            f"tau_f target must have shape [B, H, D] or [B, D], got {tuple(value.shape)}."
+            f"tau_other target must have shape [B, H, D] or [B, D], got {tuple(value.shape)}."
         )
 
     def _finish_output(self, batch, prediction):
-        output = {"tau_f_pred": prediction}
+        output = {"tau_other_pred": prediction}
         if self.target_key not in batch:
             return output
 
@@ -177,27 +177,27 @@ class TauFSequenceModelBase(nn.Module):
                 f"Prediction shape {tuple(prediction.shape)} does not match "
                 f"target shape {tuple(target.shape)}."
             )
-        output["tau_f_target"] = target
+        output["tau_other_target"] = target
         return output
 
 
-def build_tau_f_sequence_model(config) -> TauFSequenceModelBase:
-    architecture = tau_f_architecture(config)
+def build_tau_other_sequence_model(config) -> TauOtherSequenceModelBase:
+    architecture = tau_other_architecture(config)
     if architecture == "lstm":
-        from model.tau_f_lstm import TauFLSTMRegressor
+        from model.tau_other_lstm import TauOtherLSTMRegressor
 
-        return TauFLSTMRegressor(config)
+        return TauOtherLSTMRegressor(config)
     if architecture == "gru":
-        from model.tau_f_gru import TauFGRURegressor
+        from model.tau_other_gru import TauOtherGRURegressor
 
-        return TauFGRURegressor(config)
-    from model.tau_f_tcn import TauFTCNRegressor
+        return TauOtherGRURegressor(config)
+    from model.tau_other_tcn import TauOtherTCNRegressor
 
-    return TauFTCNRegressor(config)
+    return TauOtherTCNRegressor(config)
 
 
-class TauFSequenceRegressor:
+class TauOtherSequenceRegressor:
     """Backward-compatible constructor that dispatches to an explicit branch."""
 
     def __new__(cls, config):
-        return build_tau_f_sequence_model(config)
+        return build_tau_other_sequence_model(config)

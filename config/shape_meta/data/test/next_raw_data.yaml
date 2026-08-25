@@ -1,13 +1,13 @@
 io:
   # Gap-split raw signals: no Butterworth preprocessing and no resampling.
-  input: nero_ws/runs/bg_data_filted
-  output: data/train_episode/bg_data_filted
-  repo_id: bg_data_filted
+  input: nero_ws/runs/next_data_filted
+  output: data/train_episode/next_data_filted_100hz
+  repo_id: next_data_filted_100hz
   max_episodes: null
   no_videos: true
   push_to_hub: false
 
-task: bg_data_filted
+task: netx_data_filted_100hz
 master_timestamp_path: teleop/timestamp_us
 
 # fps is intentionally omitted. raw_index infers nominal LeRobot fps from the

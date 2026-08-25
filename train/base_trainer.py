@@ -168,6 +168,9 @@ class BaseTrainer:
         self.checkpoint_every_steps = int(
             self.train_config.get("checkpoint_every_steps", 0)
         )
+        self.checkpoint_every_epochs = int(
+            self.train_config.get("checkpoint_every_epochs", 0)
+        )
         self.save_latest_checkpoint = bool(
             self.train_config.get("save_latest_checkpoint", True)
         )
@@ -179,6 +182,8 @@ class BaseTrainer:
             raise ValueError("train.max_train_steps must be positive")
         if self.checkpoint_every_steps < 0:
             raise ValueError("train.checkpoint_every_steps must be non-negative")
+        if self.checkpoint_every_epochs < 0:
+            raise ValueError("train.checkpoint_every_epochs must be non-negative")
         gradient_clip_norm = self.train_config.get(
             "gradient_clip_norm",
             self.train_config.get("max_grad_norm"),
@@ -358,6 +363,11 @@ class BaseTrainer:
 
     def fit_dataset_normalizer(self, train_dataset):
         """Hook for datasets that must fit normalization after the split."""
+        return None
+
+    def build_train_sampler(self, train_dataset):
+        """Optional hook for trainers that need a non-uniform train sampler."""
+        del train_dataset
         return None
 
     def build_scheduler(self):
@@ -692,10 +702,12 @@ class BaseTrainer:
 
         self.fit_dataset_normalizer(train_dataset)
 
-        self.loader = torch.utils.data.DataLoader(
-            train_dataset,
-            **self._dataloader_kwargs(shuffle=True),
-        )
+        train_sampler = self.build_train_sampler(train_dataset)
+        train_loader_kwargs = self._dataloader_kwargs(shuffle=train_sampler is None)
+        if train_sampler is not None:
+            train_loader_kwargs.pop("shuffle", None)
+            train_loader_kwargs["sampler"] = train_sampler
+        self.loader = torch.utils.data.DataLoader(train_dataset, **train_loader_kwargs)
 
         if val_dataset is not None:
             self.val_loader = torch.utils.data.DataLoader(
@@ -1105,7 +1117,14 @@ class BaseTrainer:
                 if self.global_step % self.checkpoint_every_steps == 0:
                     self.save_step_checkpoint(epoch, metrics)
             else:
-                self.save_topk_checkpoint(epoch, metrics)
+                completed_epoch = epoch + 1
+                if self.checkpoint_every_epochs > 0:
+                    if completed_epoch % self.checkpoint_every_epochs == 0:
+                        self.save_scheduled_epoch_checkpoint(
+                            completed_epoch, metrics
+                        )
+                else:
+                    self.save_topk_checkpoint(epoch, metrics)
 
             if self.should_stop_early(epoch, metrics):
                 log.info(
@@ -1126,6 +1145,16 @@ class BaseTrainer:
         ):
             final_metrics = self.loss_history[-1] if self.loss_history else {}
             self.save_step_checkpoint(epoch, final_metrics)
+        elif (
+            not self.step_based_training
+            and self.checkpoint_every_epochs > 0
+            and self.loss_history
+        ):
+            completed_epochs = len(self.loss_history)
+            if completed_epochs % self.checkpoint_every_epochs != 0:
+                self.save_scheduled_epoch_checkpoint(
+                    completed_epochs, self.loss_history[-1]
+                )
 
         self.last_summary = {
             "num_epochs": len(self.loss_history),
@@ -1149,6 +1178,7 @@ class BaseTrainer:
             "max_train_steps": self.max_optimizer_steps,
             "max_optimizer_steps": self.max_optimizer_steps,
             "checkpoint_every_steps": self.checkpoint_every_steps,
+            "checkpoint_every_epochs": self.checkpoint_every_epochs,
             "step_based_training": self.step_based_training,
             "stopped_early": (
                 self.step_based_training
@@ -1387,7 +1417,75 @@ class BaseTrainer:
         path = self.ckpt_dir / f"epoch_{epoch:03d}.pt"
         torch.save(ckpt, path)
         # log.info(f"saved checkpoint: {path}")
-        
+
+    def save_scheduled_epoch_checkpoint(self, epoch, metrics):
+        """Save a scheduled epoch checkpoint and retain the newest ``top_k``.
+
+        Epoch-based WM runs use this chronological policy deliberately: a
+        ``top_k=3`` run saved every 500 epochs retains 2000/2500/3000 after
+        epoch 3000, rather than selecting checkpoints by validation score.
+        """
+
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        epoch = int(epoch)
+        metrics = dict(metrics or {})
+        dataloader_config = self.config.get("dataloader") or {}
+        normalizer = getattr(self.dataset, "normalizer", None)
+        model_state = (
+            self.ema.model.state_dict() if self.ema is not None
+            else self.model.state_dict()
+        )
+        checkpoint = {
+            "checkpoint_type": "scheduled_epoch",
+            "epoch": epoch,
+            "global_step": int(self.global_step),
+            "metrics": metrics,
+            "avg_loss": metrics.get("avg_loss"),
+            "val_loss": metrics.get("val_loss"),
+            "model": model_state,
+            "model_raw": self.model.state_dict() if self.ema is not None else None,
+            "ema": self._ema_checkpoint_metadata(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "config": self.config,
+            "dataloader_filters": getattr(self.dataset, "filter_config", {}),
+            "sample_rate_hz": getattr(self.dataset, "high_fps", None),
+            "normalizer": {
+                "stats": getattr(normalizer, "stats", {}),
+                "eps": getattr(normalizer, "eps", 1.0e-6),
+                "normalize_mode": dataloader_config.get("normalize_mode"),
+                "normalize_lowdim_keys": dataloader_config.get(
+                    "normalize_lowdim_keys"
+                ),
+            },
+        }
+        path = self.ckpt_dir / f"epoch_{epoch:07d}.pt"
+        torch.save(checkpoint, path)
+        self.best_checkpoints.append(
+            {
+                "score": None,
+                "epoch": epoch,
+                "global_step": int(self.global_step),
+                "path": path,
+                "metrics": metrics,
+            }
+        )
+        self.best_checkpoints.sort(key=lambda item: int(item["epoch"]))
+        while len(self.best_checkpoints) > self.top_k:
+            removed = self.best_checkpoints.pop(0)
+            removed_path = Path(removed["path"])
+            if removed_path.exists():
+                removed_path.unlink()
+        if self.save_latest_checkpoint:
+            torch.save(checkpoint, self.ckpt_dir / "latest.pt")
+        log.info(
+            "saved scheduled epoch checkpoint: epoch=%d path=%s retained=%s%s",
+            epoch,
+            path,
+            [item["epoch"] for item in self.best_checkpoints],
+            " latest.pt" if self.save_latest_checkpoint else "",
+        )
+
     def save_topk_checkpoint(self, epoch, metrics, checkpoint_label=None):
         score = metrics.get(self.monitor_key)
 

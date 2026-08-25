@@ -1,10 +1,10 @@
-"""Strictly causal TCN branch for fixed-length tau_f history windows."""
+"""Strictly causal TCN branch for fixed-length tau_other history windows."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.tau_f_sequence import TauFSequenceModelBase, _model_config
+from model.tau_other_sequence import TauOtherSequenceModelBase, _model_config
 
 
 class _CausalResidualBlock(nn.Module):
@@ -30,7 +30,7 @@ class _CausalResidualBlock(nn.Module):
         return residual + value
 
 
-class TauFTCNRegressor(TauFSequenceModelBase):
+class TauOtherTCNRegressor(TauOtherSequenceModelBase):
     def __init__(self, config):
         super().__init__(config, architecture="tcn")
         model_config = _model_config(config)

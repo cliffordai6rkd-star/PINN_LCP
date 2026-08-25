@@ -1,10 +1,9 @@
 """Progressive ODE/Flow distillation for the torque world model.
 
-The Teacher is a frozen multi-step Flow model.  The Student is trained with
-the same condition and source trajectory, first matching the Teacher endpoint
-and then matching the endpoint again after its own predicted state is written
-back into the history.  RNEA is deliberately not part of this trainer unless
-``physics.rnea.enabled`` is explicitly set.
+The Teacher is a frozen multi-step Flow model. The Student matches the Teacher
+endpoint and then matches it again after its own predicted state is written
+back into history. Action chunks stay fixed; an optional frozen tau-free chain
+supplies physics-derived rollout contact supervision.
 """
 
 from __future__ import annotations
@@ -20,8 +19,11 @@ from typing import Mapping
 import torch
 import yaml
 
-from data_process.world_model_dataset import compose_action_condition
-from physics.nero_dynamics import PinocchioDynamics
+from model.pinn_model.contact_gate import (
+    ContactGateConfig,
+    hysteresis_three_phase_mask,
+)
+from physics.nero_dynamics import load_tau_other_predictor
 from train.trainer.torque_world_model_train import TorqueWorldModelTrainer
 
 
@@ -32,6 +34,7 @@ _CHECKPOINT_SCORE = re.compile(
     r"([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\.pt$"
 )
 _CHECKPOINT_STEP = re.compile(r"^step_(\d+)\.pt$")
+_CHECKPOINT_EPOCH = re.compile(r"^epoch_(\d+)\.pt$")
 
 
 class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
@@ -51,9 +54,6 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             distill.get("student_steps", (config.get("model") or {}).get("flow_inference_steps", 2))
         )
         self.distill_weight = float(distill.get("weight", 1.0))
-        self.contact_distill_weight = float(
-            distill.get("contact_weight", self.distill_weight)
-        )
         self.rollout_weight = float(distill.get("rollout_weight", 1.0))
         self.rollout_steps = int(distill.get("rollout_steps", 4))
         curriculum = distill.get("curriculum") or {}
@@ -71,17 +71,37 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         self.rollout_weight_end = float(
             curriculum.get("rollout_weight_end", self.rollout_weight)
         )
-        self.teacher_checkpoint_path = distill.get("teacher_checkpoint_path")
-        data_config = config.get("dataloader") or {}
-        self.action_condition_features = tuple(
-            str(value)
-            for value in data_config.get("action_condition_features", ())
+        rollout_contact = distill.get("rollout_contact") or {}
+        self.rollout_contact_enabled = bool(rollout_contact.get("enabled", False))
+        self.rollout_contact_weight = float(
+            rollout_contact.get("weight", 0.2)
         )
-        self.pose_dynamics = None
-        if {"current_ee_pose", "relative_pose"} & set(
-            self.action_condition_features
-        ):
-            self.pose_dynamics = PinocchioDynamics(config)
+        self.rollout_contact_physical_weight = float(
+            rollout_contact.get("physical_consistency_weight", 0.02)
+        )
+        self.rollout_contact_horizon = int(
+            rollout_contact.get(
+                "horizon",
+                (config.get("dataloader") or {}).get(
+                    "prediction_horizon", 32
+                ),
+            )
+        )
+        self.rollout_contact_backfill = bool(
+            rollout_contact.get("backfill", False)
+        )
+        self.rollout_contact_temperature = float(
+            rollout_contact.get("temperature", 0.05)
+        )
+        self.rollout_contact_max_model_batch_size = int(
+            rollout_contact.get("max_model_batch_size", 1024)
+        )
+        self.tau_free_checkpoint_path = rollout_contact.get(
+            "tau_free_checkpoint_path"
+        )
+        self.rollout_contact_gate = ContactGateConfig.from_config(config)
+        self.tau_free_predictor = None
+        self.teacher_checkpoint_path = distill.get("teacher_checkpoint_path")
         self.teacher = None
         self._validate_distillation_config()
 
@@ -94,12 +114,21 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             raise ValueError("distillation.student_steps must be smaller than teacher_steps")
         if (
             self.distill_weight < 0.0
-            or self.contact_distill_weight < 0.0
             or self.rollout_weight < 0.0
         ):
             raise ValueError("distillation weights must be non-negative")
         if self.rollout_steps < 0:
             raise ValueError("distillation.rollout_steps must be non-negative")
+        configured_future = int(
+            (self.config.get("dataloader") or {}).get(
+                "prediction_horizon",
+                (self.config.get("dataloader") or {}).get("future_horizon", 40),
+            )
+        )
+        if self.rollout_steps > configured_future:
+            raise ValueError(
+                "distillation.rollout_steps must not exceed prediction_horizon"
+            )
         if self.curriculum_epochs <= 0:
             raise ValueError("distillation.curriculum.epochs must be positive")
         if min(
@@ -111,6 +140,54 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             raise ValueError("distillation curriculum weights must be non-negative")
         if not self.teacher_checkpoint_path:
             raise ValueError("distillation.teacher_checkpoint_path is required")
+        if self.rollout_contact_weight < 0.0 or self.rollout_contact_physical_weight < 0.0:
+            raise ValueError("distillation.rollout_contact weights must be non-negative")
+        if self.rollout_contact_horizon <= 0 or self.rollout_contact_horizon > configured_future:
+            raise ValueError(
+                "distillation.rollout_contact.horizon must be in "
+                f"[1, {configured_future}]"
+            )
+        if self.rollout_contact_temperature <= 0.0:
+            raise ValueError(
+                "distillation.rollout_contact.temperature must be positive"
+            )
+        if self.rollout_contact_max_model_batch_size <= 0:
+            raise ValueError(
+                "distillation.rollout_contact.max_model_batch_size must be positive"
+            )
+        if self.rollout_contact_enabled:
+            configured_contact_states = int(
+                (self.config.get("model") or {}).get("contact_state_count", 3)
+            )
+            if configured_contact_states != 3:
+                raise ValueError(
+                    "rollout contact supervision requires contact_state_count=3"
+                )
+            if not self.rollout_contact_gate.enabled:
+                raise ValueError(
+                    "rollout contact supervision requires contact_gate.enabled=true"
+                )
+            if self.rollout_contact_gate.label_mode != "three_phase":
+                raise ValueError(
+                    "rollout contact supervision requires contact_gate.label_mode=three_phase"
+                )
+            if self.rollout_contact_gate.metric not in {"tau_ext_l1", "tau_ext_l2"}:
+                raise ValueError(
+                    "rollout contact supervision requires contact_gate.metric="
+                    "tau_ext_l1 or tau_ext_l2"
+                )
+            if not self.tau_free_checkpoint_path:
+                raise ValueError(
+                    "distillation.rollout_contact.tau_free_checkpoint_path is required "
+                    "when rollout contact supervision is enabled"
+                )
+            if (
+                self.rollout_contact_weight == 0.0
+                and self.rollout_contact_physical_weight == 0.0
+            ):
+                raise ValueError(
+                    "rollout contact supervision needs a positive CE or physical weight"
+                )
 
     def build_model(self):
         student_config = copy.deepcopy(self.config)
@@ -163,6 +240,7 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
 
         scored = []
         stepped = []
+        scheduled_epochs = []
         for candidate in candidates:
             match = _CHECKPOINT_SCORE.search(candidate.name)
             if match is not None:
@@ -170,6 +248,11 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             step_match = _CHECKPOINT_STEP.match(candidate.name)
             if step_match is not None:
                 stepped.append((int(step_match.group(1)), candidate))
+            epoch_match = _CHECKPOINT_EPOCH.match(candidate.name)
+            if epoch_match is not None:
+                scheduled_epochs.append((int(epoch_match.group(1)), candidate))
+        if scheduled_epochs:
+            return max(scheduled_epochs, key=lambda item: (item[0], item[1].name))[1]
         if stepped:
             return max(stepped, key=lambda item: item[0])[1]
         if scored:
@@ -201,13 +284,14 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         if (
             self.teacher.flow_dim != self.model.flow_dim
             or self.teacher.joint_dim != self.model.joint_dim
-            or self.teacher.wrench_dim != self.model.wrench_dim
             or self.teacher.action_dim != self.model.action_dim
+            or tuple(self.teacher.inputs) != tuple(self.model.inputs)
+            or self.teacher.contact_state_count != self.model.contact_state_count
         ):
             raise ValueError(
                 "Teacher and Student state contracts differ: "
-                f"teacher=(joint={self.teacher.joint_dim}, wrench={self.teacher.wrench_dim}) "
-                f"student=(joint={self.model.joint_dim}, wrench={self.model.wrench_dim}, "
+                f"teacher=(joint={self.teacher.joint_dim}, inputs={self.teacher.inputs}) "
+                f"student=(joint={self.model.joint_dim}, inputs={self.model.inputs}, "
                 f"action={self.model.action_dim})"
             )
         log.info(
@@ -216,35 +300,223 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             self.teacher_steps,
             self.student_steps,
         )
+        if self.rollout_contact_enabled:
+            tau_free_path = self._resolve_teacher_checkpoint(
+                self.tau_free_checkpoint_path
+            )
+            self.tau_free_predictor = load_tau_other_predictor(
+                tau_free_path,
+                device=self.device,
+                max_model_batch_size=self.rollout_contact_max_model_batch_size,
+            )
+            expected_inputs = ("q", "dq", "delta_q")
+            if tuple(self.tau_free_predictor.active_inputs) != expected_inputs:
+                raise ValueError(
+                    "rollout contact tau-free checkpoint must use model.inputs="
+                    f"{list(expected_inputs)}, got "
+                    f"{list(self.tau_free_predictor.active_inputs)}"
+                )
+            if self.tau_free_predictor.history_horizon > self.model.history_horizon:
+                raise ValueError(
+                    "rollout contact tau-free history horizon exceeds SWM history: "
+                    f"{self.tau_free_predictor.history_horizon} > "
+                    f"{self.model.history_horizon}"
+                )
+            log.info(
+                "loaded frozen tau-free rollout model=%s (history=%d)",
+                tau_free_path,
+                self.tau_free_predictor.history_horizon,
+            )
 
     @staticmethod
     def _state_keys(model):
         """Return state streams that can be committed to model history."""
-
-        keys = ["q", "tau"] if model.q_tau_contact_contract else ["q", "dq", "tau"]
-        if model.wrench_dim:
-            keys.append("wrench")
-        return keys
+        del model
+        return ["q", "dq", "delta_q", "tau"]
 
     def _distillation_terms(self):
-        """Return ``(name, output_key, weight)`` terms for either contract."""
+        """Return continuous state endpoint terms for OPD.
 
-        if self.model.q_tau_contact_contract:
-            return (
-                ("q", "q_pred", 1.0),
-                ("tau", "tau_pred", 1.0),
-                ("contact", "contact_logits", self.contact_distill_weight),
-            )
+        Contact is intentionally absent: its categorical logits are trained
+        from recorded phase labels by the ordinary data loss, not from a
+        Teacher/Student regression target.
+        """
+
         terms = [
             ("q", "q_pred", 1.0),
             ("dq", "dq_pred", 1.0),
+            ("delta_q", "delta_q_pred", 1.0),
             ("tau", "tau_pred", 1.0),
         ]
-        if self.model.wrench_dim:
-            terms.append(("wrench", "wrench_pred", 1.0))
         return tuple(terms)
 
-    def _teacher_predict(self, batch):
+    def _rollout_contact_signal(self, tau_ext):
+        metric = self.rollout_contact_gate.metric
+        if metric == "tau_ext_l2":
+            return torch.linalg.vector_norm(tau_ext, dim=-1)
+        if metric == "tau_ext_l1":
+            return tau_ext.abs().sum(dim=-1)
+        raise RuntimeError(
+            "rollout contact signal requires tau_ext_l1 or tau_ext_l2"
+        )
+
+    def _rollout_contact_labels(self, signal):
+        """Apply the configured hysteresis to each predicted signal window.
+
+        Hysteresis labels are intentionally detached pseudo-labels.  The
+        differentiable physical consistency term below is what sends a
+        gradient back into the predicted state trajectory.
+        """
+
+        labels = []
+        for row in signal.detach().to(dtype=torch.float32).cpu():
+            labels.append(
+                hysteresis_three_phase_mask(
+                    row,
+                    on_threshold=self.rollout_contact_gate.on_threshold,
+                    off_threshold=self.rollout_contact_gate.off_threshold,
+                    consecutive_frames=self.rollout_contact_gate.consecutive_frames,
+                    backfill=self.rollout_contact_backfill,
+                )
+            )
+        return torch.stack(labels, dim=0).to(device=signal.device)
+
+    def _rollout_contact_loss(self, batch, student_out):
+        """Generate physics-derived contact supervision for one Student rollout.
+
+        The frozen tau-free model remains differentiable with respect to its
+        q/dq/delta_q inputs.  Its parameters are frozen, but this method is
+        deliberately not wrapped in ``no_grad`` so the optional physical term
+        can constrain the Student state trajectory.
+        """
+
+        if not self.rollout_contact_enabled:
+            zero = student_out["q_pred"].new_zeros(())
+            return zero, {
+                "rollout_contact_ce": zero.detach(),
+                "rollout_contact_physical": zero.detach(),
+                "rollout_tau_ext_norm": zero.detach(),
+            }
+        if self.tau_free_predictor is None:
+            raise RuntimeError(
+                "rollout contact is enabled but tau-free predictor is not loaded"
+            )
+
+        horizon = self.rollout_contact_horizon
+
+        def physical(key, value):
+            # The tau-free checkpoint is a FP32 model.  Converting here keeps
+            # its input contract stable under Student AMP while preserving the
+            # autograd path from the physical loss to Student predictions.
+            return self.loss_calculator._physical(key, value).to(dtype=torch.float32)
+
+        history = {
+            key: physical(key, batch[key])
+            for key in ("q", "dq", "delta_q")
+        }
+        future = {
+            key: physical(key, student_out[f"{key}_pred"][:, :horizon])
+            for key in ("q", "dq", "delta_q")
+        }
+        tau_pred = physical("tau", student_out["tau_pred"][:, :horizon])
+        autocast_context = getattr(self, "autocast_context", None)
+        context = (
+            autocast_context(enabled=False)
+            if autocast_context is not None
+            else nullcontext()
+        )
+        with context:
+            tau_free = self.tau_free_predictor(history, future)
+        tau_ext = tau_pred - tau_free
+        signal = self._rollout_contact_signal(tau_ext)
+        labels = self._rollout_contact_labels(signal)
+        logits = student_out["contact_logits"][:, :horizon]
+        if logits.shape[-1] != 3:
+            raise ValueError(
+                "rollout contact supervision expects three contact logits"
+            )
+        class_weight = self.loss_calculator.contact_class_weights
+        weight = None
+        if class_weight is not None:
+            weight = torch.as_tensor(
+                class_weight, device=logits.device, dtype=logits.dtype
+            )
+        rollout_ce = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, 3), labels.reshape(-1).long(), weight=weight
+        )
+        # Detach the contact head target so this term updates the continuous
+        # state trajectory without creating a self-reinforcing head/state loop.
+        # A margin form is used instead of only matching saturated sigmoids:
+        # it continues to provide a useful gradient when a predicted signal is
+        # far outside the configured free/contact bands.
+        head_probabilities = torch.softmax(logits, dim=-1).detach().to(
+            dtype=signal.dtype
+        )
+        threshold_gap = signal.new_tensor(
+            max(
+                self.rollout_contact_gate.on_threshold
+                - self.rollout_contact_gate.off_threshold,
+                1.0e-6,
+            )
+        )
+        temperature = signal.new_tensor(self.rollout_contact_temperature)
+        smooth_scale = temperature / threshold_gap
+        log_two = signal.new_tensor(0.6931471805599453)
+
+        def smooth_hinge(value):
+            return smooth_scale * torch.relu(
+                torch.nn.functional.softplus(value / temperature) - log_two
+            )
+
+        free_violation = smooth_hinge(
+            signal - self.rollout_contact_gate.off_threshold
+        )
+        contact_violation = smooth_hinge(
+            self.rollout_contact_gate.on_threshold - signal
+        )
+        align_violation = smooth_scale * (
+            torch.relu(
+                torch.nn.functional.softplus(
+                    (self.rollout_contact_gate.off_threshold - signal)
+                    / temperature
+                )
+                - log_two
+            )
+            + torch.relu(
+                torch.nn.functional.softplus(
+                    (signal - self.rollout_contact_gate.on_threshold)
+                    / temperature
+                )
+                - log_two
+            )
+        )
+        physical_consistency = (
+            head_probabilities[..., 0] * free_violation.square()
+            + head_probabilities[..., 1] * align_violation.square()
+            + head_probabilities[..., 2] * contact_violation.square()
+        ).mean()
+        total = (
+            self.rollout_contact_weight * rollout_ce
+            + self.rollout_contact_physical_weight * physical_consistency
+        )
+        metrics = {
+            "rollout_contact_ce": rollout_ce.detach(),
+            "rollout_contact_physical": physical_consistency.detach(),
+            "rollout_tau_ext_norm": signal.detach().mean(),
+        }
+        return total, metrics
+
+    def _sample_source_noise(self, batch):
+        reference = batch[self.model.inputs[0]]
+        return torch.randn(
+            reference.shape[0],
+            self.model.future_horizon,
+            self.model.flow_dim,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    def _teacher_predict(self, batch, *, source_noise=None):
         """Generate a frozen Teacher target without inheriting Student AMP."""
 
         # Keep Teacher targets in the original FP32 path even when the Student
@@ -262,6 +534,7 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                     batch,
                     steps=self.teacher_steps,
                     solver=self.teacher.flow_solver,
+                    source_noise=source_noise,
                 )
 
     def _endpoint_distill(
@@ -270,15 +543,21 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         teacher_batch=None,
         *,
         teacher_out=None,
+        source_noise=None,
     ):
         if teacher_batch is None:
             teacher_batch = student_batch
+        if source_noise is None:
+            source_noise = self._sample_source_noise(student_batch)
         if teacher_out is None:
-            teacher_out = self._teacher_predict(teacher_batch)
+            teacher_out = self._teacher_predict(
+                teacher_batch, source_noise=source_noise
+            )
         student_out = self.model.predict_differentiable(
             student_batch,
             steps=self.student_steps,
             solver=self.model.flow_solver,
+            source_noise=source_noise,
         )
         losses = []
         weights = []
@@ -297,47 +576,6 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             return student_out["q_pred"].new_zeros(()), student_out
         return torch.stack(losses).sum() / sum(weights), student_out
 
-    def _refresh_action_condition(self, batch, q_state=None, current_pose=None):
-        """Update pose-derived action tokens after a state-history writeback."""
-
-        if self.pose_dynamics is None or "target_pose_abs" not in batch:
-            return batch
-
-        if current_pose is None:
-            if q_state is None:
-                raise ValueError("q_state or current_pose is required")
-            # Only the committed first prediction affects the next history
-            # condition.  Avoid FK for the remaining prediction horizon.
-            if q_state.ndim >= 3:
-                q_state = q_state[:, :1]
-            q_physical = self.loss_calculator._physical("q", q_state.float())
-            current_pose = self.pose_dynamics.frame_poses(q_physical)
-
-        if current_pose.ndim == 3:
-            current_pose = current_pose[:, 0]
-        if current_pose.ndim != 2 or current_pose.shape[-1] != 7:
-            raise ValueError(
-                "current_pose must have shape [B, 7] or [B, 1, 7], got "
-                f"{tuple(current_pose.shape)}"
-            )
-        condition_raw = compose_action_condition(
-            current_pose,
-            batch["target_pose_abs"],
-            self.action_condition_features,
-        )
-        batch["target_relative_pose"] = self.dataset._normalize(
-            "target_relative_pose", condition_raw
-        )
-        if "current_ee_pose" in batch:
-            batch["current_ee_pose"] = torch.cat(
-                (
-                    batch["current_ee_pose"][:, 1:],
-                    current_pose[:, None, :].detach(),
-                ),
-                dim=1,
-            )
-        return batch
-
     def _write_back(self, batch, student_out):
         next_batch = dict(batch)
         for key in self._state_keys(self.model):
@@ -348,7 +586,12 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             next_batch[key] = torch.cat(
                 (history[:, 1:], prediction[:, :1].detach()), dim=1
             )
-        return self._refresh_action_condition(next_batch, student_out["q_pred"][:, :1])
+        if "contact" in batch and "contact_state_pred" in student_out:
+            next_batch["contact"] = torch.cat(
+                (batch["contact"][:, 1:], student_out["contact_state_pred"][:, :1].detach()),
+                dim=1,
+            )
+        return next_batch
 
     def _write_back_real(self, batch, reference_batch, step):
         """Advance Teacher history with the corresponding recorded future state."""
@@ -363,40 +606,62 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             history = batch[key]
             recorded = reference_batch[future_key][:, step : step + 1].detach()
             next_batch[key] = torch.cat((history[:, 1:], recorded), dim=1)
-        current_pose = None
-        if "current_ee_pose_future" in reference_batch:
-            # The real future q is static dataset data and its FK was already
-            # computed when TorqueWorldModelDataset was initialized.
-            current_pose = reference_batch["current_ee_pose_future"][
-                :, step : step + 1
-            ]
-        return self._refresh_action_condition(
-            next_batch,
-            next_batch["q"][:, -1:],
-            current_pose=current_pose,
-        )
+        if "contact" in batch and "contact_future" in reference_batch:
+            next_batch["contact"] = torch.cat(
+                (
+                    batch["contact"][:, 1:],
+                    reference_batch["contact_future"][:, step : step + 1].detach(),
+                ),
+                dim=1,
+            )
+        return next_batch
 
-    def _rollout_distill(self, batch, initial_teacher_out=None):
+    def _rollout_distill(
+        self, batch, initial_teacher_out=None, initial_source_noise=None
+    ):
         if self.rollout_steps == 0:
-            return batch["q"].new_zeros(())
+            zero = batch["q"].new_zeros(())
+            return zero, {
+                "rollout_contact_ce": zero.detach(),
+                "rollout_contact_physical": zero.detach(),
+                "rollout_tau_ext_norm": zero.detach(),
+            }
         student_current = dict(batch)
         teacher_current = dict(batch)
         losses = []
+        contact_metrics = []
         for step in range(self.rollout_steps):
             teacher_out = initial_teacher_out if step == 0 else None
+            source_noise = (
+                initial_source_noise
+                if step == 0 and initial_source_noise is not None
+                else self._sample_source_noise(student_current)
+            )
             loss, student_out = self._endpoint_distill(
                 student_current,
                 teacher_current,
                 teacher_out=teacher_out,
+                source_noise=source_noise,
             )
-            losses.append(loss)
+            contact_loss, current_contact_metrics = self._rollout_contact_loss(
+                student_current, student_out
+            )
+            losses.append(loss + contact_loss)
+            contact_metrics.append(current_contact_metrics)
             student_current = self._write_back(student_current, student_out)
             teacher_current = self._write_back_real(
                 teacher_current,
                 batch,
                 step,
             )
-        return torch.stack(losses).mean()
+        metrics = {}
+        for key in (
+            "rollout_contact_ce",
+            "rollout_contact_physical",
+            "rollout_tau_ext_norm",
+        ):
+            metrics[key] = torch.stack([item[key] for item in contact_metrics]).mean()
+        return torch.stack(losses).mean(), metrics
 
     def _curriculum_state(self):
         if not self.curriculum_enabled:
@@ -424,11 +689,17 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         # The first rollout Teacher context is identical to the direct
         # endpoint context.  Reuse its frozen target, while recomputing the
         # Student path so training-time dropout behavior remains unchanged.
-        teacher_out = self._teacher_predict(batch)
-        distill_loss, _ = self._endpoint_distill(batch, teacher_out=teacher_out)
-        rollout_loss = self._rollout_distill(
+        source_noise = self._sample_source_noise(batch)
+        teacher_out = self._teacher_predict(batch, source_noise=source_noise)
+        distill_loss, _ = self._endpoint_distill(
+            batch,
+            teacher_out=teacher_out,
+            source_noise=source_noise,
+        )
+        rollout_loss, rollout_contact_metrics = self._rollout_distill(
             batch,
             initial_teacher_out=teacher_out,
+            initial_source_noise=source_noise,
         )
         progress, teacher_weight, rollout_weight = self._curriculum_state()
         total = (
@@ -440,6 +711,10 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             {
                 "distill_loss": distill_loss.detach(),
                 "rollout_distill_loss": rollout_loss.detach(),
+                **{
+                    key: value.detach()
+                    for key, value in rollout_contact_metrics.items()
+                },
                 "opd_curriculum_progress": progress,
                 "opd_teacher_weight": teacher_weight,
                 "opd_rollout_weight": rollout_weight,

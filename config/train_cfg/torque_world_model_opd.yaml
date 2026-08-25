@@ -1,43 +1,62 @@
-# OPD Student training. First train a Teacher with torque_world_model.yaml,
-# then point distillation.teacher_checkpoint_path at its checkpoint.
+wm_v3_only: true
+
+train_data:
+  format: lerobot_v3
+
 dataloader:
-  repo_id: wipe_board_wm_lbv3
-  root: data/train_episode/wipe_board_wm_lbv3
+  repo_id: push_button_lerobot_v3
+  root: ../nero_ws/runs/push_button_lerobot_v3
   backend: lerobot
+  v3_only: true
   video_backend: pyav
   high_fps: 100
-  enforce_uniform_high_timestamps: false
   state_history_horizon: 50
   prediction_horizon: 32
   action_condition_horizon: 8
-  action_condition_features: [absolute_pose, current_ee_pose, relative_pose]
-  current_ee_pose_source: fk
   action_chunk_horizon: 8
-  pad_history: true
-  pad_future: false
+  action_start_offset: 1
   expert_fps: 25.0
   inference_delay_s: 0.0
   action_resample: nearest
-  action_condition_mode: composite
+  action_condition_mode: direct
+  action_key: action.joint
   high_timestamp_key: timing.state_timestamp_ns
   anchor_timestamp_key: timing.action_anchor_timestamp_ns
   high_keys:
     q: observation.joint
     dq: observation.velocity
-    ddq: null
+    delta_q: observation.delta_q
     tau: observation.torque
-    wrench: observation.wrench_ext
-    reference_pose: action.ee_pose
+    tau_ext: observation.tau_ext
+    action: action.joint
+  filters:
+    q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
+    dq: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
+    delta_q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
+    tau: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 20.0, order: 2}]}
+  filter_timestamp_unit: ns
   normalize_mode: gaussian
-  normalize_lowdim_keys: [q, dq, tau, wrench, target_relative_pose]
+  normalize_lowdim_keys: [q, dq, delta_q, tau, action]
+  pad_history: true
+  pad_future: false
 
 contact_gate:
-  enabled: false
+  enabled: true
+  label_mode: three_phase
+  metric: tau_ext_l1
+  thresholds:
+    force_xyz_l2: {off: 0.3, on: 1.5}
+    tau_ext_l1: {off: 0.15, on: 0.75}
+    tau_ext_l2: {off: 0.15, on: 0.75}
+  consecutive_frames: 5
+  class_weights: auto
+  max_class_weight: 20.0
 
 model:
+  inputs: [q, dq, delta_q, tau]
   joint_dim: 7
-  action_dim: 21
-  wrench_dim: 6
+  action_dim: 7
+  contact_state_count: 3
   hidden_dim: 128
   state_layers: 2
   action_layers: 2
@@ -46,49 +65,52 @@ model:
   flow_layers: 4
   flow_attention_heads: 4
   flow_ffn_multiplier: 4
-  # Student architecture is unchanged; only its ODE solve count is reduced.
   flow_inference_steps: 2
   flow_solver: heun
-  state_estimator:
-    sampling_dt: 0.01
-    q_mean_window_samples: 10
-    q_lowpass_cutoff_hz: 10
-    dq_lowpass_cutoff_hz: 6
-    ddq_lowpass_cutoff_hz: 3
+  flow_source_mode: gaussian
+  contact_logit_scale: 4.0
 
 loss:
   flow_weight: 1.0
   flow_q_weight: 1.0
   flow_dq_weight: 1.0
+  flow_delta_q_weight: 1.0
   flow_tau_weight: 1.0
-  flow_wrench_weight: 1.0
   q_weight: 1.0
   dq_weight: 0.5
-  tau_weight: 0.5
-  wrench_observation_weight: 1.0
-  ddq_weight: 0.0
-  # Legacy RNEA loss remains zero for the first OPD run.
-  wrench_weight: 0.0
-  standardize_derived_residuals: true
-  standardize_wrench_residual: true
-
-physics:
-  rnea:
-    enabled: false
+  delta_q_weight: 1.0
+  tau_weight: 1.0
+  contact_weight: 1.0
+  contact_class_weights: auto
+  kinematic_consistency_weight: 0.05
+  ddq_smoothness_weight: 0.05
+  ddq_smoothness_warmup_steps: 1000
+  ddq_smoothness_huber_delta: 1.0
+  ddq_smoothness_normalize: true
+  dt: 0.01
 
 distillation:
   enabled: true
-  teacher_checkpoint_path: outputs/torque_world_model_test2/checkpoints/epoch_143_val_loss_0.045692.pt
+  teacher_checkpoint_path: outputs/torque_world_model_v4/checkpoints
   teacher_steps: 8
   student_steps: 2
   weight: 1.0
   rollout_weight: 1.0
-  # Each iteration writes the Student's first 100 Hz state into history.
   rollout_steps: 4
+  rollout_contact:
+    # Physics-derived rollout labels use the frozen real-robot tau-free model.
+    enabled: true
+    # Checkpoint must be trained with model.inputs=[q, dq, delta_q] and target_key=tau.
+    tau_free_checkpoint_path: outputs/tau_free_sequence/pure_teleop_1/checkpoints/epoch_128_val_tau_mse_nm2_0.005294.pt
+    weight: 0.2
+    physical_consistency_weight: 0.02
+    horizon: 32
+    # Keep rollout labels causal; offline dataset labels may still backfill.
+    backfill: false
+    temperature: 0.05
+    max_model_batch_size: 1024
   curriculum:
     enabled: true
-    # Early epochs are anchored to Teacher(real history); later epochs put
-    # more weight on Student-written histories while retaining base labels.
     epochs: 100
     teacher_weight_start: 1.0
     teacher_weight_end: 0.25
@@ -99,18 +121,23 @@ train:
   device: cuda:0
   batch_size: 128
   num_workers: 8
-  max_train_steps: 50000
-  checkpoint_every_steps: 5000
+  num_epochs: 3000
+  checkpoint_every_epochs: 500
   val_ratio: 0.1
   split_mode: episode
   seed: 42
   lr: 0.0001
   weight_decay: 0.0001
   gradient_clip_norm: 1.0
-  output_dir: outputs/torque_world_model_opd
+  output_dir: outputs/torque_world_model_v4_opd
   monitor_key: val_loss
-  top_k: 2
-  save_latest_checkpoint: true
+  top_k: 3
+  save_latest_checkpoint: false
+  contact_sampling:
+    enabled: true
+    phase_weights: [1.0, 2.0, 3.0]
+    future_phase_reduction: max
+    replacement: true
   ema:
     enabled: true
     decay: 0.999
@@ -119,19 +146,15 @@ train:
     use_for_validation: true
   scheduler:
     name: cosine
-    T_max: 50000
+    T_max: 3000
     eta_min: 0.000001
   early_stopping:
-    # Keep val_loss logging, but use the fixed optimizer-step budget by default.
     enabled: false
-    patience: 30
-    warmup_epochs: 20
-    min_delta: 0.000001
   wandb:
     enabled: false
     project: torque-world-model
-    name: opd-student
+    name: direct-action-opd
     group: torque-world-model-opd
-    tags: [q-dq-tau-wrench, action-chunk, flow-distillation, opd]
+    tags: [q-dq-deltaq-tau, direct-action, flow-distillation, opd]
     mode: online
     log_every_steps: 10

@@ -489,7 +489,7 @@ def residual_torque(
     tau_measured: np.ndarray,
     tau_inverse_dynamics: np.ndarray,
 ) -> np.ndarray:
-    """Return the repository-wide residual convention: tau_f = tau - tau_id."""
+    """Return the repository-wide residual convention: tau_other = tau - tau_id."""
 
     tau_measured = np.asarray(tau_measured, dtype=np.float64)
     tau_inverse_dynamics = np.asarray(tau_inverse_dynamics, dtype=np.float64)

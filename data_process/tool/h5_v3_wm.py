@@ -22,6 +22,7 @@ from typing import Any, Mapping
 
 from tqdm import tqdm
 
+from data_process.causal_data_filter import filter_episode_values
 from data_process.tool.h5_2_lerobotev3 import (
     H5Dataset,
     LeRobotV3Dataset,
@@ -120,6 +121,9 @@ def _output_feature_spec(raw_spec: Mapping[str, Any]) -> dict[str, Any]:
             "allow_stale",
             "transform",
             "combine",
+            "lowpass",
+            "cutoff_hz",
+            "order",
         }
     }
     normalize_feature_spec(feature_spec)
@@ -127,6 +131,33 @@ def _output_feature_spec(raw_spec: Mapping[str, Any]) -> dict[str, Any]:
     if dtype in {"image", "video"}:
         raise ValueError("h5_v3_wm only supports low-dimensional features.")
     return feature_spec
+
+
+def _normalize_lowpass(raw_spec: Mapping[str, Any], feature_name: str) -> dict[str, Any] | None:
+    """Normalize an optional causal history-only low-pass declaration."""
+
+    enabled = bool(raw_spec.get("lowpass", False))
+    present = enabled or any(key in raw_spec for key in ("cutoff_hz", "order"))
+    if not present:
+        return None
+    if not enabled:
+        raise ValueError(
+            f"Feature {feature_name!r} defines cutoff_hz/order but lowpass is false."
+        )
+    cutoff_hz = float(raw_spec.get("cutoff_hz", 0.0))
+    order = int(raw_spec.get("order", 1))
+    if not math.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+        raise ValueError(f"Feature {feature_name!r} lowpass.cutoff_hz must be positive")
+    if order < 1:
+        raise ValueError(f"Feature {feature_name!r} lowpass.order must be positive")
+    return {
+        "enabled": True,
+        "cutoff_hz": cutoff_hz,
+        "order": order,
+        "causal": True,
+        "history_only": True,
+        "contract": "causal_variable_dt_one_pole_cascade_v1",
+    }
 
 
 def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
@@ -166,6 +197,7 @@ def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
                 )
 
         feature_spec = _output_feature_spec(raw_spec)
+        lowpass = _normalize_lowpass(raw_spec, key)
         lerobot_features[key] = feature_spec
         mappings.append(
             {
@@ -176,6 +208,7 @@ def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
                 "transform": raw_spec.get("transform"),
                 "combine": raw_spec.get("combine"),
                 "max_gap_s": raw_spec.get("max_gap_s"),
+                "lowpass": lowpass,
                 "feature_spec": feature_spec,
             }
         )
@@ -330,11 +363,23 @@ def build_wm_episode_cache(
         "action_anchors": action_anchor_seconds,
         "resampled": {},
         "wm_raw_lowdim_rows": True,
+        "filters": {},
     }
     for mapping in spec["state_mappings"]:
-        cache["resampled"][mapping["lerobot_key"]] = (
-            h5_dataset._sample_snapshot_mapping(mapping, state_indices, cache)
-        )
+        # Filter the complete raw episode before dropping unlabeled boundary
+        # rows. This preserves the causal history that precedes the first
+        # retained WM row.
+        all_state_indices = np.arange(len(raw_state_seconds), dtype=np.int64)
+        values = h5_dataset._sample_snapshot_mapping(mapping, all_state_indices, cache)
+        if mapping.get("lowpass") is not None:
+            lowpass = mapping["lowpass"]
+            values = filter_episode_values(
+                raw_state_seconds,
+                values,
+                [{"type": "lowpass", "cutoff_hz": lowpass["cutoff_hz"], "order": lowpass["order"]}],
+            )
+            cache["filters"][mapping["lerobot_key"]] = lowpass
+        cache["resampled"][mapping["lerobot_key"]] = values[state_indices]
 
     for mapping in spec["action_mappings"]:
         for source in mapping["sources"]:
@@ -354,6 +399,14 @@ def build_wm_episode_cache(
         cache["resampled"][mapping["lerobot_key"]] = (
             h5_dataset._resample_mapping(mapping, action_anchor_seconds, cache)
         )
+        if mapping.get("lowpass") is not None:
+            lowpass = mapping["lowpass"]
+            cache["resampled"][mapping["lerobot_key"]] = filter_episode_values(
+                action_anchor_seconds,
+                cache["resampled"][mapping["lerobot_key"]],
+                [{"type": "lowpass", "cutoff_hz": lowpass["cutoff_hz"], "order": lowpass["order"]}],
+            )
+            cache["filters"][mapping["lerobot_key"]] = lowpass
 
     valid_anchor_index = np.full(len(anchor_valid), -1, dtype=np.int64)
     valid_anchor_index[anchor_valid] = np.arange(
@@ -424,6 +477,11 @@ def write_wm_manifest(output_path: Path, spec: Mapping[str, Any]) -> Path:
         "action_upsampling": "previous_anchor_hold",
         "unlabeled_state_rows": "drop",
         "action_update_key": "timing.action_update",
+        "feature_filters": {
+            mapping["lerobot_key"]: mapping["lowpass"]
+            for mapping in spec["mappings"]
+            if mapping.get("lowpass") is not None
+        },
     }
     path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"

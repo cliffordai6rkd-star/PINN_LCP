@@ -13,24 +13,21 @@ dataloader:
   lowdim_keys:
     q: observation.joint
     dq: observation.velocity
-    ddq: observation.ddq
     delta_q: observation.delta_q
-    tau_id: observation.tau_id
-    tau_f: observation.tau_f
+    # tau is the measured torque field used by tau_other target generation.
     tau: observation.torque
 
   normalize_mode: gaussian
   normalize_lowdim_keys:
     - q
     - dq
-    - ddq
     - delta_q
     # - tau_id
     # - tau
-    - tau_f
+    - tau_other
 
-  # Apply the same resolved torque operations independently to measured tau and
-  # derived RNEA tau_id on the dataset's 50 Hz timeline.
+  # tau is observation.torque; tau_other uses it directly on the dataset's
+  # 50 Hz timeline.
   filter_timestamp_key: timestamp
   filter_timestamp_unit: s
   filters:
@@ -49,26 +46,16 @@ dataloader:
 # mini-batch sampling. This resolved contract is also stored in every checkpoint.
 target_generation:
   enabled: true
-  method: causal_rnea_residual_v1
-  target_key: tau_f
+  method: causal_gravity_residual_v1
+  target_key: tau_other
   timestamp_key: timestamp
   timestamp_unit: s
   source_keys: {q: q, dq: dq, tau: tau}
   dq_sign: [1, 1, 1, 1, 1, 1, 1]
-  rnea_state_source: measured
   torque_filter_key: tau
-  state_estimator:
-    position_std: 5.0e-4
-    velocity_std: 3.0e-2
-    jerk_std: 2.0
-    initial_position_std: 1.0e-2
-    initial_velocity_std: 2.0e-1
-    initial_acceleration_std: 5.0
-    max_gap_s: 0.1
 
 model:
-  # Every window is independent. The causal TCN has an exact 50-frame
-  # receptive field and an explicit current-state skip.
+  # Every sample is an independent 50-frame q/dq/delta_q window.
   history_mode: stateless_sliding_window
   architecture: lstm
   # tcn_kernel_size: 2
@@ -78,21 +65,17 @@ model:
   inputs:
     - q
     - dq
-    - ddq
     - delta_q
-    # - tau
 
 
   input_dims:
     q: 7
     dq: 7
-    ddq: 7
     delta_q: 7
-    # tau: 7
 
   output_dim: 7
-  target_key: tau_f
-  target_contract: causal_rnea_residual_v1
+  target_key: tau_other
+  target_contract: causal_gravity_residual_v1
 
 
   hidden_dim: 128
@@ -105,14 +88,14 @@ model:
   dropout: 0.1
 
 loss:
-  # Ordinary seven-axis MSE in normalized target space. The tau_f rollout below
+  # Ordinary seven-axis MSE in normalized target space. The tau_other rollout below
   # is visualization-only and does not add a wrench term to this training loss.
   type: mse
   # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
   joint_weights: [1, 1, 1, 1, 1, 1, 1]
 
-# Offline visualization replays the same causal state/RNEA/filter chain used by
-# nero_ws before mapping tau_ext to the gripper-frame wrench.
+# Offline visualization replays observation.torque-tau_g before mapping tau_ext
+# to the gripper-frame wrench.
 rollout:
   measured_tau_already_filtered: true
 
@@ -134,7 +117,7 @@ train:
   # Random windows keep mixed motion regimes represented on both sides. This
   # is an interpolation/checkpoint-ranking split, not an unbiased generalization test.
   split_mode:  episode
-  val_episode_indices: [21]
+  val_episode_indices: [2]
   seed: 42
 
   lr: 1.0e-3
@@ -159,7 +142,7 @@ train:
     warmup_epochs: 10
     min_delta: 1.0e-5
 
-  output_dir: outputs/tau_f_sequence/ep3
+  output_dir: outputs/tau_other_sequence/ep2_h50
   monitor_key: val_loss
   top_k: 5
 
@@ -173,6 +156,6 @@ train:
   wandb:
     enabled: false
     project: lcp-pinn
-    name: tau-f-tcn-h50-sample-mse
+    name: tau-other-tcn-h50-sample-mse
     mode: online
     log_every_steps: 10
