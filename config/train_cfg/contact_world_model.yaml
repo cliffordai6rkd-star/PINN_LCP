@@ -136,7 +136,7 @@ train:
 
   scheduler:
     name: cosine
-    T_max: 3000
+    T_max: 800
     eta_min: 0.000001
 
   early_stopping:

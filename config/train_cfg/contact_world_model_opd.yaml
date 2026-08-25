@@ -167,7 +167,7 @@ train:
     use_for_validation: true
   scheduler:
     name: cosine
-    T_max: 3000
+    T_max: 200
     eta_min: 0.000001
   early_stopping:
     # Keep val_loss logging without stopping before the configured epoch budget.
