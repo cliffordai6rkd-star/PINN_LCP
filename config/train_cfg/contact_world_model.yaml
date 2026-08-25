@@ -9,13 +9,13 @@ train_data:
   sources:
     - name: insert_usb
       repo_id: insert_usb_lerobot_v3
-      root: ../../swm/insert_usb_lerobot_v3
+      root: ../../data/swm/insert_usb_lerobot_v3
     - name: push_button
       repo_id: push_button_lerobot_v3
-      root: ../../swm/push_button_lerobot_v3
+      root: ../../data/swm/push_button_lerobot_v3
     - name: cuccumber_peeling
       repo_id: cuccumber_peeling_lerobot_v3
-      root: ../../swm/cuccumber_peeling_lerobot_v3
+      root: ../../data/swm/cuccumber_peeling_lerobot_v3
 
 dataloader:
   backend: lerobot
@@ -136,7 +136,7 @@ train:
 
   scheduler:
     name: cosine
-    T_max: 800
+    T_max: 1000
     eta_min: 0.000001
 
   early_stopping:

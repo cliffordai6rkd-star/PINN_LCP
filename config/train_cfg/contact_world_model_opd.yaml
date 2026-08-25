@@ -113,7 +113,7 @@ distillation:
   rollout_contact:
     enabled: true
     # Checkpoint must be trained with model.inputs=[q, dq, delta_q] and target_key=tau.
-    tau_free_checkpoint_path: outputs/tau_free_sequence/pure_teleop_1/checkpoints/epoch_124_val_tau_mse_nm2_0.005756.pt
+    tau_free_checkpoint_path: ../../model/tau_free/epoch_124_val_tau_mse_nm2_0.005756.pt
     weight: 0.2
     physical_consistency_weight: 0.02
     horizon: 32
