@@ -2,10 +2,22 @@ wm_v3_only: true
 
 train_data:
   format: lerobot_v3
+  # V3 action anchors are sampled from the first command at/after each state.
+  action_alignment: next
+  # Optional multi-source form. Each source is loaded as an independent
+  # LeRobot v3 dataset and concatenated episode-wise by the WM dataloader.
+  sources:
+    - name: insert_usb
+      repo_id: insert_usb_lerobot_v3
+      root: ../../swm/insert_usb_lerobot_v3
+    - name: push_button
+      repo_id: push_button_lerobot_v3
+      root: ../../swm/push_button_lerobot_v3
+    - name: cuccumber_peeling
+      repo_id: cuccumber_peeling_lerobot_v3
+      root: ../../swm/cuccumber_peeling_lerobot_v3
 
 dataloader:
-  repo_id: push_button_lerobot_v3
-  root: ../nero_ws/runs/push_button_lerobot_v3
   backend: lerobot
   v3_only: true
 
@@ -60,7 +72,7 @@ model:
   state_layers: 2
   action_layers: 2
   attention_heads: 4
-  dropout: 0.05
+  dropout: 0.01
 
   flow_layers: 4
   flow_attention_heads: 4
@@ -82,7 +94,7 @@ loss:
   contact_class_weights: auto
   dq_weight: 0.5
   delta_q_weight: 1.0
-  kinematic_consistency_weight: 0.05
+  kinematic_consistency_weight: 0.01
   ddq_smoothness_weight: 0.05
   ddq_smoothness_warmup_steps: 1000
   ddq_smoothness_huber_delta: 1.0
@@ -94,8 +106,8 @@ train:
   batch_size: 512
   num_workers: 4
   # Epoch-based budget and chronological checkpoint retention.
-  num_epochs: 3000
-  checkpoint_every_epochs: 500
+  num_epochs: 1000
+  checkpoint_every_epochs: 250
   val_ratio: 0.1
   # val_episode_indices: [15, 50, 90]
   split_mode: episode
@@ -105,9 +117,9 @@ train:
   weight_decay: 0.0001
   gradient_clip_norm: 1.0
   validation_flow_time: 0.5
-  output_dir: outputs/contact_world_model_v1
+  output_dir: outputs/contact_world_model_ep1
   monitor_key: val_loss
-  top_k: 10
+  top_k: 3
   save_latest_checkpoint: false
   contact_sampling:
     enabled: true
@@ -135,7 +147,7 @@ train:
     min_delta: 0.000001
 
   wandb:
-    enabled: false
+    enabled: true
     project: contact-world-model
     name: q-dq-deltaq-tau-direct-action-three-phase-contact
     group: contact-world-model

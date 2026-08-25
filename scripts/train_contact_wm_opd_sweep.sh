@@ -15,6 +15,9 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${RUN_ROOT:-outputs/contact_world_model_opd_sweep/${RUN_TAG}}"
 TEACHER_OUTPUT_DIR="${TEACHER_OUTPUT_DIR:-$RUN_ROOT/teacher}"
 STUDENT_OUTPUT_ROOT="${STUDENT_OUTPUT_ROOT:-$RUN_ROOT/students}"
+# Optional machine-specific tau-free checkpoint override. When empty, the
+# path from the OPD YAML is preserved.
+TAU_FREE_CHECKPOINT_PATH="${TAU_FREE_CHECKPOINT_PATH:-}"
 
 # Optional overrides. Empty values preserve the YAML template values.
 TEACHER_MAX_STEPS="${TEACHER_MAX_STEPS:-}"
@@ -28,7 +31,7 @@ STUDENT_TOP_K="${STUDENT_TOP_K:-}"
 STUDENT_NUM_EPOCHS="${STUDENT_NUM_EPOCHS:-}"
 STUDENT_CHECKPOINT_EVERY_EPOCHS="${STUDENT_CHECKPOINT_EVERY_EPOCHS:-}"
 TEACHER_STEPS="${TEACHER_STEPS:-}"
-STUDENT_STEPS="2"
+STUDENT_STEPS="${STUDENT_STEPS:-2}"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Python executable does not exist or is not executable: $PYTHON_BIN" >&2
@@ -95,7 +98,8 @@ render_student_config() {
     "$student_output_dir" "$STUDENT_MAX_STEPS" \
     "$STUDENT_CHECKPOINT_EVERY" "$STUDENT_TOP_K" \
     "$TEACHER_STEPS" "$STUDENT_STEPS" \
-    "$STUDENT_NUM_EPOCHS" "$STUDENT_CHECKPOINT_EVERY_EPOCHS" <<'PY'
+    "$STUDENT_NUM_EPOCHS" "$STUDENT_CHECKPOINT_EVERY_EPOCHS" \
+    "$TAU_FREE_CHECKPOINT_PATH" <<'PY'
 import sys
 from pathlib import Path
 
@@ -113,6 +117,7 @@ import yaml
     student_steps,
     num_epochs,
     checkpoint_every_epochs,
+    tau_free_checkpoint_path,
 ) = sys.argv[1:]
 with Path(source).open("r", encoding="utf-8") as stream:
     config = yaml.safe_load(stream)
@@ -124,13 +129,21 @@ model["flow_inference_steps"] = int(student_steps)
 
 distillation = config.setdefault("distillation", {})
 distillation["enabled"] = True
-distillation["teacher_checkpoint_path"] = str(Path(teacher_checkpoint).resolve())
+distillation["teacher_checkpoint_path"] = str(Path(teacher_checkpoint).expanduser())
 distillation["student_steps"] = int(student_steps)
 if teacher_steps:
     distillation["teacher_steps"] = int(teacher_steps)
+if tau_free_checkpoint_path:
+    rollout_contact = distillation.setdefault("rollout_contact", {})
+    rollout_contact["tau_free_checkpoint_path"] = str(
+        Path(tau_free_checkpoint_path).expanduser()
+    )
 
 train = config.setdefault("train", {})
 train["output_dir"] = output_dir
+wandb = train.get("wandb")
+if isinstance(wandb, dict) and bool(wandb.get("enabled", False)):
+    wandb["name"] = f"{wandb.get('name', 'contact-wm-opd-student')}-{Path(teacher_checkpoint).stem}"
 if max_steps:
     train["max_train_steps"] = int(max_steps)
 if interval:
@@ -160,14 +173,40 @@ if [[ ! -d "$TEACHER_CHECKPOINT_DIR" ]]; then
   exit 1
 fi
 
+# The scheduled epoch saver retains the newest ``train.top_k`` checkpoints.
+# Read the effective value from the rendered Teacher config so this sweep
+# cannot accidentally process stale files if an output directory is reused.
+if [[ -n "$TEACHER_TOP_K" ]]; then
+  TEACHER_TOP_K_COUNT="$TEACHER_TOP_K"
+else
+  TEACHER_TOP_K_COUNT="$($PYTHON_BIN - "$TEACHER_RENDERED_CONFIG" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+with Path(sys.argv[1]).open("r", encoding="utf-8") as stream:
+    config = yaml.safe_load(stream) or {}
+value = (config.get("train") or {}).get("top_k", 3)
+print(3 if value is None else int(value))
+PY
+)"
+fi
+if ! [[ "$TEACHER_TOP_K_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Teacher top_k must be a positive integer, got: $TEACHER_TOP_K_COUNT" >&2
+  exit 1
+fi
+
 mapfile -t TEACHER_CHECKPOINTS < <(
   find "$TEACHER_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'epoch_*.pt' -printf '%f\n' \
-    | sort -V
+    | sort -V -r \
+    | head -n "$TEACHER_TOP_K_COUNT"
 )
 if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 ]]; then
   mapfile -t TEACHER_CHECKPOINTS < <(
     find "$TEACHER_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'step_*.pt' -printf '%f\n' \
-      | sort -V
+      | sort -V -r \
+      | head -n "$TEACHER_TOP_K_COUNT"
   )
 fi
 if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 && -f "$TEACHER_CHECKPOINT_DIR/latest.pt" ]]; then
@@ -178,7 +217,7 @@ if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-echo "[2/2] Distilling ${#TEACHER_CHECKPOINTS[@]} Teacher checkpoints with Student=${STUDENT_STEPS} steps"
+echo "[2/2] Distilling ${#TEACHER_CHECKPOINTS[@]} of top_k=${TEACHER_TOP_K_COUNT} Teacher checkpoints from newest to oldest with Student=${STUDENT_STEPS} steps"
 for checkpoint_name in "${TEACHER_CHECKPOINTS[@]}"; do
   checkpoint_path="$TEACHER_CHECKPOINT_DIR/$checkpoint_name"
   checkpoint_id="${checkpoint_name%.pt}"

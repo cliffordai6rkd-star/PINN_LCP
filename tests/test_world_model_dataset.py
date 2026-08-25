@@ -263,6 +263,108 @@ def test_dataset_accepts_per_episode_timestamp_resets():
     assert len(dataset.episodes) == 2
 
 
+def test_dataset_concatenates_multiple_lerobot_v3_sources(monkeypatch):
+    rows = 2
+    block = 2
+
+    def make_columns(offset):
+        high_ts = torch.arange(rows * block, dtype=torch.int64) * 500_000_000
+        anchor_ts = high_ts.reshape(rows, block)[:, -1]
+        action_index = torch.arange(rows * block, dtype=torch.int64).reshape(
+            rows, block, 1
+        )
+        action_anchor = high_ts.reshape(rows, block, 1)
+        return {
+            "observation.joint": _packed_values(rows, block, 2, offset),
+            "observation.velocity": _packed_values(rows, block, 2, offset + 100),
+            "observation.delta_q": _packed_values(rows, block, 2, offset + 200),
+            "observation.torque": _packed_values(rows, block, 2, offset + 300),
+            "action.joint": _packed_values(rows, block, 2, offset + 400),
+            "timing.state_timestamp_ns": high_ts.reshape(rows, block, 1),
+            "timing.anchor_timestamp_ns": anchor_ts.reshape(rows, 1),
+            "timing.action_index": action_index,
+            "timing.action_anchor_timestamp_ns": action_anchor,
+        }
+
+    columns_by_repo = {
+        "insert_usb_lerobot_v3": make_columns(0),
+        "push_button_lerobot_v3": make_columns(1000),
+    }
+
+    class MultiSourceHFDataset(_FakeHFDataset):
+        pass
+
+    class MultiSourceLeRobotDataset:
+        def __init__(self, *, repo_id, root, **kwargs):
+            del root, kwargs
+            self.hf_dataset = MultiSourceHFDataset(columns_by_repo[repo_id])
+            self.meta = SimpleNamespace(
+                episodes=[
+                    {
+                        "episode_index": 7,
+                        "dataset_from_index": 0,
+                        "dataset_to_index": rows,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        "data_process.world_model_dataset._load_lerobot_dataset_class",
+        lambda: MultiSourceLeRobotDataset,
+    )
+    config = {
+        "wm_v3_only": True,
+        "train_data": {
+            "format": "lerobot_v3",
+            "sources": [
+                {
+                    "repo_id": "insert_usb_lerobot_v3",
+                    "root": "/tmp/insert_usb_lerobot_v3",
+                },
+                {
+                    "repo_id": "push_button_lerobot_v3",
+                    "root": "/tmp/push_button_lerobot_v3",
+                },
+            ],
+        },
+        "dataloader": {
+            "backend": "lerobot",
+            "high_fps": 2,
+            "expert_fps": 1,
+            "state_history_horizon": 1,
+            "prediction_horizon": 1,
+            "action_condition_horizon": 1,
+            "action_start_offset": 1,
+            "high_timestamp_key": "timing.state_timestamp_ns",
+            "anchor_timestamp_key": "timing.anchor_timestamp_ns",
+            "action_index_key": "timing.action_index",
+            "action_anchor_timestamp_key": "timing.action_anchor_timestamp_ns",
+            "normalize_mode": None,
+            "pad_history": True,
+            "pad_future": False,
+        },
+        "contact_gate": {"enabled": False},
+    }
+
+    dataset = TorqueWorldModelDataset(config)
+
+    assert len(dataset.source_datasets) == 2
+    assert dataset.high_tensors["q"].shape[0] == rows * block * 2
+    assert len(dataset.episodes) == 2
+    assert [episode["episode_index"] for episode in dataset.episodes] == [0, 1]
+    assert [episode["source_name"] for episode in dataset.episodes] == [
+        "insert_usb_lerobot_v3",
+        "push_button_lerobot_v3",
+    ]
+    assert dataset.episodes[1]["dataset_from_index"] == rows * block
+    assert dataset.episodes[1]["source_dataset_from_index"] == rows
+    assert len(dataset) == 4
+    first = dataset[0]
+    second = dataset[2]
+    assert first["q"].flatten()[0].item() == 1.0
+    assert second["q"].flatten()[0].item() == 1001.0
+
+
 def test_normalizer_streams_target_pose_and_uses_training_frames():
     dataset = _make_dataset(
         normalize_mode="gaussian",

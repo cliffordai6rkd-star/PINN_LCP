@@ -161,34 +161,46 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                 config.get("wm_v3_only", declared_format == "lerobot_v3"),
             )
         )
-        if self.train_data_config.get("sources"):
-            if str(self.train_data_config.get("format", "h5_v3")).lower() != "h5_v3":
+        configured_sources = self.train_data_config.get("sources")
+        if configured_sources:
+            source_format = str(
+                self.train_data_config.get("format", "h5_v3")
+            ).lower()
+            if source_format not in {"h5_v3", "lerobot_v3"}:
                 raise ValueError(
-                    "train_data.sources currently requires train_data.format=h5_v3"
+                    "train_data.sources requires train_data.format=h5_v3 "
+                    "or lerobot_v3"
                 )
-            configured_v3_fields = self.train_data_config.get("v3_fields") or {}
-            missing_v3 = sorted(set(V3_STATE_FIELDS) - set(configured_v3_fields))
-            if missing_v3:
-                raise ValueError(
-                    "train_data.v3_fields is missing canonical fields: "
-                    f"{missing_v3}"
-                )
-            wrong_v3 = {
-                key: configured_v3_fields[key]
-                for key, expected in V3_STATE_FIELDS.items()
-                if str(configured_v3_fields[key]) != expected
-            }
-            if wrong_v3:
-                raise ValueError(
-                    "train_data.v3_fields must use the unified V3 names: "
-                    f"{wrong_v3}"
-                )
+            if source_format == "h5_v3":
+                configured_v3_fields = self.train_data_config.get("v3_fields") or {}
+                missing_v3 = sorted(set(V3_STATE_FIELDS) - set(configured_v3_fields))
+                if missing_v3:
+                    raise ValueError(
+                        "train_data.v3_fields is missing canonical fields: "
+                        f"{missing_v3}"
+                    )
+                wrong_v3 = {
+                    key: configured_v3_fields[key]
+                    for key, expected in V3_STATE_FIELDS.items()
+                    if str(configured_v3_fields[key]) != expected
+                }
+                if wrong_v3:
+                    raise ValueError(
+                        "train_data.v3_fields must use the unified V3 names: "
+                        f"{wrong_v3}"
+                    )
         # SWM always uses the direct dataset action contract.
         self.direct_action = True
+        source_format = str(self.train_data_config.get("format", "")).lower()
         self.backend = str(
             self.train_data_config.get(
                 "backend",
-                "h5" if self.train_data_config.get("sources") else self.data_config.get("backend", "lerobot"),
+                (
+                    "h5"
+                    if self.train_data_config.get("sources")
+                    and source_format != "lerobot_v3"
+                    else self.data_config.get("backend", "lerobot")
+                ),
             )
         ).lower()
         if self.v3_only and self.backend != "lerobot":
@@ -198,8 +210,16 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             )
         self.repo_id = self.data_config.get("repo_id")
         root = self.data_config.get("root")
-        if self.train_data_config.get("sources"):
-            first_source = self.train_data_config["sources"][0]
+        self.lerobot_source_specs = []
+        if self.backend == "lerobot" and configured_sources:
+            self.lerobot_source_specs = self._resolve_lerobot_sources(
+                configured_sources
+            )
+            if self.lerobot_source_specs:
+                root = self.lerobot_source_specs[0]["root"]
+                self.repo_id = self.lerobot_source_specs[0]["repo_id"]
+        elif configured_sources:
+            first_source = configured_sources[0]
             if isinstance(first_source, (str, Path)):
                 root = self.train_data_config.get("root") or first_source
             elif isinstance(first_source, dict):
@@ -215,19 +235,28 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                 f"got {self.backend!r}"
             )
         if self.backend == "lerobot":
-            if not self.repo_id:
-                raise ValueError(
-                    "dataloader.repo_id is required for backend=lerobot"
-                )
+            if not self.lerobot_source_specs:
+                if not self.repo_id:
+                    raise ValueError(
+                        "dataloader.repo_id is required for backend=lerobot"
+                    )
+                self.lerobot_source_specs = [
+                    {"repo_id": str(self.repo_id), "root": self.root, "name": str(self.repo_id)}
+                ]
             LeRobotDataset = _load_lerobot_dataset_class()
-            self.source_dataset = LeRobotDataset(
-                repo_id=self.repo_id,
-                root=self.root,
-                video_backend=self.data_config.get("video_backend", "torchcodec"),
-                download_videos=False,
-            )
+            self.source_datasets = [
+                LeRobotDataset(
+                    repo_id=spec["repo_id"],
+                    root=spec["root"],
+                    video_backend=self.data_config.get("video_backend", "torchcodec"),
+                    download_videos=False,
+                )
+                for spec in self.lerobot_source_specs
+            ]
+            self.source_dataset = self.source_datasets[0]
             self.stats_dataset = self.source_dataset.hf_dataset
         else:
+            self.source_datasets = []
             self.source_dataset = None
             self.stats_dataset = None
 
@@ -392,7 +421,10 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             self.high_tensors, self.high_timestamps, self.anchor_timestamps = (
                 self._load_columns()
             )
-            self.episodes = self._build_virtual_episodes()
+            if self._combined_episodes is not None:
+                self.episodes = self._combined_episodes
+            else:
+                self.episodes = self._build_virtual_episodes()
         self.filter_config = normalize_dataloader_filters(
             self.data_config,
             {key: key for key in self.high_keys},
@@ -503,7 +535,154 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                 merged[key] = value
         return merged
 
+    def _resolve_lerobot_sources(self, sources):
+        """Normalize multi-source LeRobot v3 entries into repo/root pairs.
+
+        A source is normally a mapping with ``repo_id`` and ``root``.  For
+        convenience, a string is treated as a repo id and resolved below the
+        optional ``train_data.root`` directory.
+        """
+
+        if not isinstance(sources, (list, tuple)) or not sources:
+            raise ValueError("train_data.sources must be a non-empty list")
+        base_root = self.train_data_config.get("root")
+        specs = []
+        for position, source in enumerate(sources):
+            if isinstance(source, (str, Path)):
+                source_text = str(source)
+                source_path = Path(source_text).expanduser()
+                repo_id = source_path.name if source_path.name else source_text
+                root = source_path
+                if base_root is not None and not source_path.is_absolute():
+                    root = Path(base_root).expanduser() / source_path
+            elif isinstance(source, dict):
+                repo_id = source.get("repo_id", source.get("name"))
+                root_value = source.get("root", source.get("path"))
+                if repo_id is None and root_value is not None:
+                    repo_id = Path(str(root_value)).name
+                if root_value is None and base_root is not None and repo_id is not None:
+                    root_value = Path(base_root).expanduser() / str(repo_id)
+                root = None if root_value is None else Path(root_value).expanduser()
+            else:
+                raise TypeError(
+                    "each train_data.sources entry must be a string or mapping"
+                )
+            if not repo_id or root is None:
+                raise ValueError(
+                    "each LeRobot v3 source requires repo_id and root (or path)"
+                )
+            specs.append(
+                {
+                    "repo_id": str(repo_id),
+                    "root": root,
+                    "name": str(source.get("name", repo_id))
+                    if isinstance(source, dict)
+                    else str(repo_id),
+                    "position": position,
+                }
+            )
+        return specs
+
     def _load_columns(self):
+        """Load one or more LeRobot v3 datasets onto one logical timeline."""
+
+        self._combined_episodes = None
+        if len(getattr(self, "source_datasets", [])) <= 1:
+            return self._load_single_lerobot_columns(
+                self.stats_dataset,
+                self.source_dataset,
+            )
+
+        loaded = []
+        for source_position, source_dataset in enumerate(self.source_datasets):
+            high_tensors, high_ts, anchor_ts = self._load_single_lerobot_columns(
+                source_dataset.hf_dataset,
+                source_dataset,
+            )
+            loaded.append(
+                {
+                    "source_position": source_position,
+                    "dataset": source_dataset,
+                    "high_tensors": high_tensors,
+                    "high_ts": high_ts,
+                    "anchor_ts": anchor_ts,
+                    "action_indices": self.action_indices,
+                    "action_anchor_timestamps": self.action_anchor_timestamps,
+                    "packed_window_size": self.packed_window_size,
+                }
+            )
+
+        block_sizes = {int(item["packed_window_size"]) for item in loaded}
+        if len(block_sizes) != 1:
+            raise ValueError(
+                "all LeRobot v3 sources must use the same packed window size; "
+                f"got {sorted(block_sizes)}"
+            )
+        block_size = block_sizes.pop()
+        keys = tuple(self.high_keys)
+        if any(
+            set(item["high_tensors"]) != set(keys)
+            for item in loaded
+        ):
+            raise ValueError("all LeRobot v3 sources must expose the same configured fields")
+
+        combined_tensors = {
+            key: torch.cat([item["high_tensors"][key] for item in loaded], dim=0)
+            for key in keys
+        }
+        combined_high_ts = torch.cat([item["high_ts"] for item in loaded], dim=0)
+        combined_anchor_ts = torch.cat([item["anchor_ts"] for item in loaded], dim=0)
+        combined_action_indices = torch.cat(
+            [item["action_indices"] for item in loaded], dim=0
+        )
+        combined_action_anchor_timestamps = torch.cat(
+            [item["action_anchor_timestamps"] for item in loaded], dim=0
+        )
+
+        episodes = []
+        high_offset = 0
+        source_row_offset = 0
+        for item in loaded:
+            source_dataset = item["dataset"]
+            source_name = self.lerobot_source_specs[item["source_position"]]["name"]
+            source_rows = int(item["high_ts"].numel() // block_size)
+            for local_episode_position, episode in enumerate(source_dataset.meta.episodes):
+                row_start = int(episode["dataset_from_index"])
+                row_end = int(episode["dataset_to_index"])
+                episodes.append(
+                    {
+                        **dict(episode),
+                        "episode_index": len(episodes),
+                        "source_episode_index": int(
+                            episode.get("episode_index", local_episode_position)
+                        ),
+                        "source_index": int(item["source_position"]),
+                        "source_name": source_name,
+                        "source_dataset_from_index": source_row_offset + row_start,
+                        "source_dataset_to_index": source_row_offset + row_end,
+                        "dataset_from_index": high_offset + row_start * block_size,
+                        "dataset_to_index": high_offset + row_end * block_size,
+                    }
+                )
+            high_offset += int(item["high_ts"].numel())
+            source_row_offset += source_rows
+
+        self.packed_window_size = block_size
+        self.high_dt_ns = int(round(1.0e9 / self.high_fps))
+        self.action_period_ns = int(round(1.0e9 / self.expert_fps))
+        self.inference_delay_ns = int(round(self.inference_delay_s * 1.0e9))
+        self.action_condition_horizon = self.configured_action_condition_horizon
+        self.action_indices = combined_action_indices
+        self.action_anchor_timestamps = combined_action_anchor_timestamps
+        self._combined_episodes = episodes
+        self.source_dataset = SimpleNamespace(meta=SimpleNamespace(episodes=episodes))
+        self.stats_dataset = SimpleNamespace(
+            column_names=list(combined_tensors),
+            hf_dataset=None,
+        )
+        return combined_tensors, combined_high_ts, combined_anchor_ts
+
+    def _load_single_lerobot_columns(self, stats_dataset, source_dataset):
         dataset_keys = list(dict.fromkeys(self.high_keys.values()))
         dataset_keys.extend((self.high_timestamp_key, self.anchor_timestamp_key))
         # These timing columns are optional for older LeRobot exports.  They
@@ -515,13 +694,13 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             if key not in dataset_keys
         )
         try:
-            formatted = self.stats_dataset.with_format(
+            formatted = stats_dataset.with_format(
                 "torch", columns=dataset_keys, output_all_columns=False
             )
         except KeyError:
             # Permit the ingestion-time delta_q fallback above when an older
             # v3 table has no materialized observation.delta_q column.
-            formatted = self.stats_dataset.with_format(
+            formatted = stats_dataset.with_format(
                 "torch", columns=None, output_all_columns=True
             )
         columns = formatted[:]
@@ -588,7 +767,7 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         # own physical clock origin. Validate monotonicity and cadence within
         # episodes only; a timestamp reset at an episode boundary is expected.
         max_jitter_ns = int(round(self.max_high_timestamp_jitter_s * 1.0e9))
-        for episode in self.source_dataset.meta.episodes:
+        for episode in source_dataset.meta.episodes:
             row_start = int(episode["dataset_from_index"])
             row_end = int(episode["dataset_to_index"])
             episode_start = row_start * block_size
