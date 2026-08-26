@@ -54,6 +54,9 @@ class TorqueWorldModelLoss:
         self.ddq_smoothness_normalize = bool(
             loss_config.get("ddq_smoothness_normalize", True)
         )
+        self.emit_physical_diagnostics = bool(
+            loss_config.get("emit_physical_diagnostics", True)
+        )
         self._global_step = 0
         self._ddq_smoothness_factor = 0.0 if self.ddq_smoothness_warmup_steps > 0 else 1.0
         self.dt = float(
@@ -311,9 +314,18 @@ class TorqueWorldModelLoss:
             "ddq_smoothness_loss": smoothness_loss.detach(),
             "ddq_smoothness_factor": flow_loss.new_tensor(self._ddq_smoothness_factor),
         }
-        for key in STATE_KEYS:
-            out[f"{key}_pred_physical"] = self._physical(key, out[f"{key}_pred"])
-        out["ddq_pred_physical"] = torch.diff(out["dq_pred_physical"], dim=1) / self.dt if out["dq_pred_physical"].shape[1] > 1 else out["dq_pred_physical"].new_zeros(out["dq_pred_physical"].shape)
+        if self.emit_physical_diagnostics:
+            for key in STATE_KEYS:
+                out[f"{key}_pred_physical"] = self._physical(
+                    key, out[f"{key}_pred"]
+                )
+            out["ddq_pred_physical"] = (
+                torch.diff(out["dq_pred_physical"], dim=1) / self.dt
+                if out["dq_pred_physical"].shape[1] > 1
+                else out["dq_pred_physical"].new_zeros(
+                    out["dq_pred_physical"].shape
+                )
+            )
         return total, loss_dict
 
 

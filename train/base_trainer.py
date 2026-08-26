@@ -113,6 +113,7 @@ class BaseTrainer:
         self.cudnn_benchmark = bool(
             self.train_config.get("cudnn_benchmark", False)
         )
+        self.allow_tf32 = bool(self.train_config.get("allow_tf32", False))
         if self.deterministic and self.cudnn_benchmark:
             raise ValueError(
                 "train.deterministic=true is incompatible with "
@@ -150,6 +151,18 @@ class BaseTrainer:
         )
         self.persistent_workers = bool(
             self.train_config.get("persistent_workers", False)
+        )
+        configured_device_batch_keys = self.train_config.get("device_batch_keys")
+        if configured_device_batch_keys is None:
+            self.device_batch_keys = None
+        else:
+            if not isinstance(configured_device_batch_keys, (list, tuple, set)):
+                raise ValueError("train.device_batch_keys must be a sequence or null")
+            self.device_batch_keys = {str(key) for key in configured_device_batch_keys}
+        # Keep scalar metric aggregation on-device until epoch end.  Calling
+        # .item() for every diagnostic on every batch creates a CUDA sync.
+        self.defer_metric_sync = bool(
+            self.train_config.get("defer_metric_sync", False)
         )
         self.prefetch_factor = int(self.train_config.get("prefetch_factor", 2))
         if self.prefetch_factor < 1:
@@ -313,12 +326,20 @@ class BaseTrainer:
 
         torch.backends.cudnn.benchmark = self.cudnn_benchmark
         torch.backends.cudnn.deterministic = self.deterministic
+        # Match the mixed-precision fast path used by the LeRobot trainer
+        # without changing the default behavior of existing configurations.
+        torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
+        torch.backends.cudnn.allow_tf32 = self.allow_tf32
+        torch.set_float32_matmul_precision("high" if self.allow_tf32 else "highest")
 
     def batch_to_device(self, batch):
         new_batch = {}
 
         for k, v in batch.items():
             if torch.is_tensor(v):
+                if self.device_batch_keys is not None and k not in self.device_batch_keys:
+                    new_batch[k] = v
+                    continue
                 # log.info(f"{v} is tensor")
                 new_batch[k] = v.to(
                     self.device,
@@ -791,12 +812,26 @@ class BaseTrainer:
         return 1
 
     @staticmethod
-    def _accumulate_scalar_metrics(metric_sums, metric_counts, metrics, weight):
+    def _accumulate_scalar_metrics(
+        metric_sums,
+        metric_counts,
+        metrics,
+        weight,
+        *,
+        defer_device_sync=False,
+    ):
         for key, value in metrics.items():
             if torch.is_tensor(value):
                 if value.numel() != 1:
                     continue
-                value = value.detach().item()
+                value = value.detach()
+                if defer_device_sync:
+                    # Store scalar tensors and reduce once at epoch end.  A
+                    # list avoids launching a tiny GPU add kernel per metric.
+                    metric_sums.setdefault(key, []).append(value)
+                    metric_counts.setdefault(key, []).append(weight)
+                    continue
+                value = value.item()
             if not isinstance(value, (int, float)):
                 continue
             metric_sums[key] = metric_sums.get(key, 0.0) + float(value) * weight
@@ -804,10 +839,23 @@ class BaseTrainer:
 
     @staticmethod
     def _average_scalar_metrics(metric_sums, metric_counts):
-        return {
-            key: total / max(metric_counts[key], 1)
-            for key, total in metric_sums.items()
-        }
+        result = {}
+        for key, total in metric_sums.items():
+            counts = metric_counts[key]
+            if isinstance(total, list):
+                if not total:
+                    result[key] = 0.0
+                    continue
+                values = torch.stack(total)
+                weights = torch.as_tensor(
+                    counts, device=values.device, dtype=values.dtype
+                )
+                result[key] = (
+                    (values * weights).sum() / weights.sum().clamp_min(1.0)
+                ).item()
+            else:
+                result[key] = total / max(counts, 1)
+        return result
 
     def train_one_epoch(self, epoch):
         self.model.train()
@@ -862,13 +910,15 @@ class BaseTrainer:
             ):
                 self.scheduler.step()
 
-            total_loss += loss.item() * batch_size
+            loss_value = loss.detach().item()
+            total_loss += loss_value * batch_size
             num_samples += batch_size
             self._accumulate_scalar_metrics(
                 metric_sums,
                 metric_counts,
                 out.get("loss_dict") or {},
                 batch_size,
+                defer_device_sync=self.defer_metric_sync,
             )
 
             if self.global_step % self.wandb_log_every_steps == 0:
@@ -884,7 +934,7 @@ class BaseTrainer:
                 self.log_wandb(step_metrics, step=self.global_step)
 
             pbar.set_postfix({
-                "loss": f"{loss.item():.6f}",
+                "loss": f"{loss_value:.6f}",
                 "step": self.global_step,
             })
 
@@ -920,17 +970,19 @@ class BaseTrainer:
                     loss, out = self.compute_loss(batch)
                 batch_size = self._batch_size(batch)
 
-                total_loss += loss.item() * batch_size
+                loss_value = loss.detach().item()
+                total_loss += loss_value * batch_size
                 num_samples += batch_size
                 self._accumulate_scalar_metrics(
                     metric_sums,
                     metric_counts,
                     out.get("loss_dict") or {},
                     batch_size,
+                    defer_device_sync=self.defer_metric_sync,
                 )
 
                 pbar.set_postfix({
-                    "loss": f"{loss.item():.6f}",
+                    "loss": f"{loss_value:.6f}",
                 })
         finally:
             self.model = training_model

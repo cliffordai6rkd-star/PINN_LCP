@@ -173,6 +173,20 @@ class TorqueWorldModel(nn.Module):
             )
         ).lower()
         self.dropout = float(model_config.get("dropout", 0.1))
+        # These switches only control diagnostics and input validation.  They
+        # default to the historical behavior so checkpoints/tests keep the
+        # same public contract; production training can disable the work that
+        # is not part of the objective.
+        self.runtime_checks = bool(model_config.get("runtime_checks", True))
+        self.return_attention_weights = bool(
+            model_config.get("return_attention_weights", True)
+        )
+        self.use_action_padding_mask = bool(
+            model_config.get("use_action_padding_mask", True)
+        )
+        self.emit_contact_probabilities = bool(
+            model_config.get("emit_contact_probabilities", True)
+        )
         self.flow_dim = 4 * self.joint_dim + self.contact_state_count
         self.state_input_dim = len(self.inputs) * self.joint_dim
         self._validate_config()
@@ -287,6 +301,13 @@ class TorqueWorldModel(nn.Module):
             {"action": action}, "action", horizon=self.action_condition_horizon, feature_dim=self.action_dim
         )
         mask = batch.get("action_mask")
+        if not self.use_action_padding_mask:
+            # The direct-action dataset used by the fast training path always
+            # supplies a complete action chunk.  Returning an all-valid mask
+            # preserves pooling semantics while allowing fused attention.
+            return action, torch.ones(
+                action.shape[:2], device=action.device, dtype=torch.bool
+            )
         if mask is None:
             valid = torch.ones(action.shape[:2], device=action.device, dtype=torch.bool)
         else:
@@ -295,10 +316,10 @@ class TorqueWorldModel(nn.Module):
                 raise ValueError(f"action_mask must have shape [B, A], got {actual}")
             valid = mask.to(device=action.device)
             if valid.dtype != torch.bool:
-                if not torch.isfinite(valid.to(dtype=torch.float32)).all():
+                if self.runtime_checks and not torch.isfinite(valid.to(dtype=torch.float32)).all():
                     raise ValueError("action_mask must be finite")
                 valid = valid > 0
-        if torch.any(valid.sum(dim=1) == 0):
+        if self.runtime_checks and torch.any(valid.sum(dim=1) == 0):
             raise ValueError("each sample must contain at least one valid action")
         return action, valid
 
@@ -321,32 +342,60 @@ class TorqueWorldModel(nn.Module):
         action_features, _ = self.action_encoder(masked_action)
         state_tokens = self.state_token_norm(state_features + _sinusoidal_position_encoding(state_features.shape[1], self.hidden_dim, state_features))
         action_tokens = self.action_token_norm(action_features + _sinusoidal_position_encoding(action_features.shape[1], self.hidden_dim, action_features))
-        attended_action, attention_weights = self.state_queries_action(
-            query=state_tokens, key=action_tokens, value=action_tokens,
-            key_padding_mask=~valid_action, need_weights=True, average_attn_weights=False
+        action_padding_mask = (
+            ~valid_action if self.use_action_padding_mask else None
         )
+        return_attention_weights = self.return_attention_weights or not self.training
+        if return_attention_weights:
+            attended_action, attention_weights = self.state_queries_action(
+                query=state_tokens,
+                key=action_tokens,
+                value=action_tokens,
+                key_padding_mask=action_padding_mask,
+                need_weights=True,
+                average_attn_weights=False,
+            )
+        else:
+            attended_action, _ = self.state_queries_action(
+                query=state_tokens,
+                key=action_tokens,
+                value=action_tokens,
+                key_padding_mask=action_padding_mask,
+                need_weights=False,
+            )
+            attention_weights = None
         state_action_features = self.state_action_norm(state_tokens + self.state_action_dropout(attended_action))
         state_action_features = self.state_action_ffn_norm(state_action_features + self.state_action_ffn(state_action_features))
         condition_memory = torch.cat((state_action_features, action_tokens), dim=1)
-        memory_padding_mask = torch.cat(
-            (
-                torch.zeros(state_tokens.shape[0], state_tokens.shape[1], device=state_tokens.device, dtype=torch.bool),
-                ~valid_action,
-            ), dim=1
-        )
+        memory_padding_mask = None
+        if self.use_action_padding_mask:
+            memory_padding_mask = torch.cat(
+                (
+                    torch.zeros(
+                        state_tokens.shape[0],
+                        state_tokens.shape[1],
+                        device=state_tokens.device,
+                        dtype=torch.bool,
+                    ),
+                    ~valid_action,
+                ),
+                dim=1,
+            )
         denominator = valid_action.sum(dim=1, keepdim=True).to(action.dtype)
         pooled_action = (action_tokens * valid_action[..., None]).sum(dim=1) / denominator
         global_condition = self.global_condition_projection(torch.cat((state_hidden[-1], pooled_action), dim=-1))
-        return {
+        result = {
             "state_features": state_tokens,
             "action_features": action_tokens,
             "state_action_features": state_action_features,
-            "state_action_attention_weights": attention_weights,
             "action_mask": valid_action,
             "condition_memory": condition_memory,
             "condition_memory_padding_mask": memory_padding_mask,
             "global_condition": global_condition,
         }
+        if return_attention_weights:
+            result["state_action_attention_weights"] = attention_weights
+        return result
 
     def _target_flow_state(self, batch, reference):
         values = []
@@ -363,7 +412,7 @@ class TorqueWorldModel(nn.Module):
                 actual = None if not torch.is_tensor(contact) else tuple(contact.shape)
                 raise ValueError(f"contact_future must have shape [B, {self.future_horizon}, 1], got {actual}")
             contact = contact.to(device=reference.device, dtype=reference.dtype)
-            if torch.any((contact < 0) | (contact >= self.contact_state_count)):
+            if self.runtime_checks and torch.any((contact < 0) | (contact >= self.contact_state_count)):
                 raise ValueError("contact_future contains an invalid phase")
             index = contact.squeeze(-1).round().to(dtype=torch.long)
             logits = reference.new_full((*index.shape, self.contact_state_count), -float(self.contact_logit_scale))
@@ -391,7 +440,7 @@ class TorqueWorldModel(nn.Module):
             raise ValueError(f"source_noise must have shape {shape}, got {actual}")
         if source_noise.device != reference.device or source_noise.dtype != reference.dtype:
             source_noise = source_noise.to(device=reference.device, dtype=reference.dtype)
-        if not torch.isfinite(source_noise).all():
+        if self.runtime_checks and not torch.isfinite(source_noise).all():
             raise ValueError("source_noise must be finite")
         return source_noise
 
@@ -411,7 +460,9 @@ class TorqueWorldModel(nn.Module):
                 result = result[:, None]
             elif tuple(result.shape) != (batch_size, 1):
                 raise ValueError("flow_time must be scalar, [B], or [B, 1]")
-        if not torch.isfinite(result).all() or torch.any((result < 0) | (result > 1)):
+        if self.runtime_checks and (
+            not torch.isfinite(result).all() or torch.any((result < 0) | (result > 1))
+        ):
             raise ValueError("flow_time must be finite and in [0, 1]")
         return result
 
@@ -441,19 +492,22 @@ class TorqueWorldModel(nn.Module):
         result["state_pred"] = {key: result[f"{key}_pred"] for key in SUPPORTED_INPUTS}
         if self.contact_state_count:
             logits = flow_state[..., offset:offset + self.contact_state_count]
-            probability = torch.softmax(logits, dim=-1)
-            state = probability.argmax(dim=-1, keepdim=True).to(flow_state.dtype)
-            result.update(
-                {
-                    "contact_logits": logits,
-                    "contact_phase_logits": logits,
-                    "contact_probability": probability,
-                    "contact_phase_probability": probability,
-                    "contact_state_pred": state,
-                    "contact_state": state,
-                }
-            )
-            result["state_pred"]["contact_state"] = state
+            result.update({"contact_logits": logits, "contact_phase_logits": logits})
+            # Keep inference output compatibility even when training skips
+            # these diagnostics.  The ordinary training loss only consumes
+            # contact_logits.
+            if self.emit_contact_probabilities or not self.training:
+                probability = torch.softmax(logits, dim=-1)
+                state = probability.argmax(dim=-1, keepdim=True).to(flow_state.dtype)
+                result.update(
+                    {
+                        "contact_probability": probability,
+                        "contact_phase_probability": probability,
+                        "contact_state_pred": state,
+                        "contact_state": state,
+                    }
+                )
+                result["state_pred"]["contact_state"] = state
         return result
 
     def forward(self, batch, *, flow_time=None, source_noise=None):
