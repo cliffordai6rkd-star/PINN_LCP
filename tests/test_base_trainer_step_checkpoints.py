@@ -94,6 +94,39 @@ def test_step_training_defaults_null_top_k(tmp_path):
     assert trainer.top_k == 3
 
 
+def test_cosine_without_tmax_infers_optimizer_steps_and_warmup(tmp_path):
+    config = {
+        "train": {
+            "device": "cpu",
+            "batch_size": 2,
+            "num_workers": 0,
+            "num_epochs": 2,
+            "val_ratio": 0.0,
+            "output_dir": str(tmp_path),
+            "scheduler": {"name": "cosine", "warmup_steps": 2, "eta_min": 0.0},
+            "ema": {"enabled": False},
+            "wandb": {"enabled": False},
+        }
+    }
+    trainer = _Trainer(config)
+    trainer.setup()
+
+    # The toy loader has two batches per epoch, so two epochs imply four
+    # optimizer steps. LambdaLR starts at zero during the warmup.
+    assert trainer.scheduler_total_steps == 4
+    assert trainer.scheduler_warmup_steps == 2
+    assert trainer.scheduler_step_per_optimizer_step is True
+    assert trainer.optimizer.param_groups[0]["lr"] == 0.0
+
+    trainer.train_one_epoch(0)
+    assert trainer.scheduler.last_epoch == 2
+    assert trainer.optimizer.param_groups[0]["lr"] == trainer.lr
+
+    trainer.train_one_epoch(1)
+    assert trainer.scheduler.last_epoch == 4
+    assert trainer.optimizer.param_groups[0]["lr"] == 0.0
+
+
 def test_epoch_training_retains_latest_scheduled_topk(tmp_path):
     config = {
         "train": {

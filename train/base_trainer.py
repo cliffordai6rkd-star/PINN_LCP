@@ -1,6 +1,7 @@
 import argparse
 import copy
 import logging
+import math
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -271,6 +272,12 @@ class BaseTrainer:
                 scheduler_name,
             )
         self.scheduler = None
+        # Cosine schedules without an explicit T_max are step-based.  Keep
+        # this flag separate so legacy epoch-based T_max configs remain
+        # compatible with existing runs.
+        self.scheduler_step_per_optimizer_step = False
+        self.scheduler_total_steps = None
+        self.scheduler_warmup_steps = 0
 
         ema_config = self.train_config.get("ema") or {}
         self.ema_enabled = bool(ema_config.get("enabled", False))
@@ -410,25 +417,78 @@ class BaseTrainer:
             )
         
         if name == "cosine":
-            t_max = int(
-                self.scheduler_config.get(
-                    "T_max",
-                    getattr(self, "max_optimizer_steps", self.num_epochs),
-                )
-            )
             eta_min = float(self.scheduler_config.get("eta_min", 1e-6))
-            if t_max <= 0:
-                raise ValueError("cosine scheduler T_max must be positive")
             if eta_min < 0.0:
                 raise ValueError("cosine scheduler eta_min must be non-negative")
             if eta_min > self.lr:
                 raise ValueError(
                     "cosine scheduler eta_min must not exceed train.lr"
                 )
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
+
+            # Preserve the original epoch/step behavior for configurations
+            # that explicitly provide T_max.  New configs can omit T_max and
+            # get an optimizer-step schedule with automatic total steps.
+            if "T_max" in self.scheduler_config:
+                t_max = int(self.scheduler_config["T_max"])
+                if t_max <= 0:
+                    raise ValueError("cosine scheduler T_max must be positive")
+                return torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=t_max,
+                    eta_min=eta_min,
+                )
+
+            if self.max_optimizer_steps is not None:
+                total_steps = int(self.max_optimizer_steps)
+            elif self.loader is not None:
+                total_steps = int(self.num_epochs) * len(self.loader)
+            else:
+                # This fallback keeps build_scheduler usable in lightweight
+                # callers that construct the optimizer before a data loader.
+                total_steps = int(self.num_epochs)
+            if total_steps <= 0:
+                raise ValueError(
+                    "cosine scheduler requires a positive number of training steps"
+                )
+
+            warmup_steps = int(
+                self.scheduler_config.get(
+                    "warmup_steps",
+                    self.scheduler_config.get("lr_warmup_steps", 0),
+                )
+            )
+            if warmup_steps < 0:
+                raise ValueError("cosine scheduler warmup_steps must be non-negative")
+            if warmup_steps >= total_steps:
+                raise ValueError(
+                    "cosine scheduler warmup_steps must be smaller than total steps"
+                )
+
+            self.scheduler_step_per_optimizer_step = True
+            self.scheduler_total_steps = total_steps
+            self.scheduler_warmup_steps = warmup_steps
+            eta_ratio = eta_min / self.lr if self.lr > 0.0 else 0.0
+            log.info(
+                "cosine scheduler: total_steps=%d warmup_steps=%d "
+                "eta_min=%.2e update=optimizer_step",
+                total_steps,
+                warmup_steps,
+                eta_min,
+            )
+
+            def lr_lambda(current_step):
+                if warmup_steps > 0 and current_step < warmup_steps:
+                    return float(current_step) / float(warmup_steps)
+                progress = float(current_step - warmup_steps) / float(
+                    max(1, total_steps - warmup_steps)
+                )
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return eta_ratio + (1.0 - eta_ratio) * cosine
+
+            return torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer,
-                T_max=t_max,
-                eta_min=eta_min,
+                lr_lambda=lr_lambda,
             )
         raise ValueError(f"Unsupported scheduler: {name}")
 
@@ -903,8 +963,11 @@ class BaseTrainer:
             if self.ema is not None:
                 self.ema.update(self.model, self.global_step)
             if (
-                self.step_based_training
-                and self.scheduler is not None
+                self.scheduler is not None
+                and (
+                    self.step_based_training
+                    or self.scheduler_step_per_optimizer_step
+                )
                 and self.scheduler_config.get("name", "none")
                 != "reduce_on_plateau"
             ):
@@ -1079,7 +1142,10 @@ class BaseTrainer:
                     if monitor_loss is None:
                         monitor_loss = val_loss if val_loss is not None else avg_loss
                     self.scheduler.step(monitor_loss)
-                elif not self.step_based_training:
+                elif (
+                    not self.step_based_training
+                    and not self.scheduler_step_per_optimizer_step
+                ):
                     self.scheduler.step()
 
             current_lr = self.optimizer.param_groups[0]["lr"]
