@@ -32,6 +32,23 @@ class _Trainer(BaseTrainer):
         return loss, {"loss_dict": {"total_loss": loss.detach()}}
 
 
+class _ValidationCountingTrainer(_Trainer):
+    def __init__(self, config):
+        super().__init__(config)
+        self.validation_epochs = []
+
+    def setup(self):
+        super().setup()
+        # The base toy dataset has no episode metadata, so use a sentinel to
+        # exercise validation cadence without changing dataset split logic.
+        self.val_loader = object()
+
+    def validate_one_epoch(self, epoch):
+        self.validation_epochs.append(epoch)
+        self.last_val_epoch_metrics = {"marker": float(epoch)}
+        return float(epoch)
+
+
 def test_step_training_retains_latest_topk_and_latest_file(tmp_path):
     config = {
         "train": {
@@ -125,6 +142,37 @@ def test_cosine_without_tmax_infers_optimizer_steps_and_warmup(tmp_path):
     trainer.train_one_epoch(1)
     assert trainer.scheduler.last_epoch == 4
     assert trainer.optimizer.param_groups[0]["lr"] == 0.0
+
+
+def test_val_every_skips_intermediate_validation_epochs(tmp_path):
+    config = {
+        "dataloader": {},
+        "train": {
+            "device": "cpu",
+            "batch_size": 2,
+            "num_workers": 0,
+            "num_epochs": 5,
+            "val_ratio": 0.0,
+            "val_every": 2,
+            "output_dir": str(tmp_path),
+            "scheduler": None,
+            "ema": {"enabled": False},
+            "wandb": {"enabled": False},
+        }
+    }
+    trainer = _ValidationCountingTrainer(config)
+    trainer.save_loss_plot = lambda: None
+    summary = trainer.train()
+
+    assert trainer.validation_epochs == [0, 2, 4]
+    assert summary["val_every"] == 2
+    assert [item["val_loss"] for item in trainer.loss_history] == [
+        0.0,
+        None,
+        2.0,
+        None,
+        4.0,
+    ]
 
 
 def test_epoch_training_retains_latest_scheduled_topk(tmp_path):

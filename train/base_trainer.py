@@ -80,6 +80,9 @@ class BaseTrainer:
             )
 
         self.val_ratio = float(self.train_config.get("val_ratio", 0.1))
+        self.val_every = int(self.train_config.get("val_every", 1))
+        if self.val_every <= 0:
+            raise ValueError("train.val_every must be a positive integer")
         self.split_mode = self.train_config.get("split_mode", "episode")
         configured_val_episodes = self.train_config.get("val_episode_indices")
         if configured_val_episodes is None:
@@ -1106,7 +1109,16 @@ class BaseTrainer:
                 log.warning("training loader produced no optimizer steps; stopping")
                 break
             train_eval_loss = self.evaluate_train_one_epoch(epoch)
-            val_loss = self.validate_one_epoch(epoch)
+            should_validate = (
+                self.val_loader is not None and epoch % self.val_every == 0
+            )
+            if should_validate:
+                val_loss = self.validate_one_epoch(epoch)
+            else:
+                # Do not retain per-batch diagnostics from an earlier
+                # validation epoch when this epoch intentionally skips val.
+                self.last_val_epoch_metrics = {}
+                val_loss = None
 
             metrics = {
                 "avg_loss": avg_loss,
@@ -1138,10 +1150,17 @@ class BaseTrainer:
             if self.scheduler is not None:
                 name = self.scheduler_config.get("name", "none")
                 if name == "reduce_on_plateau":
-                    monitor_loss = metrics.get(self.scheduler_monitor_key)
-                    if monitor_loss is None:
-                        monitor_loss = val_loss if val_loss is not None else avg_loss
-                    self.scheduler.step(monitor_loss)
+                    # With a validation loader, only advance a plateau
+                    # scheduler on epochs that actually ran validation.  If
+                    # no validation set exists, retain the historical
+                    # fallback to the training loss.
+                    if should_validate or self.val_loader is None:
+                        monitor_loss = metrics.get(self.scheduler_monitor_key)
+                        if monitor_loss is None:
+                            monitor_loss = (
+                                val_loss if val_loss is not None else avg_loss
+                            )
+                        self.scheduler.step(monitor_loss)
                 elif (
                     not self.step_based_training
                     and not self.scheduler_step_per_optimizer_step
@@ -1287,6 +1306,7 @@ class BaseTrainer:
             "last_train_metrics": dict(self.last_train_epoch_metrics),
             "last_train_eval_metrics": dict(self.last_train_eval_epoch_metrics),
             "last_val_metrics": dict(self.last_val_epoch_metrics),
+            "val_every": self.val_every,
             "split": self.current_split_metadata,
             "monitor_key": self.monitor_key,
             "scheduler_monitor_key": self.scheduler_monitor_key,
