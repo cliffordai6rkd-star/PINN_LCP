@@ -8,7 +8,20 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.conda-env/bin/python}"
+# Prefer an explicitly supplied interpreter, then the currently activated
+# Conda environment, and finally the project-local environment.
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  PYTHON_BIN="$PYTHON_BIN"
+elif [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python" ]]; then
+  PYTHON_BIN="$CONDA_PREFIX/bin/python"
+elif [[ -x "$ROOT_DIR/.conda-env/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.conda-env/bin/python"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+else
+  echo "Python was not found. Activate the pinn environment or set PYTHON_BIN=/path/to/python." >&2
+  exit 1
+fi
 TEACHER_CONFIG="${TEACHER_CONFIG:-config/train_cfg/contact_world_model.yaml}"
 OPD_CONFIG="${OPD_CONFIG:-config/train_cfg/contact_world_model_opd.yaml}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"

@@ -114,7 +114,7 @@ train:
   num_workers: 4
   # Epoch-based budget and chronological checkpoint retention.
   num_epochs: 1000
-  checkpoint_every_epochs: 250
+  checkpoint_every_epochs: 200
   val_ratio: 0.1
   # val_episode_indices: [15, 50, 90]
   split_mode: episode
