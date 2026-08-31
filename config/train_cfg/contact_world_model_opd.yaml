@@ -1,6 +1,6 @@
 # Contact WM OPD Student configuration.
 # Train the Teacher first with contact_world_model.yaml, then point
-# distillation.teacher_checkpoint_path to its best checkpoint directory/file.
+# distillation.teacher_checkpoint_path to a Contact World Model v1 checkpoint.
 
 wm_v3_only: true
 
@@ -116,7 +116,7 @@ loss:
 
 distillation:
   enabled: true
-  teacher_checkpoint_path: outputs/contact_world_model_opd_sweep/20260829_005818/teacher/checkpoints/epoch_0001200.pt
+  teacher_checkpoint_path: outputs/contact_world_model_v1/checkpoints
   teacher_steps: 8
   student_steps: 2
   weight: 1.0

@@ -1,12 +1,4 @@
-"""Action-conditioned flow world model for robot joint state.
-
-The public state contract is deliberately small and explicit: ``q``, ``dq``,
-``delta_q`` and ``tau`` are the only supported state streams. ``model.inputs``
-selects which streams are fed to the history encoder, while all four streams
-remain prediction targets. The action condition is the dataset's direct
-``action`` sequence from the dataset.  Pose-action aliases are intentionally
-not accepted by the model contract.
-"""
+"""Action-conditioned flow Contact World Model for robot joint state."""
 
 from __future__ import annotations
 
@@ -17,7 +9,8 @@ import torch
 import torch.nn as nn
 
 
-SUPPORTED_INPUTS = ("q", "dq", "delta_q", "tau")
+SUPPORTED_STATE_STREAMS = ("q", "dq", "delta_q", "tau")
+PREDICTED_STATE_STREAMS = SUPPORTED_STATE_STREAMS
 
 
 def _sinusoidal_position_encoding(length: int, width: int, reference: torch.Tensor):
@@ -97,10 +90,11 @@ class FlowDecoderBlock(nn.Module):
         return trajectory + self.dropout(self.ffn(self.ffn_norm(trajectory)))
 
 
-class TorqueWorldModel(nn.Module):
+class ContactWorldModel(nn.Module):
     """Generate future q/dq/delta_q/tau and contact phase with CFM."""
 
-    SUPPORTED_INPUTS = SUPPORTED_INPUTS
+    SUPPORTED_STATE_STREAMS = SUPPORTED_STATE_STREAMS
+    PREDICTED_STATE_STREAMS = PREDICTED_STATE_STREAMS
     CONDITION_KEYS = ("q", "dq", "delta_q", "tau", "action", "action_mask")
     TARGET_KEYS = (
         "q_future",
@@ -109,7 +103,7 @@ class TorqueWorldModel(nn.Module):
         "tau_future",
         "contact_future",
     )
-    MODEL_VERSION = "torque_world_model_v4"
+    MODEL_VERSION = "contact_world_model_v1"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -117,66 +111,40 @@ class TorqueWorldModel(nn.Module):
             raise TypeError("config must be a mapping")
         data_config = config.get("dataloader") or {}
         model_config = config.get("model") or {}
-        self.history_horizon = int(data_config.get("state_history_horizon", data_config.get("history_horizon", 50)))
-        self.future_horizon = int(data_config.get("prediction_horizon", data_config.get("future_horizon", 40)))
-        self.action_condition_horizon = int(
-            data_config.get("action_condition_horizon", data_config.get("action_horizon", 8))
-        )
+        self.history_horizon = int(data_config.get("state_history_horizon", 50))
+        self.future_horizon = int(data_config.get("prediction_horizon", 40))
+        self.action_condition_horizon = int(data_config.get("action_condition_horizon", 8))
         self.joint_dim = int(model_config.get("joint_dim", 7))
-        self.action_dim = int(model_config.get("action_dim", self.joint_dim))
+        self.action_dim = int(model_config.get("action_dim", 7))
 
-        legacy_contract = str(model_config.get("state_contract", "")).lower()
         configured_inputs = model_config.get("inputs")
         if configured_inputs is None:
-            if legacy_contract == "q_tau_contact":
-                configured_inputs = ["q", "tau"]
-            elif legacy_contract == "q_dq_tau_wrench":
-                configured_inputs = ["q", "dq", "tau"]
-            else:
-                configured_inputs = list(SUPPORTED_INPUTS)
+            raise ValueError("model.inputs is required and must select state streams")
         if isinstance(configured_inputs, str):
             configured_inputs = [configured_inputs]
         self.inputs = tuple(str(value).lower() for value in configured_inputs)
         if not self.inputs:
             raise ValueError("model.inputs must contain at least one state stream")
-        unknown = sorted(set(self.inputs) - set(SUPPORTED_INPUTS))
+        unknown = sorted(set(self.inputs) - set(SUPPORTED_STATE_STREAMS))
         if unknown:
-            raise ValueError(f"model.inputs contains unsupported values {unknown}; choose from {list(SUPPORTED_INPUTS)}")
+            raise ValueError(f"model.inputs contains unsupported values {unknown}; choose from {list(SUPPORTED_STATE_STREAMS)}")
         if len(set(self.inputs)) != len(self.inputs):
             raise ValueError("model.inputs must not contain duplicates")
-
-        configured_wrench_dim = int(model_config.get("wrench_dim", 0) or 0)
-        if configured_wrench_dim != 0:
-            raise ValueError(
-                "model.wrench_dim is no longer supported; use q/dq/delta_q/tau"
-            )
-        # Kept as a compatibility attribute only. No wrench/RNEA path exists.
-        self.wrench_dim = 0
-        self.state_contract = "q_dq_delta_q_tau"
-        self.q_tau_contact_contract = legacy_contract == "q_tau_contact"
         self.contact_state_count = int(model_config.get("contact_state_count", 3))
-        if self.contact_state_count < 0:
-            raise ValueError("model.contact_state_count must be non-negative")
+        if self.contact_state_count != 3:
+            raise ValueError("model.contact_state_count must be exactly 3")
         self.contact_logit_scale = float(model_config.get("contact_logit_scale", 4.0))
         self.hidden_dim = int(model_config.get("hidden_dim", 128))
-        self.state_layers = int(model_config.get("state_layers", model_config.get("num_layers", 2)))
-        self.action_layers = int(model_config.get("action_layers", model_config.get("num_layers", 2)))
+        self.state_layers = int(model_config.get("state_layers", 2))
+        self.action_layers = int(model_config.get("action_layers", 2))
         self.attention_heads = int(model_config.get("attention_heads", 4))
         self.flow_layers = int(model_config.get("flow_layers", 4))
         self.flow_attention_heads = int(model_config.get("flow_attention_heads", self.attention_heads))
         self.flow_ffn_multiplier = int(model_config.get("flow_ffn_multiplier", 4))
         self.flow_inference_steps = int(model_config.get("flow_inference_steps", 8))
         self.flow_solver = str(model_config.get("flow_solver", "heun")).lower()
-        self.flow_source_mode = str(
-            model_config.get(
-                "flow_source_mode", model_config.get("flow_source", "gaussian")
-            )
-        ).lower()
+        self.flow_source_mode = str(model_config.get("flow_source_mode", "gaussian")).lower()
         self.dropout = float(model_config.get("dropout", 0.1))
-        # These switches only control diagnostics and input validation.  They
-        # default to the historical behavior so checkpoints/tests keep the
-        # same public contract; production training can disable the work that
-        # is not part of the objective.
         self.runtime_checks = bool(model_config.get("runtime_checks", True))
         self.return_attention_weights = bool(
             model_config.get("return_attention_weights", True)
@@ -188,14 +156,22 @@ class TorqueWorldModel(nn.Module):
             model_config.get("emit_contact_probabilities", True)
         )
         self.flow_dim = 4 * self.joint_dim + self.contact_state_count
-        self.state_input_dim = len(self.inputs) * self.joint_dim
         self._validate_config()
 
         state_dropout = self.dropout if self.state_layers > 1 else 0.0
         action_dropout = self.dropout if self.action_layers > 1 else 0.0
-        self.state_encoder = nn.GRU(
-            self.state_input_dim, self.hidden_dim, self.state_layers,
-            dropout=state_dropout, batch_first=True
+        self.state_encoders = nn.ModuleDict({
+            key: nn.GRU(
+                self.joint_dim, self.hidden_dim, self.state_layers,
+                dropout=state_dropout, batch_first=True
+            )
+            for key in self.inputs
+        })
+        self.state_fusion = nn.Sequential(
+            nn.LayerNorm(len(self.inputs) * self.hidden_dim),
+            nn.Linear(len(self.inputs) * self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
         )
         self.action_encoder = nn.GRU(
             self.action_dim, self.hidden_dim, self.action_layers,
@@ -203,7 +179,7 @@ class TorqueWorldModel(nn.Module):
         )
         self.state_token_norm = nn.LayerNorm(self.hidden_dim)
         self.action_token_norm = nn.LayerNorm(self.hidden_dim)
-        self.state_queries_action = nn.MultiheadAttention(
+        self.state_to_action_attention = nn.MultiheadAttention(
             self.hidden_dim, self.attention_heads, dropout=self.dropout, batch_first=True
         )
         self.state_action_dropout = nn.Dropout(self.dropout)
@@ -282,16 +258,10 @@ class TorqueWorldModel(nn.Module):
             raise TypeError(f"{key!r} must be floating point")
         return value
 
-    def _state_history(self, batch, key, *, required=False):
-        value = batch.get(key)
-        if value is None:
-            if required or key in self.inputs:
-                raise KeyError(f"missing batch key {key!r}")
-            reference = next((v for v in batch.values() if torch.is_tensor(v) and v.ndim == 3), None)
-            if reference is None:
-                raise ValueError("cannot infer device for a missing state stream")
-            return reference.new_zeros(reference.shape[0], self.history_horizon, self.joint_dim)
-        return self._require_sequence(batch, key, horizon=self.history_horizon, feature_dim=self.joint_dim)
+    def _state_history(self, batch, key):
+        return self._require_sequence(
+            batch, key, horizon=self.history_horizon, feature_dim=self.joint_dim
+        )
 
     def _action_inputs(self, batch):
         action = batch.get("action")
@@ -324,7 +294,7 @@ class TorqueWorldModel(nn.Module):
         return action, valid
 
     def _condition_inputs(self, batch):
-        states = {key: self._state_history(batch, key, required=key in self.inputs) for key in SUPPORTED_INPUTS}
+        states = {key: self._state_history(batch, key) for key in self.inputs}
         action, valid = self._action_inputs(batch)
         reference = states[self.inputs[0]]
         for key, value in states.items():
@@ -336,18 +306,27 @@ class TorqueWorldModel(nn.Module):
 
     def encode_conditions(self, batch: Mapping[str, torch.Tensor]):
         states, action, valid_action = self._condition_inputs(batch)
-        state_input = torch.cat([states[key] for key in self.inputs], dim=-1)
-        state_features, state_hidden = self.state_encoder(state_input)
+        encoded_states = {}
+        for key in self.inputs:
+            encoded_states[key], _ = self.state_encoders[key](states[key])
+        state_features = self.state_fusion(
+            torch.cat([encoded_states[key] for key in self.inputs], dim=-1)
+        )
         masked_action = action.masked_fill(~valid_action[..., None], 0.0)
         action_features, _ = self.action_encoder(masked_action)
-        state_tokens = self.state_token_norm(state_features + _sinusoidal_position_encoding(state_features.shape[1], self.hidden_dim, state_features))
+        state_tokens = self.state_token_norm(
+            state_features
+            + _sinusoidal_position_encoding(
+                state_features.shape[1], self.hidden_dim, state_features
+            )
+        )
         action_tokens = self.action_token_norm(action_features + _sinusoidal_position_encoding(action_features.shape[1], self.hidden_dim, action_features))
         action_padding_mask = (
             ~valid_action if self.use_action_padding_mask else None
         )
         return_attention_weights = self.return_attention_weights or not self.training
         if return_attention_weights:
-            attended_action, attention_weights = self.state_queries_action(
+            attended_action, attention_weights = self.state_to_action_attention(
                 query=state_tokens,
                 key=action_tokens,
                 value=action_tokens,
@@ -356,7 +335,7 @@ class TorqueWorldModel(nn.Module):
                 average_attn_weights=False,
             )
         else:
-            attended_action, _ = self.state_queries_action(
+            attended_action, _ = self.state_to_action_attention(
                 query=state_tokens,
                 key=action_tokens,
                 value=action_tokens,
@@ -383,9 +362,13 @@ class TorqueWorldModel(nn.Module):
             )
         denominator = valid_action.sum(dim=1, keepdim=True).to(action.dtype)
         pooled_action = (action_tokens * valid_action[..., None]).sum(dim=1) / denominator
-        global_condition = self.global_condition_projection(torch.cat((state_hidden[-1], pooled_action), dim=-1))
+        global_condition = self.global_condition_projection(
+            torch.cat((state_features[:, -1], pooled_action), dim=-1)
+        )
         result = {
-            "state_features": state_tokens,
+            "encoded_states": encoded_states,
+            "state_features": state_features,
+            "state_tokens": state_tokens,
             "action_features": action_tokens,
             "state_action_features": state_action_features,
             "action_mask": valid_action,
@@ -399,7 +382,7 @@ class TorqueWorldModel(nn.Module):
 
     def _target_flow_state(self, batch, reference):
         values = []
-        for key in SUPPORTED_INPUTS:
+        for key in PREDICTED_STATE_STREAMS:
             value = self._require_sequence(batch, f"{key}_future", horizon=self.future_horizon, feature_dim=self.joint_dim)
             if value.shape[0] != reference.shape[0] or value.device != reference.device or value.dtype != reference.dtype:
                 raise ValueError(f"{key}_future does not match the condition batch")
@@ -485,29 +468,21 @@ class TorqueWorldModel(nn.Module):
     def _decoded_output(self, flow_state):
         result = {"flow_state_pred": flow_state}
         offset = 0
-        for key in SUPPORTED_INPUTS:
+        for key in PREDICTED_STATE_STREAMS:
             result[f"{key}_pred"] = flow_state[..., offset:offset + self.joint_dim]
             offset += self.joint_dim
-        result["joint_pred"] = flow_state[..., :4 * self.joint_dim]
-        result["state_pred"] = {key: result[f"{key}_pred"] for key in SUPPORTED_INPUTS}
         if self.contact_state_count:
             logits = flow_state[..., offset:offset + self.contact_state_count]
-            result.update({"contact_logits": logits, "contact_phase_logits": logits})
-            # Keep inference output compatibility even when training skips
-            # these diagnostics.  The ordinary training loss only consumes
-            # contact_logits.
+            result["contact_logits"] = logits
             if self.emit_contact_probabilities or not self.training:
                 probability = torch.softmax(logits, dim=-1)
                 state = probability.argmax(dim=-1, keepdim=True).to(flow_state.dtype)
                 result.update(
                     {
                         "contact_probability": probability,
-                        "contact_phase_probability": probability,
                         "contact_state_pred": state,
-                        "contact_state": state,
                     }
                 )
-                result["state_pred"]["contact_state"] = state
         return result
 
     def forward(self, batch, *, flow_time=None, source_noise=None):
@@ -584,6 +559,3 @@ class TorqueWorldModel(nn.Module):
         }
         result.update(self._decoded_output(generated))
         return result
-
-
-ConditionalFlowTorqueWorldModel = TorqueWorldModel

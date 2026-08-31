@@ -269,7 +269,7 @@ class BaseTrainer:
         self.optimizer = None
 
         self.output_dir = Path(
-            self.train_config.get("output_dir", "outputs/torque_world_model")
+            self.train_config.get("output_dir", "outputs/contact_world_model")
         )
         self.ckpt_dir = self.output_dir / "checkpoints"
 
@@ -327,9 +327,7 @@ class BaseTrainer:
                 scheduler_name,
             )
         self.scheduler = None
-        # Cosine schedules without an explicit T_max are step-based.  Keep
-        # this flag separate so legacy epoch-based T_max configs remain
-        # compatible with existing runs.
+        # Cosine schedules without an explicit T_max are step-based.
         self.scheduler_step_per_optimizer_step = False
         self.scheduler_total_steps = None
         self.scheduler_warmup_steps = 0
@@ -644,8 +642,7 @@ class BaseTrainer:
 
         # A run normally contains one checkpoint family.  If both families
         # are present, metadata gives the only reliable cross-family order;
-        # fall back to filename numbering for legacy or partially-written
-        # files.  ``latest.pt`` was handled above.
+        # fall back to filename numbering for partially-written files.
         metadata_candidates = []
         for candidate in checkpoint_files:
             try:
@@ -779,7 +776,7 @@ class BaseTrainer:
         A latest pointer is useful when it is the only file left, but it must
         not be tracked as a retained checkpoint because every subsequent save
         overwrites it.  Scheduled and step checkpoints have deterministic
-        filenames; top-k/legacy checkpoints are matched by their metadata.
+        filenames; top-k checkpoints are matched by their metadata.
         """
 
         checkpoint_path = Path(checkpoint_path)
@@ -908,6 +905,12 @@ class BaseTrainer:
             raise ValueError(
                 f"resume checkpoint must contain a mapping: {checkpoint_path}"
             )
+        expected_model_version = getattr(self.model, "MODEL_VERSION", None)
+        if expected_model_version is not None and checkpoint.get("model_version") != expected_model_version:
+            raise ValueError(
+                f"resume checkpoint model_version {checkpoint.get('model_version')!r} "
+                f"does not match {expected_model_version!r}; retrain with the current model"
+            )
 
         model_state = checkpoint.get("model")
         raw_model_state = checkpoint.get("model_raw")
@@ -968,7 +971,7 @@ class BaseTrainer:
             # Scheduled checkpoints store the number of completed epochs.
             self.resume_epoch = int(checkpoint.get("epoch", 0) or 0)
         else:
-            # Legacy/top-k and optimizer-step checkpoints store the zero-based
+            # Epoch/top-k and optimizer-step checkpoints store the zero-based
             # epoch currently being finalized.
             self.resume_epoch = int(checkpoint.get("epoch", -1) or -1) + 1
         self.resume_epoch = max(self.resume_epoch, 0)
@@ -2028,6 +2031,7 @@ class BaseTrainer:
         )
         checkpoint = {
             "checkpoint_type": "optimizer_step",
+            "model_version": getattr(self.model, "MODEL_VERSION", None),
             "epoch": int(epoch),
             "global_step": step,
             "metrics": metrics,
@@ -2095,7 +2099,8 @@ class BaseTrainer:
             else self.model.state_dict()
         )
         ckpt = {
-            "checkpoint_type": "legacy_epoch",
+            "checkpoint_type": "epoch",
+            "model_version": getattr(self.model, "MODEL_VERSION", None),
             "epoch": epoch,
             "avg_loss": avg_loss,
             "val_loss": val_loss,
@@ -2142,6 +2147,7 @@ class BaseTrainer:
         )
         checkpoint = {
             "checkpoint_type": "scheduled_epoch",
+            "model_version": getattr(self.model, "MODEL_VERSION", None),
             "epoch": epoch,
             "global_step": int(self.global_step),
             "metrics": metrics,
@@ -2214,6 +2220,7 @@ class BaseTrainer:
         )
         ckpt = {
             "checkpoint_type": "topk_epoch",
+            "model_version": getattr(self.model, "MODEL_VERSION", None),
             "epoch": epoch,
             "global_step": self.global_step,
             "monitor_key": self.monitor_key,

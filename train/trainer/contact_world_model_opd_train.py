@@ -1,4 +1,4 @@
-"""Progressive ODE/Flow distillation for the torque world model.
+"""Progressive flow distillation for the Contact World Model.
 
 The Teacher is a frozen multi-step Flow model. The Student matches the Teacher
 endpoint and then matches it again after its own predicted state is written
@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import copy
 import logging
-import re
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Mapping
@@ -19,25 +18,18 @@ from typing import Mapping
 import torch
 import yaml
 
+from model.pinn_model.contact_world_model import PREDICTED_STATE_STREAMS
 from model.pinn_model.contact_gate import (
     ContactGateConfig,
     batched_hysteresis_three_phase_mask,
 )
 from physics.nero_dynamics import load_tau_other_predictor
-from train.trainer.torque_world_model_train import TorqueWorldModelTrainer
+from train.trainer.contact_world_model_train import ContactWorldModelTrainer
 
 
 log = logging.getLogger(__name__)
 
-_CHECKPOINT_SCORE = re.compile(
-    r"_(?:val_loss|train_eval_loss|loss)_"
-    r"([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\.pt$"
-)
-_CHECKPOINT_STEP = re.compile(r"^step_(\d+)\.pt$")
-_CHECKPOINT_EPOCH = re.compile(r"^epoch_(\d+)\.pt$")
-
-
-class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
+class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
     """Train a few-step Student against a frozen multi-step Teacher."""
 
     def __init__(self, config: Mapping):
@@ -264,9 +256,9 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         if checkpoint_path.is_file():
             return checkpoint_path
 
-        candidates = sorted((checkpoint_path / "checkpoints").glob("*.pt"))
+        candidates = sorted((checkpoint_path / "checkpoints").glob("epoch_*.pt"))
         if not candidates:
-            candidates = sorted(checkpoint_path.glob("*.pt"))
+            candidates = sorted(checkpoint_path.glob("epoch_*.pt"))
         if not candidates:
             raise FileNotFoundError(
                 "Teacher checkpoint directory contains no .pt files: "
@@ -275,32 +267,13 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                 "file/directory."
             )
 
-        scored = []
-        stepped = []
-        scheduled_epochs = []
-        for candidate in candidates:
-            match = _CHECKPOINT_SCORE.search(candidate.name)
-            if match is not None:
-                scored.append((float(match.group(1)), candidate))
-            step_match = _CHECKPOINT_STEP.match(candidate.name)
-            if step_match is not None:
-                stepped.append((int(step_match.group(1)), candidate))
-            epoch_match = _CHECKPOINT_EPOCH.match(candidate.name)
-            if epoch_match is not None:
-                scheduled_epochs.append((int(epoch_match.group(1)), candidate))
-        if scheduled_epochs:
-            return max(scheduled_epochs, key=lambda item: (item[0], item[1].name))[1]
-        if stepped:
-            return max(stepped, key=lambda item: item[0])[1]
-        if scored:
-            return min(scored, key=lambda item: item[0])[1]
-        return candidates[0]
+        return max(candidates, key=lambda item: item.name)
 
     @staticmethod
     def _student_model_from_config(config):
-        from model.pinn_model.torque_world_model import TorqueWorldModel
+        from model.pinn_model.contact_world_model import ContactWorldModel
 
-        return TorqueWorldModel(config)
+        return ContactWorldModel(config)
 
     def setup(self):
         super().setup()
@@ -310,27 +283,27 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         teacher_config = checkpoint.get("config", self.config)
         teacher_config = copy.deepcopy(dict(teacher_config))
+        if checkpoint.get("model_version") != "contact_world_model_v1":
+            raise ValueError(
+                "Teacher checkpoint is not a Contact World Model v1 checkpoint; "
+                "retrain the Teacher with the canonical model"
+            )
+        self._validate_teacher_contract(teacher_config, checkpoint)
         teacher_config.setdefault("model", {})["flow_inference_steps"] = self.teacher_steps
         self.teacher = self._student_model_from_config(teacher_config).to(self.device)
         state_dict = checkpoint.get("model") or checkpoint.get("model_raw")
         if not isinstance(state_dict, Mapping):
             raise KeyError("Teacher checkpoint does not contain model weights")
+        if not any(str(key).startswith("state_encoders.") for key in state_dict):
+            raise ValueError(
+                "Teacher checkpoint does not contain independent state encoders; "
+                "retrain it with ContactWorldModel"
+            )
         self.teacher.load_state_dict(state_dict, strict=True)
         self.teacher.eval()
         self.teacher.requires_grad_(False)
-        if (
-            self.teacher.flow_dim != self.model.flow_dim
-            or self.teacher.joint_dim != self.model.joint_dim
-            or self.teacher.action_dim != self.model.action_dim
-            or tuple(self.teacher.inputs) != tuple(self.model.inputs)
-            or self.teacher.contact_state_count != self.model.contact_state_count
-        ):
-            raise ValueError(
-                "Teacher and Student state contracts differ: "
-                f"teacher=(joint={self.teacher.joint_dim}, inputs={self.teacher.inputs}) "
-                f"student=(joint={self.model.joint_dim}, inputs={self.model.inputs}, "
-                f"action={self.model.action_dim})"
-            )
+        if self.teacher.flow_dim != self.model.flow_dim:
+            raise ValueError("Teacher and Student output contracts differ")
         log.info(
             "loaded frozen Teacher=%s (%d steps), Student=%d steps",
             checkpoint_path,
@@ -355,7 +328,7 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                 )
             if self.tau_free_predictor.history_horizon > self.model.history_horizon:
                 raise ValueError(
-                    "rollout contact tau-free history horizon exceeds SWM history: "
+                    "rollout contact tau-free history horizon exceeds model history: "
                     f"{self.tau_free_predictor.history_horizon} > "
                     f"{self.model.history_horizon}"
                 )
@@ -365,11 +338,53 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                 self.tau_free_predictor.history_horizon,
             )
 
+    def _validate_teacher_contract(self, teacher_config, checkpoint):
+        student_model = self.config.get("model") or {}
+        teacher_model = teacher_config.get("model") or {}
+        student_data = self.config.get("dataloader") or {}
+        teacher_data = teacher_config.get("dataloader") or {}
+        fields = {
+            "model.inputs": (tuple(teacher_model.get("inputs", ())), tuple(student_model.get("inputs", ()))),
+            "model.joint_dim": (teacher_model.get("joint_dim"), student_model.get("joint_dim")),
+            "model.action_dim": (teacher_model.get("action_dim"), student_model.get("action_dim")),
+            "model.contact_state_count": (teacher_model.get("contact_state_count"), student_model.get("contact_state_count")),
+            "dataloader.action_key": (teacher_data.get("action_key"), student_data.get("action_key")),
+            "dataloader.action_condition_horizon": (teacher_data.get("action_condition_horizon"), student_data.get("action_condition_horizon")),
+            "train_data.action_alignment": ((teacher_config.get("train_data") or {}).get("action_alignment"), (self.config.get("train_data") or {}).get("action_alignment")),
+            "dataloader.normalize_mode": (teacher_data.get("normalize_mode"), student_data.get("normalize_mode")),
+        }
+        mismatches = {key: value for key, value in fields.items() if value[0] != value[1]}
+        normalizer = checkpoint.get("normalizer")
+        if normalizer is None:
+            mismatches["checkpoint.normalizer"] = ("present", "missing")
+        else:
+            teacher_stats = normalizer.get("stats") if isinstance(normalizer, Mapping) else None
+            student_stats = getattr(getattr(self, "dataset", None), "normalizer", None)
+            student_stats = getattr(student_stats, "stats", None)
+            if not isinstance(teacher_stats, Mapping) or not isinstance(student_stats, Mapping):
+                mismatches["normalizer.stats"] = (type(teacher_stats).__name__, type(student_stats).__name__)
+            else:
+                if set(teacher_stats) != set(student_stats):
+                    mismatches["normalizer.stats.keys"] = (sorted(teacher_stats), sorted(student_stats))
+                else:
+                    for key in teacher_stats:
+                        for statistic in ("mean", "std", "min", "max", "q01", "q99"):
+                            if statistic not in teacher_stats[key] or statistic not in student_stats[key]:
+                                mismatches[f"normalizer.stats.{key}.{statistic}"] = "missing"
+                                break
+                            left = torch.as_tensor(teacher_stats[key][statistic])
+                            right = torch.as_tensor(student_stats[key][statistic]).cpu()
+                            if left.shape != right.shape or not torch.allclose(left, right, rtol=1.0e-5, atol=1.0e-6):
+                                mismatches[f"normalizer.stats.{key}.{statistic}"] = "different"
+                                break
+        if mismatches:
+            raise ValueError(f"Teacher/Student action/state contract mismatch: {mismatches}")
+
     @staticmethod
     def _state_keys(model):
         """Return state streams that can be committed to model history."""
         del model
-        return ["q", "dq", "delta_q", "tau"]
+        return list(PREDICTED_STATE_STREAMS)
 
     def _distillation_terms(self):
         """Return continuous state endpoint terms for OPD.
@@ -379,12 +394,7 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         Teacher/Student regression target.
         """
 
-        terms = [
-            ("q", "q_pred", 1.0),
-            ("dq", "dq_pred", 1.0),
-            ("delta_q", "delta_q_pred", 1.0),
-            ("tau", "tau_pred", 1.0),
-        ]
+        terms = [(key, f"{key}_pred", 1.0) for key in PREDICTED_STATE_STREAMS]
         return tuple(terms)
 
     def _rollout_contact_signal(self, tau_ext):
@@ -653,42 +663,6 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                 next_batch["action_mask"] = batch["action_rollout_mask"][:, next_step]
         return next_batch
 
-    def _write_back_real(self, batch, reference_batch, step):
-        """Advance a legacy teacher-forced history with recorded state data.
-
-        Guided OPD no longer calls this helper for distillation; it remains for
-        compatibility with diagnostics and still advances the action contract
-        when an ``action_rollout`` field is available.
-        """
-
-        next_batch = dict(batch)
-        for key in self._state_keys(self.model):
-            future_key = f"{key}_future"
-            if key not in batch or future_key not in reference_batch:
-                continue
-            history = batch[key]
-            recorded = reference_batch[future_key][:, step : step + 1].detach()
-            next_batch[key] = torch.cat((history[:, 1:], recorded), dim=1)
-        if "contact" in batch and "contact_future" in reference_batch:
-            next_batch["contact"] = torch.cat(
-                (
-                    batch["contact"][:, 1:],
-                    reference_batch["contact_future"][:, step : step + 1].detach(),
-                ),
-                dim=1,
-            )
-        if "action_rollout" in batch:
-            next_step = int(step) + 1
-            action_rollout = batch["action_rollout"]
-            if action_rollout.ndim != 4 or next_step >= action_rollout.shape[1]:
-                raise ValueError(
-                    "action_rollout does not contain the next OPD state chunk"
-                )
-            next_batch["action"] = action_rollout[:, next_step]
-            if "action_rollout_mask" in batch:
-                next_batch["action_mask"] = batch["action_rollout_mask"][:, next_step]
-        return next_batch
-
     def _rollout_distill(
         self,
         batch,
@@ -827,12 +801,12 @@ def main():
         "--config",
         "-c",
         type=Path,
-        default=Path("config/train_cfg/torque_world_model_opd.yaml"),
+        default=Path("config/train_cfg/contact_world_model_opd.yaml"),
     )
     args = parser.parse_args()
     with args.config.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
-    trainer = TorqueWorldModelOPDTrainer(config)
+    trainer = ContactWorldModelOPDTrainer(config)
     summary = trainer.train()
     log.info("\n%s", trainer.format_summary(summary))
 

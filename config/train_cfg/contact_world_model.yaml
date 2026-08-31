@@ -30,7 +30,7 @@ dataloader:
   action_chunk_horizon: 8
   action_start_offset: 1
   action_condition_mode: direct
-  action_key: action.joint
+  action_key: action.ee_pose
   high_timestamp_key: timing.state_timestamp_ns
   anchor_timestamp_key: timing.action_anchor_timestamp_ns
   action_index_key: timing.action_index

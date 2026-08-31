@@ -1,223 +1,61 @@
-from pathlib import Path
-from types import SimpleNamespace
-
+import pytest
 import torch
-import yaml
 
-from model.pinn_model.contact_gate import (
-    ContactGateConfig,
-    hysteresis_three_phase_mask,
+from model.pinn_model.contact_world_model import (
+    ContactWorldModel,
+    PREDICTED_STATE_STREAMS,
+    SUPPORTED_STATE_STREAMS,
 )
-from model.pinn_model.torque_world_model import TorqueWorldModel
-from train.torque_world_model_loss import TorqueWorldModelLoss
-from train.trainer.torque_world_model_opd_train import TorqueWorldModelOPDTrainer
+from train.contact_world_model_loss import ContactWorldModelLoss
 
 
-def _config():
-    return yaml.safe_load(
-        Path("config/train_cfg/contact_world_model.yaml").read_text()
-    )
-
-
-def test_metric_specific_hysteresis_thresholds_are_configurable():
-    config = _config()
-    config["contact_gate"]["metric"] = "tau_ext_l1"
-    gate = ContactGateConfig.from_config(config)
-    assert gate.off_threshold == 0.15
-    assert gate.on_threshold == 0.75
-
-
-def test_three_phase_hysteresis_has_precontact_and_confirmation():
-    values = torch.tensor([0.0, 0.4, 0.8, 1.6, 1.7, 1.0, 0.2, 0.2])
-    labels = hysteresis_three_phase_mask(
-        values,
-        off_threshold=0.3,
-        on_threshold=1.5,
-        consecutive_frames=2,
-    )
-    torch.testing.assert_close(
-        labels,
-        torch.tensor([0.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.0, 0.0]),
-    )
-
-
-def test_contact_world_model_does_not_require_dq_and_backpropagates():
-    config = _config()
-    config["dataloader"]["normalize_mode"] = None
-    model = TorqueWorldModel(config)
-    loss_fn = TorqueWorldModelLoss(config)
-    loss_fn.set_contact_class_weights([1.0, 2.0, 1.0])
-    batch = {
-        "q": torch.randn(2, 50, 7),
-        "tau": torch.randn(2, 50, 7),
-        "target_relative_pose": torch.randn(2, 8, 21),
-        "target_relative_pose_mask": torch.ones(2, 8, dtype=torch.bool),
-        "q_future": torch.randn(2, 32, 7),
-        "tau_future": torch.randn(2, 32, 7),
-        "contact_future": torch.randint(0, 3, (2, 32, 1)).float(),
+def config(inputs=None):
+    return {
+        "dataloader": {"state_history_horizon": 5, "prediction_horizon": 4, "action_condition_horizon": 3, "high_fps": 100, "normalize_mode": None},
+        "model": {"inputs": list(inputs or SUPPORTED_STATE_STREAMS), "joint_dim": 2, "action_dim": 2, "contact_state_count": 3, "hidden_dim": 8, "state_layers": 1, "action_layers": 1, "attention_heads": 2, "flow_layers": 1, "flow_attention_heads": 2, "flow_ffn_multiplier": 2, "flow_inference_steps": 2, "flow_solver": "heun", "flow_source_mode": "gaussian", "dropout": 0.0},
+        "loss": {"dt": 0.01, "kinematic_consistency_weight": 0.01, "ddq_smoothness_weight": 0.01},
     }
-    output = model(batch, flow_time=0.5)
-    assert output["contact_logits"].shape == (2, 32, 3)
-    loss, metrics = loss_fn(output, batch)
+
+
+def batch(cfg):
+    b, h, f, d, a = 2, 5, 4, 2, 3
+    out = {key: torch.randn(b, h, d) for key in cfg["model"]["inputs"]}
+    out.update({f"{key}_future": torch.randn(b, f, d) for key in PREDICTED_STATE_STREAMS})
+    out.update(action=torch.randn(b, a, d), action_mask=torch.ones(b, a, dtype=torch.bool), contact_future=torch.randint(0, 3, (b, f, 1)).float())
+    return out
+
+
+@pytest.mark.parametrize("inputs,count", [(["q", "dq", "delta_q", "tau"], 4), (["q", "tau"], 2)])
+def test_independent_state_encoders_and_fused_shapes(inputs, count):
+    cfg = config(inputs)
+    model = ContactWorldModel(cfg)
+    assert len(model.state_encoders) == count
+    assert tuple(model.state_encoders) == tuple(inputs)
+    assert model.state_encoders[inputs[0]] is not model.state_encoders[inputs[-1]]
+    first = {id(parameter) for parameter in model.state_encoders[inputs[0]].parameters()}
+    assert first.isdisjoint(id(parameter) for parameter in model.state_encoders[inputs[-1]].parameters())
+    output = model(batch(cfg), flow_time=0.5)
+    assert output["state_features"].shape == (2, 5, 8)
+    assert output["condition_memory"].shape == (2, 8, 8)
+    assert model.state_to_action_attention.embed_dim == 8
+
+
+def test_flow_targets_and_contact_are_separate():
+    cfg = config()
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    output = model(values, flow_time=0.5)
+    assert output["flow_velocity_pred"].shape == (2, 4, 11)
+    assert output["contact_logits"].shape == (2, 4, 3)
+    loss, metrics = ContactWorldModelLoss(cfg)(output, values)
     loss.backward()
-    assert model.state_encoder.input_size == 14
-    assert output["dq_pred_physical"].shape == (2, 32, 7)
-    assert output["ddq_pred_physical"].shape == (2, 32, 7)
-    assert "dq_loss" in metrics and "ddq_loss" in metrics
+    assert "flow_contact_loss" not in metrics
+    assert "contact_loss" in metrics
 
 
-def test_q_only_estimator_gives_zero_derivative_residual_for_matching_q():
-    config = _config()
-    config["dataloader"]["normalize_mode"] = None
-    loss_fn = TorqueWorldModelLoss(config)
-    batch = {
-        "q": torch.randn(1, 50, 7),
-        "q_future": torch.randn(1, 32, 7),
-        "tau_future": torch.randn(1, 32, 7),
-        "contact_future": torch.zeros(1, 32, 1),
-    }
-    q = batch["q_future"]
-    out = {
-        "flow_velocity_pred": torch.zeros(1, 32, 17),
-        "flow_velocity_target": torch.zeros(1, 32, 17),
-        "q_pred": q,
-        "tau_pred": batch["tau_future"],
-        "contact_logits": torch.zeros(1, 32, 3),
-    }
-    loss_fn.set_contact_class_weights([1.0, 1.0, 1.0])
-    _, metrics = loss_fn(out, batch)
-    assert float(metrics["dq_loss"]) == 0.0
-    assert float(metrics["ddq_loss"]) == 0.0
-
-
-def test_contact_opd_distills_contact_logits_without_dq_history():
-    config = _config()
-    config["dataloader"]["normalize_mode"] = None
-    config["model"]["flow_inference_steps"] = 2
-    student = TorqueWorldModel(config)
-    teacher = TorqueWorldModel(config)
-    trainer = TorqueWorldModelOPDTrainer.__new__(TorqueWorldModelOPDTrainer)
-    trainer.model = student
-    trainer.teacher = teacher
-    trainer.teacher_steps = 8
-    trainer.student_steps = 2
-    trainer.contact_distill_weight = 1.0
-    trainer.pose_dynamics = None
-    trainer.action_condition_features = ()
-    batch = {
-        "q": torch.randn(1, 50, 7),
-        "tau": torch.randn(1, 50, 7),
-        "target_relative_pose": torch.randn(1, 8, 21),
-        "target_relative_pose_mask": torch.ones(1, 8, dtype=torch.bool),
-        "q_future": torch.randn(1, 32, 7),
-        "tau_future": torch.randn(1, 32, 7),
-        "contact_future": torch.randint(0, 3, (1, 32, 1)).float(),
-    }
-    loss, output = trainer._endpoint_distill(batch)
-    loss.backward()
-    next_batch = trainer._write_back(batch, output)
-    teacher_batch = trainer._write_back_real(batch, batch, 0)
-    assert output["contact_logits"].shape == (1, 32, 3)
-    assert next_batch["q"].shape == batch["q"].shape
-    assert teacher_batch["tau"].shape == batch["tau"].shape
-    assert "dq" not in next_batch
-
-
-def test_opd_write_back_reanchors_action_chunk_for_next_state():
-    trainer = TorqueWorldModelOPDTrainer.__new__(TorqueWorldModelOPDTrainer)
-    trainer.model = SimpleNamespace()
-    batch = {
-        key: torch.zeros(1, 4, 2)
-        for key in ("q", "dq", "delta_q", "tau")
-    }
-    batch.update(
-        {
-            "action": torch.zeros(1, 3, 2),
-            "action_mask": torch.ones(1, 3),
-            "action_rollout": torch.tensor(
-                [[[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
-                  [[2.0, 2.0], [2.0, 2.0], [2.0, 2.0]]]]
-            ),
-            "action_rollout_mask": torch.ones(1, 2, 3),
-        }
-    )
-    student_out = {
-        f"{key}_pred": torch.ones(1, 2, 2)
-        for key in ("q", "dq", "delta_q", "tau")
-    }
-
-    next_batch = trainer._write_back(batch, student_out, rollout_step=0)
-
-    torch.testing.assert_close(next_batch["action"], batch["action_rollout"][:, 1])
-    torch.testing.assert_close(
-        next_batch["action_mask"], batch["action_rollout_mask"][:, 1]
-    )
-
-
-def test_opd_student_fk_only_evaluates_committed_first_prediction():
-    trainer = TorqueWorldModelOPDTrainer.__new__(TorqueWorldModelOPDTrainer)
-    calls = []
-
-    class FakePoseDynamics:
-        def frame_poses(self, q):
-            calls.append(tuple(q.shape))
-            return torch.zeros(*q.shape[:-1], 7)
-
-    trainer.model = SimpleNamespace(q_tau_contact_contract=True, wrench_dim=0)
-    trainer.pose_dynamics = FakePoseDynamics()
-    trainer.action_condition_features = ("relative_pose",)
-    trainer.loss_calculator = SimpleNamespace(_physical=lambda key, value: value)
-    trainer.dataset = SimpleNamespace(_normalize=lambda key, value: value)
-    batch = {
-        "q": torch.randn(2, 50, 7),
-        "tau": torch.randn(2, 50, 7),
-        "target_pose_abs": torch.randn(2, 8, 7),
-        "target_relative_pose": torch.randn(2, 8, 7),
-        "current_ee_pose": torch.randn(2, 50, 7),
-    }
-    student_out = {
-        "q_pred": torch.randn(2, 32, 7),
-        "tau_pred": torch.randn(2, 32, 7),
-    }
-
-    next_batch = trainer._write_back(batch, student_out)
-
-    assert calls == [(2, 1, 7)]
-    assert next_batch["current_ee_pose"].shape == (2, 50, 7)
-
-
-def test_opd_real_rollout_reuses_cached_future_pose_without_fk():
-    trainer = TorqueWorldModelOPDTrainer.__new__(TorqueWorldModelOPDTrainer)
-    calls = []
-
-    class FakePoseDynamics:
-        def frame_poses(self, q):
-            calls.append(tuple(q.shape))
-            return torch.zeros(*q.shape[:-1], 7)
-
-    trainer.model = SimpleNamespace(q_tau_contact_contract=True, wrench_dim=0)
-    trainer.pose_dynamics = FakePoseDynamics()
-    trainer.action_condition_features = ("relative_pose",)
-    trainer.loss_calculator = SimpleNamespace(_physical=lambda key, value: value)
-    trainer.dataset = SimpleNamespace(_normalize=lambda key, value: value)
-    batch = {
-        "q": torch.randn(2, 50, 7),
-        "tau": torch.randn(2, 50, 7),
-        "target_pose_abs": torch.randn(2, 8, 7),
-        "target_relative_pose": torch.randn(2, 8, 7),
-        "current_ee_pose": torch.randn(2, 50, 7),
-    }
-    reference_batch = {
-        **batch,
-        "q_future": torch.randn(2, 32, 7),
-        "tau_future": torch.randn(2, 32, 7),
-        "current_ee_pose_future": torch.randn(2, 32, 7),
-    }
-
-    next_batch = trainer._write_back_real(batch, reference_batch, 3)
-
-    assert calls == []
-    torch.testing.assert_close(
-        next_batch["current_ee_pose"][:, -1],
-        reference_batch["current_ee_pose_future"][:, 3],
-    )
+def test_missing_selected_state_is_rejected_without_zero_fill():
+    cfg = config(["q", "tau"])
+    values = batch(cfg)
+    del values["tau"]
+    with pytest.raises(KeyError, match="tau"):
+        ContactWorldModel(cfg)(values)

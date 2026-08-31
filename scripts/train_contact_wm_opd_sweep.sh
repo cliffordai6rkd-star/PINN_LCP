@@ -351,16 +351,6 @@ PY
       | head -n "$TEACHER_TOP_K_COUNT"
   )
   if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 ]]; then
-    mapfile -t TEACHER_CHECKPOINTS < <(
-      find "$TEACHER_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'step_*.pt' -printf '%f\n' \
-        | sort -V -r \
-        | head -n "$TEACHER_TOP_K_COUNT"
-    )
-  fi
-  if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 && -f "$TEACHER_CHECKPOINT_DIR/latest.pt" ]]; then
-    TEACHER_CHECKPOINTS=("latest.pt")
-  fi
-  if [[ "${#TEACHER_CHECKPOINTS[@]}" -eq 0 ]]; then
     echo "No Teacher epoch/step checkpoints found under: $TEACHER_CHECKPOINT_DIR" >&2
     exit 1
   fi
@@ -387,7 +377,7 @@ for checkpoint_name in "${TEACHER_CHECKPOINTS[@]}"; do
   echo "Distilling Teacher checkpoint: $checkpoint_path"
   render_student_config "$checkpoint_path" "$student_output_dir" "$student_config"
   PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" \
-    train/trainer/torque_world_model_opd_train.py \
+    train/trainer/contact_world_model_opd_train.py \
     --config "$student_config" 2>&1 | tee "${TEE_APPEND[@]}" "$student_log"
 done
 

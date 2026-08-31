@@ -1,6 +1,5 @@
-# A checkpoint file can be given directly. For epoch-based Flow WM directories,
-# the newest epoch_*.pt is selected; step and legacy loss files are fallbacks.
-checkpoint_path: outputs/torque_world_model_v4_opd/checkpoints
+# A canonical Contact World Model checkpoint file or epoch directory.
+checkpoint_path: outputs/contact_world_model_v1/checkpoints
 
 dataset:
   v3_only: true
@@ -32,7 +31,7 @@ selection:
   max_total_rollouts: null
 
 plot:
-  output_dir: outputs/torque_world_model_rollout
+  output_dir: outputs/contact_world_model_rollout
   signals: [q, dq, delta_q, tau, contact]
   dpi: 160
   subplot_columns: 2

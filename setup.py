@@ -4,7 +4,7 @@ from setuptools import find_namespace_packages, setup
 setup(
     name="lcp-pinn",
     version="0.1.0",
-    description="Action-conditioned torque world model for Nero robot dynamics",
+    description="Action-conditioned Contact World Model for Nero robot dynamics",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     python_requires=">=3.10,<3.12",
@@ -60,9 +60,9 @@ setup(
             "pinn-build-offline-labels=data_process.tool.build_offline_tau_labels:main",
             "pinn-train-tau-other=train.trainer.tau_other_sequence_train:main",
             "pinn-train-tau-free-v2=train.trainer.tau_free_sequence_train_v2:main",
-            "pinn-train-wm=train.trainer.torque_world_model_train:main",
-            "pinn-train-wm-opd=train.trainer.torque_world_model_opd_train:main",
-            "pinn-wm-rollout=data_process.tool.torque_world_model_rollout_visualizer:main",
+            "pinn-train-contact-wm=train.trainer.contact_world_model_train:main",
+            "pinn-train-contact-wm-opd=train.trainer.contact_world_model_opd_train:main",
+            "pinn-contact-wm-rollout=data_process.tool.contact_world_model_rollout_visualizer:main",
         ]
     },
 )

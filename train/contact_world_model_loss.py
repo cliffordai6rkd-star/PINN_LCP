@@ -1,6 +1,6 @@
 """Data losses for the q/dq/delta_q/tau/contact world model.
 
-There is deliberately no dynamics/RNEA branch here.  ``delta_q`` is a real
+``delta_q`` is a real
 dataset channel and is supervised directly; it is never reconstructed from a
 predicted q trajectory.  The optional kinematic and velocity-smoothness terms
 are soft regularizers only.
@@ -14,11 +14,10 @@ from typing import Mapping
 import torch
 import torch.nn.functional as F
 
+from model.pinn_model.contact_world_model import PREDICTED_STATE_STREAMS
 
-STATE_KEYS = ("q", "dq", "delta_q", "tau")
 
-
-class TorqueWorldModelLoss:
+class ContactWorldModelLoss:
     """Combine flow matching, direct state MSE and contact CE."""
 
     def __init__(self, config: Mapping):
@@ -28,6 +27,8 @@ class TorqueWorldModelLoss:
         loss_config = config.get("loss") or {}
         self.joint_dim = int(model_config.get("joint_dim", 7))
         self.contact_state_count = int(model_config.get("contact_state_count", 3))
+        if self.contact_state_count != 3:
+            raise ValueError("model.contact_state_count must be exactly 3")
         self.normalize_mode = data_config.get("normalize_mode")
         self.flow_weight = float(loss_config.get("flow_weight", 1.0))
         self.flow_q_weight = float(loss_config.get("flow_q_weight", 1.0))
@@ -42,9 +43,7 @@ class TorqueWorldModelLoss:
         self.kinematic_consistency_weight = float(
             loss_config.get("kinematic_consistency_weight", 0.0)
         )
-        self.ddq_smoothness_weight = float(
-            loss_config.get("ddq_smoothness_weight", loss_config.get("ddq_weight", 0.0))
-        )
+        self.ddq_smoothness_weight = float(loss_config.get("ddq_smoothness_weight", 0.0))
         self.ddq_smoothness_warmup_steps = int(
             loss_config.get("ddq_smoothness_warmup_steps", 1000)
         )
@@ -54,9 +53,7 @@ class TorqueWorldModelLoss:
         self.ddq_smoothness_normalize = bool(
             loss_config.get("ddq_smoothness_normalize", True)
         )
-        self.emit_physical_diagnostics = bool(
-            loss_config.get("emit_physical_diagnostics", True)
-        )
+        self.emit_physical_diagnostics = bool(loss_config.get("emit_physical_diagnostics", False))
         self._global_step = 0
         self._ddq_smoothness_factor = 0.0 if self.ddq_smoothness_warmup_steps > 0 else 1.0
         self.dt = float(
@@ -68,9 +65,6 @@ class TorqueWorldModelLoss:
                 ),
             )
         )
-        estimator_dt = (model_config.get("state_estimator") or {}).get("sampling_dt")
-        if "dt" not in loss_config and estimator_dt is not None:
-            self.dt = float(estimator_dt)
         self.normalizer = None
 
         contact_config = config.get("contact_gate") or {}
@@ -86,9 +80,6 @@ class TorqueWorldModelLoss:
                     f"contact class weights must contain {self.contact_state_count} values"
                 )
             self.contact_class_weights = values
-        # Legacy binary option is retained as a no-op compatibility property.
-        self.contact_positive_class_weight_is_auto = False
-        self.contact_positive_class_weight = None
         self._validate()
 
     def _validate(self):
@@ -125,9 +116,6 @@ class TorqueWorldModelLoss:
         self.contact_class_weights = values
         self.contact_class_weights_is_auto = False
 
-    def set_contact_positive_class_weight(self, value: float):
-        self.contact_positive_class_weight = float(value)
-
     def set_global_step(self, global_step: int):
         self._global_step = max(int(global_step), 0)
         if self.ddq_smoothness_warmup_steps <= 0:
@@ -140,7 +128,7 @@ class TorqueWorldModelLoss:
     @staticmethod
     def _required(batch, key, ndim=3):
         if key not in batch:
-            raise KeyError(f"torque world-model loss requires {key!r}")
+            raise KeyError(f"contact world-model loss requires {key!r}")
         value = batch[key]
         if not torch.is_tensor(value) or value.ndim != ndim:
             shape = tuple(value.shape) if torch.is_tensor(value) else type(value)
@@ -163,7 +151,7 @@ class TorqueWorldModelLoss:
     def _flow_slices(self):
         slices = {}
         offset = 0
-        for key in STATE_KEYS:
+        for key in PREDICTED_STATE_STREAMS:
             slices[key] = slice(offset, offset + self.joint_dim)
             offset += self.joint_dim
         slices["contact"] = slice(offset, offset + self.contact_state_count)
@@ -176,7 +164,7 @@ class TorqueWorldModelLoss:
         losses = {
             key: F.mse_loss(prediction[..., sl], target[..., sl])
             for key, sl in slices.items()
-            if key in STATE_KEYS
+            if key in PREDICTED_STATE_STREAMS
         }
         zero = prediction.new_zeros(())
         total = (
@@ -191,7 +179,7 @@ class TorqueWorldModelLoss:
 
     def _direct_losses(self, out, batch):
         result = {}
-        for key in STATE_KEYS:
+        for key in PREDICTED_STATE_STREAMS:
             prediction = self._required(out, f"{key}_pred")
             target = self._required(batch, f"{key}_future").to(device=prediction.device, dtype=prediction.dtype)
             if prediction.shape != target.shape:
@@ -200,7 +188,7 @@ class TorqueWorldModelLoss:
         return result
 
     def _contact_loss(self, out, batch, reference):
-        if self.contact_state_count <= 0 or "contact_logits" not in out:
+        if "contact_logits" not in out:
             return reference.new_zeros(())
         target = self._required(batch, "contact_future").to(device=reference.device)
         labels = target.squeeze(-1).round().long().clamp(0, self.contact_state_count - 1)
@@ -213,7 +201,7 @@ class TorqueWorldModelLoss:
         return F.cross_entropy(logits.reshape(-1, self.contact_state_count), labels.reshape(-1), weight=weight)
 
     def _kinematic_consistency(self, out, batch):
-        if self.kinematic_consistency_weight <= 0.0:
+        if self.kinematic_consistency_weight <= 0.0 or "dq" not in batch:
             return out["q_pred"].new_zeros(())
         q_future = self._physical("q", self._required(out, "q_pred"))
         dq_future = self._physical("dq", self._required(out, "dq_pred"))
@@ -269,15 +257,6 @@ class TorqueWorldModelLoss:
             delta=self.ddq_smoothness_huber_delta,
         )
 
-    # Diagnostic compatibility helper. It intentionally does not derive
-    # delta_q; callers get the explicitly predicted stream instead.
-    def _derived_state(self, out, batch):
-        q_history = self._physical("q", self._required(batch, "q"))
-        q_future = self._physical("q", self._required(out, "q_pred"))
-        dq_future = self._physical("dq", self._required(out, "dq_pred"))
-        ddq = torch.diff(dq_future, dim=1) / self.dt if dq_future.shape[1] > 1 else dq_future.new_zeros(dq_future.shape)
-        return q_history, q_future, dq_future, ddq
-
     def __call__(self, out, batch):
         flow_prediction = out.get("flow_velocity_pred")
         flow_target = out.get("flow_velocity_target")
@@ -315,7 +294,7 @@ class TorqueWorldModelLoss:
             "ddq_smoothness_factor": flow_loss.new_tensor(self._ddq_smoothness_factor),
         }
         if self.emit_physical_diagnostics:
-            for key in STATE_KEYS:
+            for key in PREDICTED_STATE_STREAMS:
                 out[f"{key}_pred_physical"] = self._physical(
                     key, out[f"{key}_pred"]
                 )
@@ -327,6 +306,3 @@ class TorqueWorldModelLoss:
                 )
             )
         return total, loss_dict
-
-
-WorldModelLoss = TorqueWorldModelLoss

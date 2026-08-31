@@ -1,9 +1,9 @@
-"""Offline rollout inference and plots for the torque world model.
+"""Offline rollout inference and plots for the Contact World Model.
 
 The model is rolled out from real 100 Hz history windows with the direct
-25 Hz action chunk supplied by :class:`TorqueWorldModelDataset`. Predictions
+25 Hz action chunk supplied by :class:`ContactWorldModelDataset`. Predictions
 are denormalized and plotted as q/dq/delta_q/tau plus contact phase. No
-derived delta_q or dynamics/RNEA quantity is introduced at inference time.
+derived state or dynamics quantity is introduced at inference time.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import copy
 import json
 import logging
 import math
-import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -33,8 +32,8 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from data_process.world_model_dataset import TorqueWorldModelDataset
-from model.pinn_model.torque_world_model import TorqueWorldModel
+from data_process.contact_world_model_dataset import ContactWorldModelDataset
+from model.pinn_model.contact_world_model import ContactWorldModel
 from train.nomalizer import Normalizer
 
 
@@ -79,53 +78,18 @@ def load_yaml_config(path: str | Path) -> dict:
     return dict(config)
 
 
-_CHECKPOINT_SCORE = re.compile(
-    r"_(?:val_loss|train_eval_loss|loss)_"
-    r"([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\.pt$"
-)
-_CHECKPOINT_STEP = re.compile(r"^step_(\d+)\.pt$")
-_CHECKPOINT_EPOCH = re.compile(r"^epoch_(\d+)\.pt$")
-
-
 def resolve_checkpoint_path(path: str | Path) -> Path:
-    """Resolve a file, newest epoch/step checkpoint, or best legacy file."""
+    """Resolve a Contact World Model checkpoint file or directory."""
 
     path = Path(path).expanduser()
     if path.is_file():
         return path.resolve()
     if not path.is_dir():
         raise FileNotFoundError(f"checkpoint path does not exist: {path}")
-    candidates = sorted(path.glob("*.pt"))
+    candidates = sorted(path.glob("epoch_*.pt"))
     if not candidates:
-        raise FileNotFoundError(f"checkpoint directory has no .pt files: {path}")
-    scored = []
-    stepped = []
-    scheduled_epochs = []
-    for candidate in candidates:
-        match = _CHECKPOINT_SCORE.search(candidate.name)
-        if match is not None:
-            scored.append((float(match.group(1)), candidate))
-        step_match = _CHECKPOINT_STEP.match(candidate.name)
-        if step_match is not None:
-            stepped.append((int(step_match.group(1)), candidate))
-        epoch_match = _CHECKPOINT_EPOCH.match(candidate.name)
-        if epoch_match is not None:
-            scheduled_epochs.append((int(epoch_match.group(1)), candidate))
-    if scheduled_epochs:
-        return max(scheduled_epochs, key=lambda item: (item[0], item[1].name))[1].resolve()
-    if stepped:
-        return max(stepped, key=lambda item: (item[0], item[1].name))[1].resolve()
-    if scored:
-        return min(scored, key=lambda item: (item[0], item[1].name))[1].resolve()
-    latest = path / "latest.pt"
-    if latest.is_file():
-        return latest.resolve()
-    if len(candidates) == 1:
-        return candidates[0].resolve()
-    raise ValueError(
-        "checkpoint directory contains multiple files without a numeric loss "
-        f"suffix; configure one explicit checkpoint file: {path}"
-    )
+        raise FileNotFoundError(f"Contact World Model checkpoint directory has no epoch_*.pt files: {path}")
+    return max(candidates, key=lambda item: item.name).resolve()
 
 
 def _checkpoint_normalizer(checkpoint: Mapping) -> Normalizer:
@@ -173,8 +137,8 @@ def load_model_and_dataset(
     Path,
     Mapping,
     dict,
-    TorqueWorldModel,
-    TorqueWorldModelDataset,
+    ContactWorldModel,
+    ContactWorldModelDataset,
     Normalizer,
     torch.device,
 ]:
@@ -182,6 +146,8 @@ def load_model_and_dataset(
 
     checkpoint_path = resolve_checkpoint_path(rollout_config["checkpoint_path"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("model_version") != "contact_world_model_v1" or not any(str(key).startswith("state_encoders.") for key in (checkpoint.get("model") or {})):
+        raise ValueError("checkpoint is not a canonical ContactWorldModel checkpoint")
     checkpoint_config = checkpoint.get("config")
     if not isinstance(checkpoint_config, Mapping):
         raise KeyError("world-model checkpoint is missing config")
@@ -189,7 +155,7 @@ def load_model_and_dataset(
 
     inference_config = rollout_config.get("inference") or {}
     device = _requested_device(str(inference_config.get("device", "cuda:0")))
-    model = TorqueWorldModel(checkpoint_config)
+    model = ContactWorldModel(checkpoint_config)
     weights = str(inference_config.get("weights", "ema")).lower()
     if weights in {"ema", "model"}:
         state_dict = checkpoint.get("model")
@@ -209,7 +175,7 @@ def load_model_and_dataset(
         dataset_overrides,
     )
     normalizer = _checkpoint_normalizer(checkpoint)
-    dataset = TorqueWorldModelDataset(
+    dataset = ContactWorldModelDataset(
         effective_config,
         normalizer=normalizer,
         compute_normalizer=False,
@@ -246,7 +212,7 @@ def _episode_index(episode: Mapping, fallback: int) -> int:
 
 
 def select_rollout_indices(
-    dataset: TorqueWorldModelDataset,
+    dataset: ContactWorldModelDataset,
     selection_config: Mapping | None,
 ) -> list[int]:
     """Select dataset sample indices episode-by-episode at a fixed row stride."""
@@ -404,7 +370,7 @@ def plot_signal_comparison(
     plt.close(figure)
 
 
-def _sample_episode_lookup(dataset: TorqueWorldModelDataset) -> dict[int, int]:
+def _sample_episode_lookup(dataset: ContactWorldModelDataset) -> dict[int, int]:
     result = {}
     for fallback, episode in enumerate(dataset.episodes):
         episode_index = _episode_index(episode, fallback)
@@ -447,7 +413,7 @@ def run_rollout(rollout_config: Mapping) -> dict:
         raise ValueError("batch_size/flow_steps must be positive and num_workers non-negative")
 
     output_dir = Path(
-        plot_config.get("output_dir", "outputs/torque_world_model_rollout")
+        plot_config.get("output_dir", "outputs/contact_world_model_rollout")
     ).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     dpi = int(plot_config.get("dpi", 160))
@@ -590,13 +556,13 @@ def run_rollout(rollout_config: Mapping) -> dict:
 
 def parse_args(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser(
-        description="Run and plot 100 Hz torque-world-model rollouts."
+        description="Run and plot 100 Hz Contact World Model rollouts."
     )
     parser.add_argument(
         "--config",
         "-c",
         type=Path,
-        default=Path("config/inference_cfg/torque_world_model_rollout.yaml"),
+        default=Path("config/inference_cfg/contact_world_model_rollout.yaml"),
     )
     return parser.parse_args(argv)
 

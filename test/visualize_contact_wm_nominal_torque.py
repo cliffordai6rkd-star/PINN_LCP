@@ -55,8 +55,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from data_process.world_model_dataset import TorqueWorldModelDataset
-from model.pinn_model.torque_world_model import TorqueWorldModel
+from data_process.contact_world_model_dataset import ContactWorldModelDataset
+from model.pinn_model.contact_world_model import ContactWorldModel
 from train.nomalizer import Normalizer
 
 
@@ -186,7 +186,7 @@ def _episode_indices(value: str | None) -> set[int] | None:
 
 
 def select_rollouts(
-    dataset: TorqueWorldModelDataset,
+    dataset: ContactWorldModelDataset,
     *,
     episodes: set[int] | None,
     stride: int,
@@ -198,7 +198,7 @@ def select_rollouts(
 
     if stride <= 0 or start_offset < 0:
         raise ValueError("stride must be positive and start_offset non-negative")
-    # ``TorqueWorldModelDataset`` already records the owning episode for every
+    # ``ContactWorldModelDataset`` already records the owning episode for every
     # valid high-rate row.  Group once instead of rescanning all windows for
     # every episode (the three training sources contain ~600k rows).
     grouped: dict[int, list[int]] = {}
@@ -522,14 +522,14 @@ def run(args: argparse.Namespace) -> dict:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
-    model = TorqueWorldModel(config)
+    model = ContactWorldModel(config)
     weight_key = "model" if args.weights == "ema" else "model_raw"
     state_dict = checkpoint.get(weight_key)
     if not isinstance(state_dict, Mapping):
         raise KeyError(f"checkpoint does not contain {weight_key}")
     model.load_state_dict(state_dict, strict=True)
     model.to(device).eval()
-    dataset = TorqueWorldModelDataset(config, normalizer=normalizer, compute_normalizer=False)
+    dataset = ContactWorldModelDataset(config, normalizer=normalizer, compute_normalizer=False)
     if (dataset.history_horizon, dataset.future_horizon, dataset.action_condition_horizon) != (
         model.history_horizon,
         model.future_horizon,
@@ -662,7 +662,7 @@ def run(args: argparse.Namespace) -> dict:
             "formula": "tau_nom = tau_total - Kp * (q_des - q) - Kd * (dq_des - dq)",
             "kp": kp.tolist(),
             "kd": kd.tolist(),
-            "q_des_source": "expert_action_chunk_abs (action.joint)",
+            "q_des_source": "expert_action_chunk_abs (action.ee_pose)",
             "action_interpolation": args.action_interpolation,
             "dq_des_source": args.dqdes_mode,
             "dq_des_units": "rad/s",

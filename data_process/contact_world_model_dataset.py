@@ -1,9 +1,4 @@
-"""Training dataset for the torque state world model.
-
-The preferred H5 backend consumes an already uniform, shared state timeline
-without running a dataset converter.  The legacy LeRobot packed backend remains
-available for old experiments.
-"""
+"""Dataset for the canonical Contact World Model state/action contract."""
 
 from __future__ import annotations
 
@@ -18,18 +13,11 @@ from data_process.causal_data_filter import (
 )
 from model.pinn_model.contact_gate import (
     ContactGateConfig,
-    contact_labels_from_wrench,
-    contact_phase_labels_from_wrench,
     contact_phase_labels_from_signal,
 )
+from model.pinn_model.contact_world_model import PREDICTED_STATE_STREAMS
 from train.nomalizer import Normalizer
 
-
-ACTION_CONDITION_FEATURES = (
-    "absolute_pose",
-    "current_ee_pose",
-    "relative_pose",
-)
 
 V3_STATE_FIELDS = {
     "q": "observation.joint",
@@ -37,70 +25,8 @@ V3_STATE_FIELDS = {
     "delta_q": "observation.delta_q",
     "tau": "observation.torque",
     "tau_ext": "observation.tau_ext",
-    "action": "action.joint",
+    "action": "action.ee_pose",
 }
-
-
-def compose_action_condition(
-    current_pose: torch.Tensor,
-    target_pose: torch.Tensor,
-    features,
-) -> torch.Tensor:
-    """Compose absolute/current/relative action tokens in a fixed order."""
-
-    if current_pose.shape[-1] != 7 or target_pose.shape[-1] != 7:
-        raise ValueError("pose tensors must have final dimension 7")
-    batched = target_pose.ndim == 3
-    if batched:
-        if current_pose.ndim != 2 or current_pose.shape[0] != target_pose.shape[0]:
-            raise ValueError("batched current_pose must have shape [B, 7]")
-        batch_size, action_horizon = target_pose.shape[:2]
-        current_tokens = current_pose[:, None, :].expand(-1, action_horizon, -1)
-    else:
-        if target_pose.ndim != 2:
-            raise ValueError("target_pose must have shape [A, 7] or [B, A, 7]")
-        if current_pose.ndim == 1:
-            current_pose = current_pose[None, :]
-        if current_pose.shape[0] != 1:
-            raise ValueError("unbatched current_pose must contain one pose")
-        current_tokens = current_pose[None, :, :].expand(1, target_pose.shape[0], -1)
-        target_pose = target_pose[None, ...]
-
-    current_quaternion = torch.nn.functional.normalize(current_tokens[..., 3:], dim=-1)
-    target_quaternion = torch.nn.functional.normalize(target_pose[..., 3:], dim=-1)
-    inverse = TorqueWorldModelDataset._quat_inverse(current_quaternion)
-    relative_position = TorqueWorldModelDataset._quat_rotate(
-        inverse,
-        target_pose[..., :3] - current_tokens[..., :3],
-    )
-    relative_quaternion = torch.nn.functional.normalize(
-        TorqueWorldModelDataset._quat_multiply(inverse, target_quaternion), dim=-1
-    )
-    sign = torch.where(
-        relative_quaternion[..., 3:4] < 0,
-        -torch.ones_like(relative_quaternion[..., 3:4]),
-        torch.ones_like(relative_quaternion[..., 3:4]),
-    )
-    relative_pose = torch.cat(
-        (relative_position, relative_quaternion * sign), dim=-1
-    )
-    absolute_pose = target_pose.clone()
-    absolute_pose[..., 3:] = target_quaternion
-    current_pose_tokens = current_tokens.clone()
-    current_pose_tokens[..., 3:] = current_quaternion
-    values = {
-        "absolute_pose": absolute_pose,
-        "current_ee_pose": current_pose_tokens,
-        "relative_pose": relative_pose,
-    }
-    try:
-        result = torch.cat([values[str(feature)] for feature in features], dim=-1)
-    except KeyError as exc:
-        raise ValueError(
-            f"unsupported action condition feature {exc.args[0]!r}; "
-            f"choose from {ACTION_CONDITION_FEATURES}"
-        ) from exc
-    return result if batched else result[0]
 
 
 def _load_lerobot_dataset_class():
@@ -108,12 +34,12 @@ def _load_lerobot_dataset_class():
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "TorqueWorldModelDataset requires the lerobot package."
+            "ContactWorldModelDataset requires the lerobot package."
         ) from exc
     return LeRobotDataset
 
 
-class TorqueWorldModelDataset(torch.utils.data.Dataset):
+class ContactWorldModelDataset(torch.utils.data.Dataset):
     """Build causal high-rate samples with a held low-rate action plan.
 
     A sample is anchored at the latest valid high-rate state timestamp ``t``.
@@ -129,7 +55,7 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         "delta_q": "observation.delta_q",
         "tau": "observation.torque",
         "tau_ext": "observation.tau_ext",
-        "action": "action.joint",
+        "action": "action.ee_pose",
     }
     DEFAULT_H5_HIGH_FIELDS = {
         "q": "teleop/q_follower",
@@ -146,6 +72,9 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
     def __init__(self, config, normalizer=None, compute_normalizer=False):
         self.config = config
         self.data_config = config.get("dataloader") or {}
+        self.action_key = str(self.data_config.get("action_key", "")).strip()
+        if not self.action_key:
+            raise ValueError("dataloader.action_key is required")
         configured_train_data = config.get("train_data")
         if isinstance(configured_train_data, list):
             configured_train_data = {"sources": configured_train_data}
@@ -173,7 +102,8 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                 )
             if source_format == "h5_v3":
                 configured_v3_fields = self.train_data_config.get("v3_fields") or {}
-                missing_v3 = sorted(set(V3_STATE_FIELDS) - set(configured_v3_fields))
+                expected_v3_fields = {**V3_STATE_FIELDS, "action": self.action_key}
+                missing_v3 = sorted(set(expected_v3_fields) - set(configured_v3_fields))
                 if missing_v3:
                     raise ValueError(
                         "train_data.v3_fields is missing canonical fields: "
@@ -181,7 +111,7 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                     )
                 wrong_v3 = {
                     key: configured_v3_fields[key]
-                    for key, expected in V3_STATE_FIELDS.items()
+                    for key, expected in expected_v3_fields.items()
                     if str(configured_v3_fields[key]) != expected
                 }
                 if wrong_v3:
@@ -189,8 +119,6 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                         "train_data.v3_fields must use the unified V3 names: "
                         f"{wrong_v3}"
                     )
-        # SWM always uses the direct dataset action contract.
-        self.direct_action = True
         source_format = str(self.train_data_config.get("format", "")).lower()
         self.backend = str(
             self.train_data_config.get(
@@ -260,32 +188,12 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             self.source_dataset = None
             self.stats_dataset = None
 
-        self.history_horizon = int(
-            self.data_config.get(
-                "state_history_horizon",
-                self.data_config.get("history_horizon", 50),
-            )
-        )
-        self.future_horizon = int(
-            self.data_config.get(
-                "prediction_horizon",
-                self.data_config.get("future_horizon", 40),
-            )
-        )
+        self.history_horizon = int(self.data_config.get("state_history_horizon", 50))
+        self.future_horizon = int(self.data_config.get("prediction_horizon", 40))
         self.high_fps = int(self.data_config.get("high_fps", 80))
         self.expert_fps = float(self.data_config.get("expert_fps", 4.0))
-        self.action_horizon = int(
-            self.data_config.get(
-                "action_chunk_horizon",
-                self.data_config.get(
-                    "action_condition_horizon",
-                    self.data_config.get("action_horizon", 8),
-                ),
-            )
-        )
-        self.configured_action_condition_horizon = int(
-            self.data_config.get("action_condition_horizon", self.action_horizon)
-        )
+        self.action_horizon = int(self.data_config.get("action_chunk_horizon", 8))
+        self.configured_action_condition_horizon = int(self.data_config.get("action_condition_horizon", 8))
         # Optional per-rollout action plans for OPD.  Entry zero is the
         # ordinary action chunk at the sampled state; later entries are
         # re-anchored chunks for successive high-rate rollout states.
@@ -304,33 +212,12 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         self.inference_delay_s = float(
             self.data_config.get("inference_delay_s", 0.0)
         )
-        self.action_condition_mode = str(
-            self.data_config.get("action_condition_mode", "direct")
-        ).lower()
-        configured_features = self.data_config.get("action_condition_features")
-        if configured_features is None:
-            configured_features = []
-        self.action_condition_features = tuple(str(value) for value in configured_features)
-        self.current_pose_source = str(
-            self.data_config.get("current_ee_pose_source", "dataset")
-        ).lower()
-        self.action_resample = str(
-            self.data_config.get("action_resample", "pose")
-        ).lower()
-        # The WM v3 converter samples each action anchor from the first command
-        # at-or-after that camera timestamp (``next``), then holds it until the
-        # next anchor. Keep action alignment independent from legacy state
-        # resampling.
+        self.action_condition_mode = str(self.data_config.get("action_condition_mode", "direct")).lower()
+        self.action_resample = str(self.data_config.get("action_resample", "nearest")).lower()
         self.action_alignment = str(
             self.train_data_config.get(
                 "action_alignment",
-                "next"
-                if self.train_data_config.get("sources")
-                else (
-                    "nearest"
-                    if self.action_resample == "pose"
-                    else self.action_resample
-                ),
+                self.action_resample,
             )
         ).lower()
         self.pad_history = bool(self.data_config.get("pad_history", True))
@@ -382,34 +269,21 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             self.DEFAULT_H5_HIGH_FIELDS,
             configured_h5_fields,
         )
-        if self.direct_action:
-            for legacy_key in ("ddq", "wrench", "reference_pose"):
-                if legacy_key not in configured_high_keys:
-                    self.high_keys.pop(legacy_key, None)
-            # External torque is only needed to build the optional contact
-            # labels.  Do not make contact-disabled datasets carry a field
-            # they cannot use.
-            if not (config.get("contact_gate") or {}).get("enabled", False) and "tau_ext" not in configured_high_keys:
-                self.high_keys.pop("tau_ext", None)
-            for legacy_key in ("ddq", "wrench", "reference_pose"):
-                if legacy_key not in configured_h5_fields:
-                    self.h5_high_fields.pop(legacy_key, None)
-            if not (config.get("contact_gate") or {}).get("enabled", False) and "tau_ext" not in configured_h5_fields:
-                self.h5_high_fields.pop("tau_ext", None)
-            action_key = self.data_config.get("action_key", "action.joint")
-            self.high_keys.setdefault("action", action_key)
-            self.h5_high_fields.setdefault(
-                "action", self.data_config.get("h5_action_field", "teleop/q_cmd")
+        configured_action = configured_high_keys.get("action", self.action_key)
+        if str(configured_action) != self.action_key:
+            raise ValueError(
+                "train_data action field must match dataloader.action_key: "
+                f"{configured_action!r} != {self.action_key!r}"
             )
-        if self.direct_action:
-            self.high_keys.setdefault("delta_q", "observation.delta_q")
-            self.h5_high_fields.setdefault(
-                "delta_q",
-                {
-                    "operation": "subtract",
-                    "paths": ["teleop/q_cmd", "teleop/q_follower"],
-                },
-            )
+        self.high_keys["action"] = self.action_key
+        self.h5_high_fields.setdefault(
+            "action", self.data_config.get("h5_action_field", "teleop/q_cmd")
+        )
+        self.high_keys.setdefault("delta_q", "observation.delta_q")
+        self.h5_high_fields.setdefault(
+            "delta_q",
+            {"operation": "subtract", "paths": ["teleop/q_cmd", "teleop/q_follower"]},
+        )
         configured_high_keys = self.data_config.get("high_keys") or {}
         if (config.get("contact_gate") or {}).get("enabled", False):
             self.high_keys.setdefault("tau_ext", "observation.tau_ext")
@@ -440,7 +314,6 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         self._apply_v3_filters()
         self._build_action_tables()
         self.dataset = SimpleNamespace(meta=SimpleNamespace(episodes=self.episodes))
-        self.current_ee_pose = None
         self.contact_gate_config = ContactGateConfig.from_config(config)
         self._build_contact_labels()
 
@@ -454,7 +327,7 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         self.normalize_lowdim_keys = list(
             self.data_config.get(
                 "normalize_lowdim_keys",
-                ["q", "dq", "delta_q", "tau", "action"],
+                [*PREDICTED_STATE_STREAMS, "action"],
             )
         )
         self.normalizer = normalizer
@@ -483,24 +356,11 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "dataloader.max_high_timestamp_jitter_s must be non-negative"
             )
-        if self.action_condition_mode not in {
-            "direct",
-        }:
+        if self.action_condition_mode != "direct":
+            raise ValueError("dataloader.action_condition_mode must be 'direct'")
+        if self.action_resample not in {"nearest", "previous", "next"}:
             raise ValueError(
-                "dataloader.action_condition_mode must be 'direct'"
-            )
-        if not self.direct_action:
-            raise ValueError(
-                "TorqueWorldModelDataset requires a direct action field"
-            )
-        if self.action_condition_features and any(
-            str(value) not in ACTION_CONDITION_FEATURES
-            for value in self.action_condition_features
-        ):
-            raise ValueError("pose action_condition_features are unsupported for SWM; use direct action")
-        if self.action_resample not in {"pose", "nearest", "previous"}:
-            raise ValueError(
-                "dataloader.action_resample must be pose, nearest, or previous"
+                "dataloader.action_resample must be nearest, previous, or next"
             )
         if self.action_alignment not in {"nearest", "previous", "next"}:
             raise ValueError(
@@ -723,7 +583,7 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                 # This is distinct from (and never replaces) predicted
                 # delta_q supervision.
                 if key == "delta_q":
-                    action_source = self.high_keys.get("action", "action.joint")
+                    action_source = self.high_keys.get("action", self.action_key)
                     q_source = self.high_keys.get("q", "observation.joint")
                     if action_source in columns and q_source in columns:
                         columns[dataset_key] = self._as_tensor(
@@ -1194,8 +1054,8 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
 
         table = self._action_tables.get(id(episode))
         if table is None:
-            # Native H5/legacy fallback.  These datasets are much smaller and
-            # use irregular timestamp anchors, so retain the exact helper.
+            # Native H5 datasets use irregular timestamp anchors, so retain the
+            # exact helper.
             chunks = [
                 self._action_for_anchor(int(state_index), episode)["condition"]
                 for state_index in state_indices.tolist()
@@ -1235,32 +1095,20 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             for ep in self.episodes
         ]
         if self.contact_gate_config.enabled:
-            if self.contact_gate_config.label_mode == "three_phase":
-                if self.contact_gate_config.metric in {"tau_ext_l1", "tau_ext_l2"}:
-                    if "tau_ext" not in self.high_tensors:
-                        raise KeyError(
-                            "contact_gate.metric=tau_ext_l1 requires a high_keys "
-                            "entry named tau_ext (offline tau_ext_cal), not "
-                            "observation.torque"
-                        )
-                    tau_ext = self.high_tensors["tau_ext"]
-                    if not torch.is_tensor(tau_ext):
-                        tau_ext = tau_ext.to_tensor()
-                    if self.contact_gate_config.metric == "tau_ext_l2":
-                        signal = torch.linalg.vector_norm(tau_ext, dim=-1)
-                    else:
-                        signal = tau_ext.abs().sum(dim=-1)
-                    self.contact = contact_phase_labels_from_signal(
-                        signal, bounds, self.contact_gate_config
-                    )
-                else:
-                    self.contact = contact_phase_labels_from_wrench(
-                        self.high_tensors["wrench"], bounds, self.contact_gate_config
-                    )
+            if self.contact_gate_config.label_mode != "three_phase":
+                raise ValueError("Contact World Model requires three_phase contact labels")
+            if self.contact_gate_config.metric not in {"tau_ext_l1", "tau_ext_l2"}:
+                raise ValueError("contact_gate.metric must be tau_ext_l1 or tau_ext_l2")
+            if "tau_ext" not in self.high_tensors:
+                raise KeyError("contact labels require the configured tau_ext field")
+            tau_ext = self.high_tensors["tau_ext"]
+            if self.contact_gate_config.metric == "tau_ext_l2":
+                signal = torch.linalg.vector_norm(tau_ext, dim=-1)
             else:
-                self.contact = contact_labels_from_wrench(
-                    self.high_tensors["wrench"], bounds, self.contact_gate_config
-                )
+                signal = tau_ext.abs().sum(dim=-1)
+            self.contact = contact_phase_labels_from_signal(
+                signal, bounds, self.contact_gate_config
+            )
         else:
             self.contact = torch.zeros(
                 (self.high_tensors["q"].shape[0], 1), dtype=torch.float32
@@ -1317,43 +1165,6 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             raise IndexError("action target lies outside episode high-rate timeline")
         return indices + start, selected_times
 
-    def _sample_reference_poses(self, times, episode):
-        if self.action_resample != "pose":
-            indices, _ = self._sample_indices(times, episode)
-            return self.high_tensors["reference_pose"].index_select(0, indices)
-
-        start = int(episode["dataset_from_index"])
-        end = int(episode["dataset_to_index"])
-        source_times = self.high_timestamps[start:end]
-        query = torch.as_tensor(times, dtype=torch.int64)
-        if torch.any(query < source_times[0]) or torch.any(query > source_times[-1]):
-            raise IndexError("action target lies outside episode high-rate timeline")
-        right = torch.searchsorted(source_times, query, right=False)
-        right = right.clamp(0, source_times.numel() - 1)
-        left = (right - 1).clamp(0, source_times.numel() - 1)
-        left_time = source_times[left]
-        right_time = source_times[right]
-        denominator = (right_time - left_time).to(dtype=torch.float64)
-        alpha = torch.where(
-            denominator > 0,
-            (query - left_time).to(dtype=torch.float64) / denominator,
-            torch.zeros_like(denominator),
-        ).to(dtype=torch.float32)
-        poses = self.high_tensors["reference_pose"][start:end]
-        left_pose = poses.index_select(0, left)
-        right_pose = poses.index_select(0, right)
-        position = torch.lerp(
-            left_pose[:, :3],
-            right_pose[:, :3],
-            alpha[:, None],
-        )
-        quaternion = self._quat_slerp(
-            left_pose[:, 3:],
-            right_pose[:, 3:],
-            alpha,
-        )
-        return torch.cat((position, quaternion), dim=-1)
-
     def _sample_action_values(self, times, episode):
         """Sample direct command values on the high-rate state timeline."""
 
@@ -1365,77 +1176,6 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             times, episode, resample=self.action_alignment
         )
         return self.high_tensors["action"].index_select(0, indices)
-
-    @staticmethod
-    def _quat_slerp(left, right, alpha):
-        left = torch.nn.functional.normalize(left, dim=-1)
-        right = torch.nn.functional.normalize(right, dim=-1)
-        dot = (left * right).sum(dim=-1, keepdim=True)
-        right = torch.where(dot < 0.0, -right, right)
-        dot = dot.abs().clamp(max=1.0)
-        theta = torch.acos(dot)
-        sin_theta = torch.sin(theta)
-        alpha = alpha[:, None]
-        spherical = (
-            torch.sin((1.0 - alpha) * theta) / sin_theta.clamp_min(1e-8) * left
-            + torch.sin(alpha * theta) / sin_theta.clamp_min(1e-8) * right
-        )
-        linear = torch.lerp(left, right, alpha)
-        quaternion = torch.where(dot > 0.9995, linear, spherical)
-        quaternion = torch.nn.functional.normalize(quaternion, dim=-1)
-        return torch.where(quaternion[:, 3:4] < 0.0, -quaternion, quaternion)
-
-    @staticmethod
-    def _quat_inverse(quaternion):
-        inverse = quaternion.clone()
-        inverse[..., :3] = -inverse[..., :3]
-        return torch.nn.functional.normalize(inverse, dim=-1)
-
-    @staticmethod
-    def _quat_multiply(first, second):
-        ax, ay, az, aw = first.unbind(dim=-1)
-        bx, by, bz, bw = second.unbind(dim=-1)
-        return torch.stack(
-            (
-                aw * bx + ax * bw + ay * bz - az * by,
-                aw * by - ax * bz + ay * bw + az * bx,
-                aw * bz + ax * by - ay * bx + az * bw,
-                aw * bw - ax * bx - ay * by - az * bz,
-            ),
-            dim=-1,
-        )
-
-    @staticmethod
-    def _quat_rotate(quaternion, vector):
-        """Rotate vectors by xyzw quaternions without leaving Torch."""
-        q_xyz = quaternion[..., :3]
-        q_w = quaternion[..., 3:4]
-        cross = torch.linalg.cross(q_xyz, vector, dim=-1)
-        return vector + 2.0 * (
-            q_w * cross + torch.linalg.cross(q_xyz, cross, dim=-1)
-        )
-
-    def _relative_pose(self, current, targets):
-        current_position = current[:3]
-        current_quaternion = torch.nn.functional.normalize(current[3:], dim=-1)
-        target_quaternion = torch.nn.functional.normalize(targets[..., 3:], dim=-1)
-        inverse = self._quat_inverse(current_quaternion).expand_as(target_quaternion)
-        relative_position = self._quat_rotate(
-            inverse,
-            targets[..., :3] - current_position,
-        )
-        relative_quaternion = torch.nn.functional.normalize(
-            self._quat_multiply(inverse, target_quaternion), dim=-1
-        )
-        sign = torch.where(
-            relative_quaternion[..., 3:4] < 0,
-            -torch.ones_like(relative_quaternion[..., 3:4]),
-            torch.ones_like(relative_quaternion[..., 3:4]),
-        )
-        return torch.cat(
-            (relative_position, relative_quaternion * sign),
-            dim=-1,
-        )
 
     def _action_for_anchor(self, high_idx, episode):
         indexed = self._indexed_action_for_anchor(high_idx, episode)
@@ -1496,11 +1236,6 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             + self.inference_delay_ns
             + (target_times + self.action_start_offset) * self.action_period_ns
         )
-        if not self.direct_action:
-            raise ValueError(
-                "TorqueWorldModelDataset requires direct action conditioning; "
-                "set dataloader.action_key (for example action.joint)."
-            )
         # The action horizon is 8 tokens at 25 Hz while state history and
         # prediction windows remain on the 100 Hz timeline.
         action_chunk = self._sample_action_values(target_times, episode)
@@ -1610,14 +1345,13 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         )
         for key in self.normalize_lowdim_keys:
             if key == "action":
-                if self.direct_action and key == "action":
-                    values = []
-                    for sample_idx in sample_indices:
-                        high_idx = self.valid_indices[int(sample_idx)]
-                        episode = self._episode_for_index(high_idx)
-                        action = self._action_for_anchor(high_idx, episode)
-                        values.append(action["condition"])
-                    stats[key] = self._tensor_statistics(torch.cat(values, dim=0))
+                values = []
+                for sample_idx in sample_indices:
+                    high_idx = self.valid_indices[int(sample_idx)]
+                    episode = self._episode_for_index(high_idx)
+                    action = self._action_for_anchor(high_idx, episode)
+                    values.append(action["condition"])
+                stats[key] = self._tensor_statistics(torch.cat(values, dim=0))
                 continue
             if key not in self.high_tensors:
                 raise KeyError(f"normalization key {key!r} missing from dataset")
@@ -1690,16 +1424,11 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
                 dtype=torch.float32,
             )
         for key, values in self.high_tensors.items():
-            if key in {"reference_pose", "action", "tau_ext"}:
+            if key in {"action", "tau_ext"}:
                 continue
             sample[key] = values.index_select(0, history)
             sample[f"{key}_future"] = values.index_select(0, future)
             sample[f"{key}_future_raw"] = sample[f"{key}_future"].clone()
-        if self.current_ee_pose is not None:
-            sample["current_ee_pose"] = self.current_ee_pose.index_select(0, history)
-            sample["current_ee_pose_future"] = self.current_ee_pose.index_select(0, future)
-        if "reference_pose" in self.high_tensors:
-            sample["reference_pose"] = self.high_tensors["reference_pose"].index_select(0, history)
         sample["contact_future"] = self.contact.index_select(0, future)
         sample["contact"] = self.contact.index_select(0, history)
         for key in self.normalize_lowdim_keys:
@@ -1713,8 +1442,7 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             future_key = f"{key}_future"
             if future_key in sample:
                 sample[future_key] = self._normalize(key, sample[future_key])
-        if "action" not in sample:
-            sample["action"] = sample["action_raw"]
+        sample["action"] = sample["action_raw"]
         return sample
 
     def __getitem__(self, index):
