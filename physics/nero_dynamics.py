@@ -579,6 +579,11 @@ class FrozenTauOtherPredictor(nn.Module):
             normalizer_payload,
             fallback_mode=normalize_mode,
         )
+        self.register_buffer(
+            "_window_offsets",
+            torch.arange(self.history_horizon),
+            persistent=False,
+        )
         self.model.requires_grad_(False)
         if hasattr(self.model, "recurrent"):
             self.model.recurrent.dropout = 0.0
@@ -672,35 +677,28 @@ class FrozenTauOtherPredictor(nn.Module):
         # Recurrent training treats every H-step window as an independent sample
         # with a fresh state. Build those same windows for every future target
         # instead of carrying a hidden state beyond the trained horizon.
-        window_starts = torch.arange(
-            1,
-            future_steps + 1,
+        total_windows = batch_size * future_steps
+        flat_indices = torch.arange(
+            total_windows,
             device=next(iter(complete_inputs.values())).device,
         )
-        window_offsets = torch.arange(
-            self.history_horizon,
-            device=window_starts.device,
+        batch_indices = torch.div(
+            flat_indices,
+            future_steps,
+            rounding_mode="floor",
         )
-        total_windows = batch_size * future_steps
+        future_indices = flat_indices - batch_indices * future_steps
+        window_indices = (
+            future_indices[:, None] + 1 + self._window_offsets[None, :]
+        )
         chunk_outputs = []
         for start in range(0, total_windows, self.max_model_batch_size):
             end = min(start + self.max_model_batch_size, total_windows)
-            flat_indices = torch.arange(
-                start,
-                end,
-                device=window_starts.device,
-            )
-            batch_indices = torch.div(
-                flat_indices,
-                future_steps,
-                rounding_mode="floor",
-            )
-            future_indices = flat_indices - batch_indices * future_steps
-            window_indices = (
-                future_indices[:, None] + 1 + window_offsets[None, :]
-            )
             model_batch = {
-                key: value[batch_indices[:, None], window_indices]
+                key: value[
+                    batch_indices[start:end, None],
+                    window_indices[start:end],
+                ]
                 for key, value in complete_inputs.items()
             }
             chunk_outputs.append(self.model(model_batch)["tau_other_pred"])

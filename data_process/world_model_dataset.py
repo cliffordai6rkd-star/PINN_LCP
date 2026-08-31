@@ -286,6 +286,14 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
         self.configured_action_condition_horizon = int(
             self.data_config.get("action_condition_horizon", self.action_horizon)
         )
+        # Optional per-rollout action plans for OPD.  Entry zero is the
+        # ordinary action chunk at the sampled state; later entries are
+        # re-anchored chunks for successive high-rate rollout states.
+        self.action_rollout_horizon = int(
+            self.data_config.get("action_rollout_horizon", 0)
+        )
+        if self.action_rollout_horizon < 0:
+            raise ValueError("dataloader.action_rollout_horizon must be non-negative")
         # The state row at t already reflects the currently held command.
         # Action token 0 therefore starts at the next expert refresh by
         # default.  Keep the offset configurable for VLA contracts whose
@@ -1164,6 +1172,63 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             "action_index": table["indices"][start_position:end_position],
         }
 
+    def _action_rollout_for_anchor(self, high_idx, episode):
+        """Return re-anchored direct action chunks for OPD rollout states.
+
+        The first chunk corresponds to ``high_idx``.  Each subsequent chunk is
+        sampled using the same action-anchor contract as ``_action_for_anchor``
+        at ``high_idx + offset``.  The v3 path is vectorized over offsets so
+        enabling this optional field does not add one Python search per token.
+        """
+
+        horizon = self.action_rollout_horizon
+        if horizon <= 0:
+            return None
+
+        end = int(episode["dataset_to_index"])
+        state_indices = torch.arange(
+            int(high_idx), int(high_idx) + horizon, dtype=torch.long
+        )
+        if int(state_indices[-1]) >= end:
+            raise IndexError("action rollout crosses the episode boundary")
+
+        table = self._action_tables.get(id(episode))
+        if table is None:
+            # Native H5/legacy fallback.  These datasets are much smaller and
+            # use irregular timestamp anchors, so retain the exact helper.
+            chunks = [
+                self._action_for_anchor(int(state_index), episode)["condition"]
+                for state_index in state_indices.tolist()
+            ]
+            return torch.stack(chunks, dim=0)
+
+        current_indices = self.action_indices.index_select(0, state_indices)
+        positions = torch.searchsorted(table["indices"], current_indices)
+        if torch.any(positions >= table["indices"].numel()):
+            raise IndexError("state row refers to an unknown action index")
+        if torch.any(table["indices"].index_select(0, positions) != current_indices):
+            raise IndexError("state row refers to an unknown action index")
+
+        starts = positions + self.action_start_offset
+        if torch.any(starts >= table["indices"].numel()):
+            raise IndexError("future action chunk crosses the available action table")
+        if self.inference_delay_ns:
+            desired_times = table["times"].index_select(0, starts) + self.inference_delay_ns
+            starts = torch.searchsorted(table["times"], desired_times, right=False)
+            if torch.any(starts >= table["indices"].numel()):
+                raise IndexError("future action chunk crosses the available action table")
+
+        token_offsets = torch.arange(
+            self.action_condition_horizon, dtype=torch.long
+        )
+        chunk_positions = starts[:, None] + token_offsets[None, :]
+        if torch.any(chunk_positions >= table["indices"].numel()):
+            raise IndexError("future action chunk crosses the available action table")
+        rows = table["rows"].index_select(0, chunk_positions.reshape(-1))
+        return self.high_tensors["action"].index_select(0, rows).reshape(
+            horizon, self.action_condition_horizon, -1
+        )
+
     def _build_contact_labels(self):
         bounds = [
             (int(ep["dataset_from_index"]), int(ep["dataset_to_index"]))
@@ -1475,6 +1540,8 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             for high_idx in range(anchor_start, max(anchor_start, last + 1)):
                 try:
                     self._action_for_anchor(high_idx, episode)
+                    if self.action_rollout_horizon:
+                        self._action_rollout_for_anchor(high_idx, episode)
                 except IndexError:
                     continue
                 self.valid_indices.append(high_idx)
@@ -1614,6 +1681,14 @@ class TorqueWorldModelDataset(torch.utils.data.Dataset):
             "action_raw": action["condition"],
             "action_mask": action["condition_mask"],
         }
+        if self.action_rollout_horizon:
+            action_rollout = self._action_rollout_for_anchor(high_idx, episode)
+            sample["action_rollout"] = self._normalize("action", action_rollout)
+            sample["action_rollout_mask"] = torch.ones(
+                self.action_rollout_horizon,
+                self.configured_action_condition_horizon,
+                dtype=torch.float32,
+            )
         for key, values in self.high_tensors.items():
             if key in {"reference_pose", "action", "tau_ext"}:
                 continue

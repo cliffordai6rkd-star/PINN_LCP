@@ -21,7 +21,7 @@ import yaml
 
 from model.pinn_model.contact_gate import (
     ContactGateConfig,
-    hysteresis_three_phase_mask,
+    batched_hysteresis_three_phase_mask,
 )
 from physics.nero_dynamics import load_tau_other_predictor
 from train.trainer.torque_world_model_train import TorqueWorldModelTrainer
@@ -57,6 +57,15 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         self.rollout_weight = float(distill.get("rollout_weight", 1.0))
         self.rollout_steps = int(distill.get("rollout_steps", 4))
         curriculum = distill.get("curriculum") or {}
+        configured_rollout_schedule = curriculum.get(
+            "rollout_steps_schedule",
+            distill.get("rollout_steps_schedule"),
+        )
+        if configured_rollout_schedule is None:
+            configured_rollout_schedule = [self.rollout_steps]
+        self.rollout_steps_schedule = tuple(
+            int(value) for value in configured_rollout_schedule
+        )
         self.curriculum_enabled = bool(curriculum.get("enabled", True))
         self.curriculum_epochs = int(curriculum.get("epochs", 100))
         self.teacher_weight_start = float(
@@ -119,15 +128,43 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             raise ValueError("distillation weights must be non-negative")
         if self.rollout_steps < 0:
             raise ValueError("distillation.rollout_steps must be non-negative")
+        if not self.rollout_steps_schedule or any(
+            value < 0 for value in self.rollout_steps_schedule
+        ):
+            raise ValueError(
+                "distillation.curriculum.rollout_steps_schedule must contain "
+                "non-negative integers"
+            )
+        if any(
+            current > following
+            for current, following in zip(
+                self.rollout_steps_schedule, self.rollout_steps_schedule[1:]
+            )
+        ):
+            raise ValueError(
+                "distillation.curriculum.rollout_steps_schedule must be "
+                "non-decreasing"
+            )
         configured_future = int(
             (self.config.get("dataloader") or {}).get(
                 "prediction_horizon",
                 (self.config.get("dataloader") or {}).get("future_horizon", 40),
             )
         )
-        if self.rollout_steps > configured_future:
+        if max(self.rollout_steps, *self.rollout_steps_schedule) > configured_future:
             raise ValueError(
-                "distillation.rollout_steps must not exceed prediction_horizon"
+                "distillation rollout steps must not exceed prediction_horizon"
+            )
+        configured_action_rollout = (self.config.get("dataloader") or {}).get(
+            "action_rollout_horizon"
+        )
+        if (
+            configured_action_rollout is not None
+            and int(configured_action_rollout) < max(self.rollout_steps_schedule)
+        ):
+            raise ValueError(
+                "dataloader.action_rollout_horizon must cover the rollout "
+                "steps schedule"
             )
         if self.curriculum_epochs <= 0:
             raise ValueError("distillation.curriculum.epochs must be positive")
@@ -368,18 +405,13 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         gradient back into the predicted state trajectory.
         """
 
-        labels = []
-        for row in signal.detach().to(dtype=torch.float32).cpu():
-            labels.append(
-                hysteresis_three_phase_mask(
-                    row,
-                    on_threshold=self.rollout_contact_gate.on_threshold,
-                    off_threshold=self.rollout_contact_gate.off_threshold,
-                    consecutive_frames=self.rollout_contact_gate.consecutive_frames,
-                    backfill=self.rollout_contact_backfill,
-                )
-            )
-        return torch.stack(labels, dim=0).to(device=signal.device)
+        return batched_hysteresis_three_phase_mask(
+            signal.detach().to(dtype=torch.float32),
+            on_threshold=self.rollout_contact_gate.on_threshold,
+            off_threshold=self.rollout_contact_gate.off_threshold,
+            consecutive_frames=self.rollout_contact_gate.consecutive_frames,
+            backfill=self.rollout_contact_backfill,
+        )
 
     def _rollout_contact_loss(self, batch, student_out):
         """Generate physics-derived contact supervision for one Student rollout.
@@ -576,9 +608,18 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             return student_out["q_pred"].new_zeros(()), student_out
         return torch.stack(losses).sum() / sum(weights), student_out
 
-    def _write_back(self, batch, student_out):
+    def _write_back(
+        self,
+        batch,
+        student_out,
+        rollout_step=0,
+        *,
+        advance_action=True,
+    ):
         next_batch = dict(batch)
         for key in self._state_keys(self.model):
+            if key not in batch or f"{key}_pred" not in student_out:
+                continue
             history = batch[key]
             prediction = student_out[f"{key}_pred"]
             # One high-rate state is committed per rollout iteration. Detach
@@ -586,23 +627,45 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             next_batch[key] = torch.cat(
                 (history[:, 1:], prediction[:, :1].detach()), dim=1
             )
-        if "contact" in batch and "contact_state_pred" in student_out:
+        contact_prediction = student_out.get("contact_state_pred")
+        if contact_prediction is None and "contact_logits" in student_out:
+            contact_prediction = student_out["contact_logits"].argmax(
+                dim=-1, keepdim=True
+            ).to(dtype=batch["contact"].dtype) if "contact" in batch else None
+        if "contact" in batch and contact_prediction is not None:
             next_batch["contact"] = torch.cat(
-                (batch["contact"][:, 1:], student_out["contact_state_pred"][:, :1].detach()),
+                (batch["contact"][:, 1:], contact_prediction[:, :1].detach()),
                 dim=1,
             )
+        # Direct actions are low-rate chunks, but each OPD state rollout must
+        # use the chunk re-anchored at its new high-rate state.  The dataset
+        # supplies these chunks as [B, R, A, D], where entry zero is the
+        # current condition and entry ``rollout_step + 1`` is the next one.
+        if advance_action and "action_rollout" in batch:
+            next_step = int(rollout_step) + 1
+            action_rollout = batch["action_rollout"]
+            if action_rollout.ndim != 4 or next_step >= action_rollout.shape[1]:
+                raise ValueError(
+                    "action_rollout does not contain the next OPD state chunk"
+                )
+            next_batch["action"] = action_rollout[:, next_step]
+            if "action_rollout_mask" in batch:
+                next_batch["action_mask"] = batch["action_rollout_mask"][:, next_step]
         return next_batch
 
     def _write_back_real(self, batch, reference_batch, step):
-        """Advance Teacher history with the corresponding recorded future state."""
+        """Advance a legacy teacher-forced history with recorded state data.
+
+        Guided OPD no longer calls this helper for distillation; it remains for
+        compatibility with diagnostics and still advances the action contract
+        when an ``action_rollout`` field is available.
+        """
 
         next_batch = dict(batch)
         for key in self._state_keys(self.model):
             future_key = f"{key}_future"
-            if future_key not in reference_batch:
-                raise KeyError(
-                    f"OPD Teacher rollout requires recorded {future_key!r}"
-                )
+            if key not in batch or future_key not in reference_batch:
+                continue
             history = batch[key]
             recorded = reference_batch[future_key][:, step : step + 1].detach()
             next_batch[key] = torch.cat((history[:, 1:], recorded), dim=1)
@@ -614,12 +677,29 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                 ),
                 dim=1,
             )
+        if "action_rollout" in batch:
+            next_step = int(step) + 1
+            action_rollout = batch["action_rollout"]
+            if action_rollout.ndim != 4 or next_step >= action_rollout.shape[1]:
+                raise ValueError(
+                    "action_rollout does not contain the next OPD state chunk"
+                )
+            next_batch["action"] = action_rollout[:, next_step]
+            if "action_rollout_mask" in batch:
+                next_batch["action_mask"] = batch["action_rollout_mask"][:, next_step]
         return next_batch
 
     def _rollout_distill(
-        self, batch, initial_teacher_out=None, initial_source_noise=None
+        self,
+        batch,
+        initial_teacher_out=None,
+        initial_source_noise=None,
+        rollout_steps=None,
     ):
-        if self.rollout_steps == 0:
+        if rollout_steps is None:
+            rollout_steps = self.rollout_steps
+        rollout_steps = int(rollout_steps)
+        if rollout_steps == 0:
             zero = batch["q"].new_zeros(())
             return zero, {
                 "rollout_contact_ce": zero.detach(),
@@ -627,10 +707,9 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                 "rollout_tau_ext_norm": zero.detach(),
             }
         student_current = dict(batch)
-        teacher_current = dict(batch)
         losses = []
         contact_metrics = []
-        for step in range(self.rollout_steps):
+        for step in range(rollout_steps):
             teacher_out = initial_teacher_out if step == 0 else None
             source_noise = (
                 initial_source_noise
@@ -639,7 +718,11 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             )
             loss, student_out = self._endpoint_distill(
                 student_current,
-                teacher_current,
+                # Guided OPD relabels the frozen Teacher on the same
+                # Student-induced history.  Student write-back is detached,
+                # so this changes the state distribution without introducing
+                # full-horizon BPTT.
+                student_current,
                 teacher_out=teacher_out,
                 source_noise=source_noise,
             )
@@ -648,11 +731,11 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             )
             losses.append(loss + contact_loss)
             contact_metrics.append(current_contact_metrics)
-            student_current = self._write_back(student_current, student_out)
-            teacher_current = self._write_back_real(
-                teacher_current,
-                batch,
-                step,
+            student_current = self._write_back(
+                student_current,
+                student_out,
+                rollout_step=step,
+                advance_action=step + 1 < rollout_steps,
             )
         metrics = {}
         for key in (
@@ -680,12 +763,25 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
         )
         return progress, teacher_weight, rollout_weight
 
+    def _rollout_steps_for_progress(self, progress):
+        """Select the configured non-decreasing rollout-depth stage."""
+
+        schedule = self.rollout_steps_schedule
+        if not self.curriculum_enabled:
+            return int(self.rollout_steps)
+        if len(schedule) == 1:
+            return int(schedule[-1])
+        stage = min(int(float(progress) * len(schedule)), len(schedule) - 1)
+        return int(schedule[stage])
+
     def compute_loss(self, batch):
         # Keep ordinary future-label supervision as an anchor for the first
         # stage; OPD then supplies the frozen Teacher and on-policy terms.
         base_loss, out = super().compute_loss(batch)
         if not self.distill_enabled:
             return base_loss, out
+        progress, teacher_weight, rollout_weight = self._curriculum_state()
+        rollout_steps = self._rollout_steps_for_progress(progress)
         # The first rollout Teacher context is identical to the direct
         # endpoint context.  Reuse its frozen target, while recomputing the
         # Student path so training-time dropout behavior remains unchanged.
@@ -700,8 +796,8 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
             batch,
             initial_teacher_out=teacher_out,
             initial_source_noise=source_noise,
+            rollout_steps=rollout_steps,
         )
-        progress, teacher_weight, rollout_weight = self._curriculum_state()
         total = (
             base_loss
             + teacher_weight * distill_loss
@@ -718,6 +814,7 @@ class TorqueWorldModelOPDTrainer(TorqueWorldModelTrainer):
                 "opd_curriculum_progress": progress,
                 "opd_teacher_weight": teacher_weight,
                 "opd_rollout_weight": rollout_weight,
+                "opd_rollout_steps": float(rollout_steps),
                 "opd_total_loss": total.detach(),
             }
         )

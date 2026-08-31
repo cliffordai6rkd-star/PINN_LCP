@@ -2,6 +2,10 @@ import argparse
 import copy
 import logging
 import math
+import os
+import random
+import tempfile
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -149,6 +153,8 @@ class BaseTrainer:
 
         self.batch_size = int(self.train_config.get("batch_size", 64))
         self.num_workers = int(self.train_config.get("num_workers", 4))
+        if self.num_workers < 0:
+            raise ValueError("train.num_workers must be non-negative")
         self.pin_memory = bool(self.train_config.get("pin_memory", False))
         self.non_blocking_transfer = bool(
             self.train_config.get("non_blocking_transfer", self.pin_memory)
@@ -174,6 +180,32 @@ class BaseTrainer:
         if self.persistent_workers and self.num_workers <= 0:
             raise ValueError(
                 "train.persistent_workers requires train.num_workers > 0"
+            )
+
+        # Validation does not need a second pool of persistent workers.  On
+        # memory-constrained hosts, sharing the dataset between train and val
+        # workers can duplicate Arrow/Python pages through fork COW, so keep
+        # validation in the main process by default.  Every setting remains
+        # configurable for larger machines.
+        self.val_num_workers = int(
+            self.train_config.get("val_num_workers", 0)
+        )
+        self.val_prefetch_factor = int(
+            self.train_config.get("val_prefetch_factor", 1)
+        )
+        self.val_pin_memory = bool(
+            self.train_config.get("val_pin_memory", self.pin_memory)
+        )
+        self.val_persistent_workers = bool(
+            self.train_config.get("val_persistent_workers", False)
+        )
+        if self.val_num_workers < 0:
+            raise ValueError("train.val_num_workers must be non-negative")
+        if self.val_prefetch_factor < 1:
+            raise ValueError("train.val_prefetch_factor must be at least 1")
+        if self.val_persistent_workers and self.val_num_workers <= 0:
+            raise ValueError(
+                "train.val_persistent_workers requires train.val_num_workers > 0"
             )
         self.lr = float(self.train_config.get("lr", 1e-4))
         self.weight_decay = float(self.train_config.get("weight_decay", 1e-4))
@@ -240,6 +272,26 @@ class BaseTrainer:
             self.train_config.get("output_dir", "outputs/torque_world_model")
         )
         self.ckpt_dir = self.output_dir / "checkpoints"
+
+        # ``resume_from`` may point at a checkpoint file, a checkpoint
+        # directory, or the output directory containing ``checkpoints/``.
+        # Keep this in the trainer (rather than only in shell wrappers) so a
+        # resumed run restores the complete optimization state consistently.
+        configured_resume = self.train_config.get("resume_from")
+        if configured_resume is None:
+            configured_resume = self.train_config.get("resume_checkpoint")
+        if configured_resume is None:
+            configured_resume = self.train_config.get("resume")
+        if isinstance(configured_resume, bool):
+            self.resume_from = self.output_dir if configured_resume else None
+        elif configured_resume:
+            self.resume_from = Path(str(configured_resume)).expanduser()
+        else:
+            self.resume_from = None
+        self.resume_checkpoint_path = None
+        self.resume_epoch = 0
+        self._resume_loaded = False
+        self.current_epoch = 0
 
         self.global_step = 0
         self._last_step_checkpoint = None
@@ -371,16 +423,50 @@ class BaseTrainer:
             dtype=self.amp_dtype,
         )
 
-    def _dataloader_kwargs(self, *, shuffle):
+    def _dataloader_kwargs(
+        self,
+        *,
+        shuffle,
+        num_workers=None,
+        prefetch_factor=None,
+        pin_memory=None,
+        persistent_workers=None,
+    ):
+        """Build DataLoader arguments for train or validation.
+
+        Optional overrides let validation use a smaller worker pool without
+        changing the historical training-loader defaults.
+        """
+
+        num_workers = self.num_workers if num_workers is None else int(num_workers)
+        prefetch_factor = (
+            self.prefetch_factor
+            if prefetch_factor is None
+            else int(prefetch_factor)
+        )
+        pin_memory = self.pin_memory if pin_memory is None else bool(pin_memory)
+        persistent_workers = (
+            self.persistent_workers
+            if persistent_workers is None
+            else bool(persistent_workers)
+        )
+        if num_workers < 0:
+            raise ValueError("DataLoader num_workers must be non-negative")
+        if prefetch_factor < 1:
+            raise ValueError("DataLoader prefetch_factor must be at least 1")
+        if persistent_workers and num_workers <= 0:
+            raise ValueError(
+                "DataLoader persistent_workers requires num_workers > 0"
+            )
         kwargs = {
             "batch_size": self.batch_size,
             "shuffle": shuffle,
-            "num_workers": self.num_workers,
-            "pin_memory": self.pin_memory,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
         }
-        if self.num_workers > 0:
-            kwargs["prefetch_factor"] = self.prefetch_factor
-            kwargs["persistent_workers"] = self.persistent_workers
+        if num_workers > 0:
+            kwargs["prefetch_factor"] = prefetch_factor
+            kwargs["persistent_workers"] = persistent_workers
         return kwargs
     
     def build_dataset(self):
@@ -494,6 +580,452 @@ class BaseTrainer:
                 lr_lambda=lr_lambda,
             )
         raise ValueError(f"Unsupported scheduler: {name}")
+
+    @staticmethod
+    def resolve_resume_checkpoint(configured_path):
+        """Resolve a checkpoint file or output directory for continuation.
+
+        ``configured_path`` may be a direct ``.pt`` file, an output directory,
+        or its ``checkpoints`` child.  ``latest.pt`` is preferred when present;
+        otherwise the numerically newest step/epoch checkpoint is selected.
+        Relative paths are checked from the caller's working directory and the
+        repository root so rendered configs remain portable.
+        """
+
+        if configured_path is None or configured_path is False:
+            return None
+        raw_path = Path(str(configured_path)).expanduser()
+        candidates = [raw_path]
+        if not raw_path.is_absolute():
+            repository_root = Path(__file__).resolve().parents[1]
+            candidates.extend((Path.cwd() / raw_path, repository_root / raw_path))
+
+        path = None
+        seen = set()
+        for candidate in candidates:
+            try:
+                key = candidate.resolve()
+            except OSError:
+                key = candidate.absolute()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists():
+                path = candidate
+                break
+        if path is None:
+            raise FileNotFoundError(
+                f"resume checkpoint path does not exist: {configured_path}"
+            )
+        if path.is_file():
+            return path.resolve()
+
+        nested = path / "checkpoints"
+        # An output directory may contain auxiliary .pt files.  Prefer its
+        # dedicated checkpoint directory so an unrelated artifact cannot be
+        # selected as the resume source.
+        roots = [nested] if nested.is_dir() else [path]
+        checkpoint_files = []
+        for root in roots:
+            checkpoint_files.extend(root.glob("*.pt"))
+        if not checkpoint_files:
+            raise FileNotFoundError(
+                f"resume checkpoint directory contains no .pt files: {path}"
+            )
+
+        def filename_key(candidate):
+            name = candidate.name
+            for prefix in ("step_", "epoch_"):
+                if name.startswith(prefix) and name.endswith(".pt"):
+                    number = name[len(prefix) : -3]
+                    if number.isdigit():
+                        return (int(number), prefix == "step_")
+            return (-1, False)
+
+        # A run normally contains one checkpoint family.  If both families
+        # are present, metadata gives the only reliable cross-family order;
+        # fall back to filename numbering for legacy or partially-written
+        # files.  ``latest.pt`` was handled above.
+        metadata_candidates = []
+        for candidate in checkpoint_files:
+            try:
+                payload = torch.load(
+                    candidate,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                if isinstance(payload, Mapping):
+                    global_step = payload.get("global_step")
+                    epoch = payload.get("epoch")
+                    if global_step is None and epoch is None and candidate.name != "latest.pt":
+                        continue
+                    metadata_candidates.append(
+                        (
+                            int(global_step if global_step is not None else -1),
+                            int(epoch if epoch is not None else -1),
+                            filename_key(candidate),
+                            candidate,
+                        )
+                    )
+            except Exception as exc:
+                log.debug("ignoring unreadable resume candidate %s: %s", candidate, exc)
+                continue
+        if metadata_candidates:
+            # ``latest.pt`` is a pointer, not necessarily the newest payload
+            # when a run was interrupted between two save calls.  Prefer the
+            # greatest recorded progress and use latest only to break ties.
+            return max(
+                metadata_candidates,
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                    item[3].name == "latest.pt",
+                    item[2],
+                ),
+            )[-1].resolve()
+        latest = [candidate for candidate in checkpoint_files if candidate.name == "latest.pt"]
+        if latest:
+            return latest[0].resolve()
+        return max(checkpoint_files, key=filename_key).resolve()
+
+    @staticmethod
+    def _capture_rng_state():
+        """Capture process RNG state so a resumed run is reproducible."""
+
+        state = {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+        }
+        try:
+            import numpy as np
+
+            state["numpy"] = np.random.get_state()
+        except ImportError:
+            pass
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state):
+        if not isinstance(state, Mapping):
+            return
+        try:
+            if state.get("python") is not None:
+                random.setstate(state["python"])
+            if state.get("torch") is not None:
+                torch.set_rng_state(state["torch"])
+            if state.get("numpy") is not None:
+                import numpy as np
+
+                np.random.set_state(state["numpy"])
+            if state.get("cuda") is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(state["cuda"])
+        except (RuntimeError, TypeError, ValueError) as exc:
+            log.warning("could not restore checkpoint RNG state: %s", exc)
+
+    @staticmethod
+    def _move_optimizer_state_to_device(optimizer, device):
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+
+    def _restore_checkpoint_normalizer(self, checkpoint):
+        payload = checkpoint.get("normalizer")
+        if not isinstance(payload, Mapping) or not payload.get("stats"):
+            return
+        if self.dataset is None or not hasattr(self.dataset, "set_normalizer"):
+            return
+        try:
+            from train.nomalizer import Normalizer
+
+            normalizer = Normalizer(
+                copy.deepcopy(payload["stats"]),
+                eps=float(payload.get("eps", 1.0e-6)),
+            )
+            self.dataset.set_normalizer(normalizer)
+            loss_calculator = getattr(self, "loss_calculator", None)
+            if loss_calculator is not None and hasattr(
+                loss_calculator, "set_normalizer"
+            ):
+                loss_calculator.set_normalizer(normalizer)
+        except (ImportError, TypeError, ValueError) as exc:
+            log.warning("could not restore checkpoint normalizer: %s", exc)
+
+    @staticmethod
+    def _serialize_checkpoint_records(records):
+        serialized = []
+        for record in records or []:
+            if not isinstance(record, Mapping):
+                continue
+            item = dict(record)
+            if item.get("path") is not None:
+                path = Path(str(item["path"]))
+                # ``latest.pt`` is an overwriteable pointer, not a retained
+                # checkpoint.  Persisting it in the history would make a
+                # later resume point at a different state than the record's
+                # epoch/step metadata.
+                if path.name == "latest.pt":
+                    continue
+                item["path"] = str(path)
+            serialized.append(item)
+        return serialized
+
+    @staticmethod
+    def _immutable_checkpoint_path(checkpoint_path, checkpoint):
+        """Find the immutable payload represented by ``latest.pt``.
+
+        A latest pointer is useful when it is the only file left, but it must
+        not be tracked as a retained checkpoint because every subsequent save
+        overwrites it.  Scheduled and step checkpoints have deterministic
+        filenames; top-k/legacy checkpoints are matched by their metadata.
+        """
+
+        checkpoint_path = Path(checkpoint_path)
+        if checkpoint_path.name != "latest.pt":
+            return checkpoint_path.resolve()
+
+        root = checkpoint_path.parent
+        checkpoint_type = str(checkpoint.get("checkpoint_type", ""))
+        epoch = checkpoint.get("epoch")
+        global_step = checkpoint.get("global_step")
+        candidates = []
+        try:
+            if checkpoint_type == "scheduled_epoch" and epoch is not None:
+                value = int(epoch)
+                candidates.extend(
+                    (root / f"epoch_{value:07d}.pt", root / f"epoch_{value:03d}.pt")
+                )
+            elif checkpoint_type == "optimizer_step" and global_step is not None:
+                candidates.append(root / f"step_{int(global_step):08d}.pt")
+            elif epoch is not None:
+                value = int(epoch)
+                candidates.extend(
+                    (root / f"epoch_{value:03d}.pt", root / f"epoch_{value:07d}.pt")
+                )
+        except (TypeError, ValueError):
+            candidates = []
+        for candidate in candidates:
+            if candidate.is_file() and candidate.name != "latest.pt":
+                return candidate.resolve()
+
+        # Top-k filenames contain a floating-point score, so use metadata as a
+        # fallback.  This path is taken only when resuming from latest.pt.
+        target_epoch = None
+        target_step = None
+        try:
+            target_epoch = None if epoch is None else int(epoch)
+        except (TypeError, ValueError):
+            pass
+        try:
+            target_step = None if global_step is None else int(global_step)
+        except (TypeError, ValueError):
+            pass
+        for candidate in root.glob("*.pt"):
+            if candidate.name == "latest.pt":
+                continue
+            try:
+                payload = torch.load(
+                    candidate,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                if not isinstance(payload, Mapping):
+                    continue
+                candidate_epoch = payload.get("epoch")
+                candidate_step = payload.get("global_step")
+                if target_epoch is not None and candidate_epoch is not None:
+                    if int(candidate_epoch) != target_epoch:
+                        continue
+                if target_step is not None and candidate_step is not None:
+                    if int(candidate_step) != target_step:
+                        continue
+                if target_epoch is not None or target_step is not None:
+                    return candidate.resolve()
+            except (OSError, TypeError, ValueError, RuntimeError, EOFError):
+                continue
+        return None
+
+    def _checkpoint_runtime_state(self, *, resume_epoch):
+        """Return state needed to continue optimization after a checkpoint."""
+
+        return {
+            "resume_epoch": int(resume_epoch),
+            "rng_state": self._capture_rng_state(),
+            "amp_scaler": (
+                self.amp_scaler.state_dict() if self.amp_scaler is not None else None
+            ),
+            "trainer_state": {
+                "resume_epoch": int(resume_epoch),
+                "global_step": int(self.global_step),
+                "loss_history": copy.deepcopy(self.loss_history),
+                "best_checkpoints": self._serialize_checkpoint_records(
+                    self.best_checkpoints
+                ),
+                "early_stopping_best": float(self.early_stopping_best),
+                "early_stopping_bad_epochs": int(self.early_stopping_bad_epochs),
+            },
+        }
+
+    @staticmethod
+    def _save_checkpoint_atomic(checkpoint, path):
+        """Write a checkpoint atomically so an interrupted save is ignored."""
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=path.parent,
+                delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+            torch.save(checkpoint, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                try:
+                    temporary_path.unlink()
+                except OSError:
+                    pass
+
+    def _load_resume_checkpoint(self):
+        """Load model and all available optimizer/trainer state for resuming."""
+
+        if self.resume_from is None:
+            return
+        checkpoint_path = self.resolve_resume_checkpoint(self.resume_from)
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if not isinstance(checkpoint, Mapping):
+            raise ValueError(
+                f"resume checkpoint must contain a mapping: {checkpoint_path}"
+            )
+
+        model_state = checkpoint.get("model")
+        raw_model_state = checkpoint.get("model_raw")
+        if model_state is None and raw_model_state is None:
+            raise KeyError(
+                f"resume checkpoint has no model/model_raw state: {checkpoint_path}"
+            )
+
+        # ``model`` is the EMA copy when EMA is enabled.  Continue optimizing
+        # the raw model, while restoring EMA independently when available.
+        if self.ema is not None:
+            self.model.load_state_dict(raw_model_state or model_state, strict=True)
+            self.ema.model.load_state_dict(model_state or raw_model_state, strict=True)
+        else:
+            self.model.load_state_dict(raw_model_state or model_state, strict=True)
+
+        optimizer_state = checkpoint.get("optimizer")
+        if optimizer_state is not None:
+            try:
+                self.optimizer.load_state_dict(optimizer_state)
+                self._move_optimizer_state_to_device(self.optimizer, self.device)
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"could not restore optimizer state from {checkpoint_path}: {exc}"
+                ) from exc
+        else:
+            log.warning("resume checkpoint has no optimizer state; optimizer reset")
+
+        scheduler_state = checkpoint.get("scheduler")
+        if self.scheduler is not None and scheduler_state is not None:
+            try:
+                self.scheduler.load_state_dict(scheduler_state)
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"could not restore scheduler state from {checkpoint_path}: {exc}"
+                ) from exc
+        elif self.scheduler is not None:
+            log.warning("resume checkpoint has no scheduler state; scheduler reset")
+
+        scaler_state = checkpoint.get("amp_scaler")
+        if self.amp_scaler is not None and scaler_state is not None:
+            self.amp_scaler.load_state_dict(scaler_state)
+        elif self.amp_scaler is not None:
+            log.warning("resume checkpoint has no AMP scaler state; scaler reset")
+
+        trainer_state = checkpoint.get("trainer_state") or {}
+        if not isinstance(trainer_state, Mapping):
+            trainer_state = {}
+        self.global_step = int(
+            trainer_state.get("global_step", checkpoint.get("global_step", 0)) or 0
+        )
+        checkpoint_type = str(checkpoint.get("checkpoint_type", ""))
+        if "resume_epoch" in trainer_state:
+            self.resume_epoch = int(trainer_state["resume_epoch"])
+        elif "resume_epoch" in checkpoint:
+            self.resume_epoch = int(checkpoint["resume_epoch"])
+        elif checkpoint_type == "scheduled_epoch":
+            # Scheduled checkpoints store the number of completed epochs.
+            self.resume_epoch = int(checkpoint.get("epoch", 0) or 0)
+        else:
+            # Legacy/top-k and optimizer-step checkpoints store the zero-based
+            # epoch currently being finalized.
+            self.resume_epoch = int(checkpoint.get("epoch", -1) or -1) + 1
+        self.resume_epoch = max(self.resume_epoch, 0)
+
+        history = trainer_state.get("loss_history", checkpoint.get("loss_history"))
+        if isinstance(history, list):
+            self.loss_history = copy.deepcopy(history)
+        records = trainer_state.get(
+            "best_checkpoints", checkpoint.get("best_checkpoints", [])
+        )
+        if isinstance(records, list):
+            self.best_checkpoints = []
+            for record in records:
+                if not isinstance(record, Mapping):
+                    continue
+                item = dict(record)
+                if item.get("path") is not None:
+                    item["path"] = Path(str(item["path"]))
+                    if item["path"].name == "latest.pt":
+                        continue
+                self.best_checkpoints.append(item)
+        record_checkpoint_path = self._immutable_checkpoint_path(
+            checkpoint_path,
+            checkpoint,
+        )
+        if record_checkpoint_path is not None:
+            source_record = {
+                "score": checkpoint.get("monitor_score"),
+                "epoch": int(checkpoint.get("epoch", self.resume_epoch)),
+                "global_step": self.global_step,
+                "path": record_checkpoint_path,
+                "metrics": dict(checkpoint.get("metrics") or {}),
+            }
+            if not any(
+                Path(item.get("path")).resolve() == record_checkpoint_path
+                for item in self.best_checkpoints
+                if item.get("path")
+            ):
+                self.best_checkpoints.append(source_record)
+
+        if "early_stopping_best" in trainer_state:
+            self.early_stopping_best = float(trainer_state["early_stopping_best"])
+        if "early_stopping_bad_epochs" in trainer_state:
+            self.early_stopping_bad_epochs = int(trainer_state["early_stopping_bad_epochs"])
+
+        self._restore_checkpoint_normalizer(checkpoint)
+        self._restore_rng_state(checkpoint.get("rng_state"))
+        self.resume_checkpoint_path = checkpoint_path
+        self._resume_loaded = True
+        self._last_step_checkpoint = self.global_step if checkpoint_type == "optimizer_step" else None
+        self.current_epoch = self.resume_epoch
+        log.info(
+            "resumed training from %s (epoch=%d global_step=%d)",
+            checkpoint_path,
+            self.resume_epoch,
+            self.global_step,
+        )
 
     def split_dataset_by_episode(self):
         episodes = list(self.dataset.dataset.meta.episodes)
@@ -796,7 +1328,13 @@ class BaseTrainer:
         if val_dataset is not None:
             self.val_loader = torch.utils.data.DataLoader(
                 val_dataset,
-                **self._dataloader_kwargs(shuffle=False),
+                **self._dataloader_kwargs(
+                    shuffle=False,
+                    num_workers=self.val_num_workers,
+                    prefetch_factor=self.val_prefetch_factor,
+                    pin_memory=self.val_pin_memory,
+                    persistent_workers=self.val_persistent_workers,
+                ),
             )
 
         if self.step_based_training:
@@ -825,6 +1363,10 @@ class BaseTrainer:
             weight_decay=self.weight_decay,
         )
         self.scheduler = self.build_scheduler()
+        # Restore only after every stateful training object has been created.
+        # This also restores the fitted normalizer after ``fit_dataset_normalizer``
+        # has initialized the dataset.
+        self._load_resume_checkpoint()
         self.setup_wandb()
 
     def setup_wandb(self):
@@ -987,7 +1529,10 @@ class BaseTrainer:
                 defer_device_sync=self.defer_metric_sync,
             )
 
-            if self.global_step % self.wandb_log_every_steps == 0:
+            if (
+                self.wandb_run is not None
+                and self.global_step % self.wandb_log_every_steps == 0
+            ):
                 step_metrics = {
                     "train/loss": loss.detach().item(),
                     "train/epoch": epoch,
@@ -1095,7 +1640,11 @@ class BaseTrainer:
 
         self.setup()
 
-        epoch = 0
+        # Checkpoints represent completed epochs.  Continue with the next
+        # epoch while retaining the configured ``num_epochs`` as the total
+        # budget, rather than adding another full budget on every invocation.
+        epoch = int(self.resume_epoch)
+        self.current_epoch = epoch
         while True:
             if self.step_based_training:
                 if self.max_optimizer_steps is None or self.global_step >= self.max_optimizer_steps:
@@ -1104,6 +1653,7 @@ class BaseTrainer:
                 break
 
             step_before_epoch = self.global_step
+            self.current_epoch = epoch
             avg_loss = self.train_one_epoch(epoch)
             if self.global_step == step_before_epoch:
                 log.warning("training loader produced no optimizer steps; stopping")
@@ -1247,8 +1797,13 @@ class BaseTrainer:
                         f"val/{key}": value
                         for key, value in self.last_val_epoch_metrics.items()
                     }
-                )
+            )
             self.log_wandb(epoch_metrics, step=self.global_step)
+
+            # Update early-stopping state before persisting the epoch so a
+            # resumed run observes the same patience counter and stopping
+            # decision as an uninterrupted run.
+            stop_early = self.should_stop_early(epoch, metrics)
 
             if self.step_based_training:
                 if self.global_step % self.checkpoint_every_steps == 0:
@@ -1263,7 +1818,7 @@ class BaseTrainer:
                 else:
                     self.save_topk_checkpoint(epoch, metrics)
 
-            if self.should_stop_early(epoch, metrics):
+            if stop_early:
                 log.info(
                     "early stopping at epoch=%d: monitor=%s best=%.6f patience=%d",
                     epoch,
@@ -1274,6 +1829,7 @@ class BaseTrainer:
                 break
 
             epoch += 1
+            self.current_epoch = epoch
 
         if (
             self.step_based_training
@@ -1326,6 +1882,12 @@ class BaseTrainer:
             "output_dir": self.output_dir,
             "ckpt_dir": self.ckpt_dir,
             "ema_enabled": self.ema_enabled,
+            "resumed_from": (
+                str(self.resume_checkpoint_path)
+                if self.resume_checkpoint_path is not None
+                else None
+            ),
+            "resume_epoch": int(self.resume_epoch),
             "wandb_run_id": (
                 self.wandb_run.id if self.wandb_run is not None else None
             ),
@@ -1491,8 +2053,11 @@ class BaseTrainer:
                 ),
             },
         }
+        checkpoint.update(
+            self._checkpoint_runtime_state(resume_epoch=int(epoch) + 1)
+        )
         path = self.ckpt_dir / f"step_{step:08d}.pt"
-        torch.save(checkpoint, path)
+        self._save_checkpoint_atomic(checkpoint, path)
 
         self.best_checkpoints.append(
             {
@@ -1511,7 +2076,7 @@ class BaseTrainer:
                 removed_path.unlink()
 
         if self.save_latest_checkpoint:
-            torch.save(checkpoint, self.ckpt_dir / "latest.pt")
+            self._save_checkpoint_atomic(checkpoint, self.ckpt_dir / "latest.pt")
         self._last_step_checkpoint = step
         log.info(
             "saved optimizer-step checkpoint: step=%d path=%s retained=%s%s",
@@ -1530,6 +2095,7 @@ class BaseTrainer:
             else self.model.state_dict()
         )
         ckpt = {
+            "checkpoint_type": "legacy_epoch",
             "epoch": epoch,
             "avg_loss": avg_loss,
             "val_loss": val_loss,
@@ -1551,9 +2117,10 @@ class BaseTrainer:
                 "normalize_lowdim_keys": self.config["dataloader"].get("normalize_lowdim_keys"),
             }
         }
+        ckpt.update(self._checkpoint_runtime_state(resume_epoch=int(epoch) + 1))
 
         path = self.ckpt_dir / f"epoch_{epoch:03d}.pt"
-        torch.save(ckpt, path)
+        self._save_checkpoint_atomic(ckpt, path)
         # log.info(f"saved checkpoint: {path}")
 
     def save_scheduled_epoch_checkpoint(self, epoch, metrics):
@@ -1597,8 +2164,9 @@ class BaseTrainer:
                 ),
             },
         }
+        checkpoint.update(self._checkpoint_runtime_state(resume_epoch=epoch))
         path = self.ckpt_dir / f"epoch_{epoch:07d}.pt"
-        torch.save(checkpoint, path)
+        self._save_checkpoint_atomic(checkpoint, path)
         self.best_checkpoints.append(
             {
                 "score": None,
@@ -1615,7 +2183,7 @@ class BaseTrainer:
             if removed_path.exists():
                 removed_path.unlink()
         if self.save_latest_checkpoint:
-            torch.save(checkpoint, self.ckpt_dir / "latest.pt")
+            self._save_checkpoint_atomic(checkpoint, self.ckpt_dir / "latest.pt")
         log.info(
             "saved scheduled epoch checkpoint: epoch=%d path=%s retained=%s%s",
             epoch,
@@ -1645,6 +2213,7 @@ class BaseTrainer:
             else self.model.state_dict()
         )
         ckpt = {
+            "checkpoint_type": "topk_epoch",
             "epoch": epoch,
             "global_step": self.global_step,
             "monitor_key": self.monitor_key,
@@ -1668,8 +2237,9 @@ class BaseTrainer:
                 "normalize_lowdim_keys": self.config["dataloader"].get("normalize_lowdim_keys"),
             }
         }
+        ckpt.update(self._checkpoint_runtime_state(resume_epoch=int(epoch) + 1))
 
-        torch.save(ckpt, path)
+        self._save_checkpoint_atomic(ckpt, path)
         # log.info(f"saved checkpoint: {path}")
 
         self.best_checkpoints.append({
@@ -1727,6 +2297,8 @@ class BaseTrainer:
         lines.append(f"output_dir: {summary['output_dir']}")
         lines.append(f"ckpt_dir: {summary['ckpt_dir']}")
         lines.append(f"ema_enabled: {summary['ema_enabled']}")
+        if summary.get("resumed_from"):
+            lines.append(f"resumed_from: {summary['resumed_from']}")
         lines.append(f"wandb_run_id: {summary['wandb_run_id']}")
         lines.append("best_checkpoints:")
     

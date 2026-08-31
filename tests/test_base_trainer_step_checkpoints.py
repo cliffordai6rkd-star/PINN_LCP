@@ -205,3 +205,43 @@ def test_epoch_training_retains_latest_scheduled_topk(tmp_path):
     assert [item["epoch"] for item in summary["best_checkpoints"]] == [2, 4, 6]
     assert summary["checkpoint_every_epochs"] == 2
     assert not (checkpoint_dir / "latest.pt").exists()
+
+
+def test_validation_dataloader_can_use_independent_low_memory_settings(tmp_path):
+    config = {
+        "train": {
+            "device": "cpu",
+            "batch_size": 2,
+            "num_workers": 2,
+            "prefetch_factor": 2,
+            "persistent_workers": True,
+            "val_num_workers": 0,
+            "val_prefetch_factor": 1,
+            "val_persistent_workers": False,
+            "output_dir": str(tmp_path),
+            "val_ratio": 0.0,
+            "scheduler": None,
+            "ema": {"enabled": False},
+            "wandb": {"enabled": False},
+        }
+    }
+    trainer = _Trainer(config)
+
+    train_kwargs = trainer._dataloader_kwargs(shuffle=True)
+    assert train_kwargs["num_workers"] == 2
+    assert train_kwargs["prefetch_factor"] == 2
+    assert train_kwargs["persistent_workers"] is True
+
+    val_kwargs = trainer._dataloader_kwargs(
+        shuffle=False,
+        num_workers=trainer.val_num_workers,
+        prefetch_factor=trainer.val_prefetch_factor,
+        pin_memory=trainer.val_pin_memory,
+        persistent_workers=trainer.val_persistent_workers,
+    )
+    assert val_kwargs == {
+        "batch_size": 2,
+        "shuffle": False,
+        "num_workers": 0,
+        "pin_memory": False,
+    }

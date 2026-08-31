@@ -123,6 +123,37 @@ def test_contact_opd_distills_contact_logits_without_dq_history():
     assert "dq" not in next_batch
 
 
+def test_opd_write_back_reanchors_action_chunk_for_next_state():
+    trainer = TorqueWorldModelOPDTrainer.__new__(TorqueWorldModelOPDTrainer)
+    trainer.model = SimpleNamespace()
+    batch = {
+        key: torch.zeros(1, 4, 2)
+        for key in ("q", "dq", "delta_q", "tau")
+    }
+    batch.update(
+        {
+            "action": torch.zeros(1, 3, 2),
+            "action_mask": torch.ones(1, 3),
+            "action_rollout": torch.tensor(
+                [[[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+                  [[2.0, 2.0], [2.0, 2.0], [2.0, 2.0]]]]
+            ),
+            "action_rollout_mask": torch.ones(1, 2, 3),
+        }
+    )
+    student_out = {
+        f"{key}_pred": torch.ones(1, 2, 2)
+        for key in ("q", "dq", "delta_q", "tau")
+    }
+
+    next_batch = trainer._write_back(batch, student_out, rollout_step=0)
+
+    torch.testing.assert_close(next_batch["action"], batch["action_rollout"][:, 1])
+    torch.testing.assert_close(
+        next_batch["action_mask"], batch["action_rollout_mask"][:, 1]
+    )
+
+
 def test_opd_student_fk_only_evaluates_committed_first_prediction():
     trainer = TorqueWorldModelOPDTrainer.__new__(TorqueWorldModelOPDTrainer)
     calls = []

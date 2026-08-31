@@ -2,6 +2,8 @@ wm_v3_only: true
 
 train_data:
   format: lerobot_v3
+  # Relative roots are resolved from the repository root by the training
+  # script (which changes to that directory before launching Python).
   # V3 action anchors are sampled from the first command at/after each state.
   action_alignment: next
   # Optional multi-source form. Each source is loaded as an independent
@@ -9,13 +11,13 @@ train_data:
   sources:
     - name: insert_usb
       repo_id: insert_usb_lerobot_v3
-      root: ../../data/swm/insert_usb_lerobot_v3
+      root: ../nero_ws/runs/swm/insert_usb_lerobot_v3
     - name: push_button
       repo_id: push_button_lerobot_v3
-      root: ../../data/swm/push_button_lerobot_v3
+      root: ../nero_ws/runs/swm/push_button_lerobot_v3
     - name: cuccumber_peeling
       repo_id: cucumber_peeling_lerobot_v3
-      root: ../../data/swm/cucumber_peeling_lerobot_v3
+      root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
 
 dataloader:
   backend: lerobot
@@ -110,14 +112,20 @@ loss:
 train:
   device: cuda:0
   batch_size: 512
-  num_workers: 4
+  # Keep host-memory pressure bounded on the 15 GiB training workstation.
+  # Validation runs in the main process by default (see val_num_workers).
+  num_workers: 2
+  prefetch_factor: 1
+  val_num_workers: 0
+  val_prefetch_factor: 1
+  val_persistent_workers: false
   # Epoch-based budget and chronological checkpoint retention.
-  num_epochs: 1000
+  num_epochs: 2000
+  # Save often enough that a host OOM loses at most a few epochs.
   checkpoint_every_epochs: 200
   val_ratio: 0.1
   # Match DP-style validation cadence; epoch 0 is included.
-  val_every: 20
-  # val_episode_indices: [15, 50, 90]
+  val_every: 20  # val_episode_indices: [15, 50, 90]
   split_mode: episode
   seed: 42
 
@@ -127,9 +135,9 @@ train:
   deterministic: false
   cudnn_benchmark: true
   allow_tf32: true
-  pin_memory: true
-  non_blocking_transfer: true
-  persistent_workers: true
+  pin_memory: false
+  non_blocking_transfer: false
+  persistent_workers: false
   defer_metric_sync: true
   # Only these tensors participate in the model/loss; indices, timestamps and
   # *_raw diagnostics stay on CPU for logging/visualization.
@@ -138,10 +146,31 @@ train:
     enabled: true
     dtype: bfloat16
   validation_flow_time: 0.5
+  # Validation executes the same integrated sampler used at inference.  The
+  # ordinary flow/direct/physics loss remains the training objective; when
+  # replace_val_loss is true only the monitor scalar is replaced.
+  rollout_validation:
+    enabled: true
+    replace_val_loss: true
+    steps: 8
+    solver: heun
+    # Reuse the same source for every checkpoint so score changes reflect
+    # model quality rather than Gaussian Monte-Carlo noise.
+    source_seed: 1234
+    # Zero means all validation batches.  Set a positive value for a quicker,
+    # sampled diagnostic run on a memory-constrained machine.
+    max_batches: 0
+    # Free-running writes the predicted first frame back into history.  It is
+    # intentionally shorter by default because each step is a fresh 8-step
+    # ODE integration; set to 32 for a full-horizon stress test.
+    free_running_steps: 8
+    free_running_max_batches: 8
+    horizons: [1, 4, 8, 16, 32]
+    divergence_abs_threshold: 100.0
   output_dir: outputs/contact_world_model_ep1
   monitor_key: val_loss
-  top_k: 3
-  save_latest_checkpoint: false
+  top_k: 10
+  save_latest_checkpoint: true
   contact_sampling:
     enabled: true
     phase_weights: [1.0, 5.0, 5.0]
@@ -169,7 +198,7 @@ train:
     min_delta: 0.000001
 
   wandb:
-    enabled: true
+    enabled: false
     project: contact-world-model
     name: q-dq-deltaq-tau-direct-action-three-phase-contact
     group: contact-world-model

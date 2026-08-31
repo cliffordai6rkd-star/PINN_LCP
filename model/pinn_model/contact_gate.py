@@ -281,6 +281,116 @@ def hysteresis_three_phase_mask(
     return labels
 
 
+@torch.no_grad()
+def batched_hysteresis_three_phase_mask(
+    signal: torch.Tensor,
+    *,
+    on_threshold: float,
+    off_threshold: float,
+    consecutive_frames: int,
+    backfill: bool = True,
+) -> torch.Tensor:
+    """Apply the three-phase state machine to independent ``[B, T]`` rows."""
+
+    values = torch.as_tensor(signal).detach()
+    if values.ndim != 2:
+        raise ValueError(
+            f"batched hysteresis signal must have shape [B, T], got {values.shape}"
+        )
+    if not torch.isfinite(values).all():
+        raise ValueError("hysteresis signal must contain finite values")
+    if on_threshold <= off_threshold:
+        raise ValueError("on_threshold must be greater than off_threshold")
+    if consecutive_frames < 1:
+        raise ValueError("consecutive_frames must be positive")
+
+    batch_size, horizon = values.shape
+    labels = torch.zeros(
+        (batch_size, horizon), device=values.device, dtype=torch.float32
+    )
+    contact = torch.zeros(batch_size, device=values.device, dtype=torch.bool)
+    candidate_count = torch.zeros(
+        batch_size, device=values.device, dtype=torch.long
+    )
+    release_count = torch.zeros_like(candidate_count)
+    zero = labels.new_zeros(())
+    one = labels.new_ones(())
+    two = one + one
+
+    # Hysteresis is sequential in time but independent across rows. Keeping
+    # only the short time loop avoids the previous B*T Python scalar loop and
+    # the device-to-host round trip without changing the state-machine rules.
+    for index in range(horizon):
+        value = values[:, index]
+        was_contact = contact
+
+        labels[:, index] = torch.where(
+            was_contact,
+            two,
+            labels[:, index],
+        )
+        release_count = torch.where(
+            was_contact,
+            torch.where(value <= off_threshold, release_count + 1, 0),
+            0,
+        )
+        released = was_contact & (release_count >= consecutive_frames)
+        contact = was_contact & ~released
+        release_count = torch.where(released, 0, release_count)
+        if backfill:
+            start = max(index - consecutive_frames + 1, 0)
+            segment = labels[:, start : index + 1]
+            labels[:, start : index + 1] = torch.where(
+                released[:, None],
+                torch.zeros_like(segment),
+                segment,
+            )
+        else:
+            labels[:, index] = torch.where(
+                released,
+                zero,
+                labels[:, index],
+            )
+
+        # A row released on this frame follows the scalar implementation's
+        # ``continue`` path and is not reconsidered as a new rising edge.
+        active = ~was_contact
+        rising = active & (value > off_threshold)
+        labels[:, index] = torch.where(
+            rising,
+            one,
+            labels[:, index],
+        )
+        candidate_count = torch.where(
+            active,
+            torch.where(
+                rising & (value >= on_threshold),
+                candidate_count + 1,
+                0,
+            ),
+            0,
+        )
+        entered = active & (candidate_count >= consecutive_frames)
+        contact = contact | entered
+        candidate_count = torch.where(entered, 0, candidate_count)
+        if backfill:
+            start = max(index - consecutive_frames + 1, 0)
+            segment = labels[:, start : index + 1]
+            labels[:, start : index + 1] = torch.where(
+                entered[:, None],
+                torch.full_like(segment, 2.0),
+                segment,
+            )
+        else:
+            labels[:, index] = torch.where(
+                entered,
+                two,
+                labels[:, index],
+            )
+
+    return labels
+
+
 def contact_phase_labels_from_wrench(
     wrench: torch.Tensor,
     episode_bounds: Sequence[tuple[int, int]],

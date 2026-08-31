@@ -269,14 +269,18 @@ def _tau_other_checkpoint(path: Path, architecture="gru"):
     )
 
 
-@pytest.mark.parametrize("architecture", ["gru", "tcn"])
+@pytest.mark.parametrize("architecture", ["gru", "lstm", "tcn"])
 def test_frozen_tau_other_checkpoint_uses_caller_histories_and_input_gradients(
     tmp_path,
     architecture,
 ):
     checkpoint_path = tmp_path / "tau_other.pt"
     _tau_other_checkpoint(checkpoint_path, architecture=architecture)
-    predictor = load_tau_other_predictor(checkpoint_path)
+    predictor = load_tau_other_predictor(
+        checkpoint_path,
+        max_model_batch_size=2,
+    )
+    reference_predictor = load_tau_other_predictor(checkpoint_path)
     history = {
         key: torch.randn(2, 4, 2, requires_grad=True)
         for key in predictor.active_inputs
@@ -286,8 +290,11 @@ def test_frozen_tau_other_checkpoint_uses_caller_histories_and_input_gradients(
         for key in predictor.active_inputs
     }
     tau_other = predictor(history, future)
+    with torch.no_grad():
+        reference = reference_predictor(history, future)
 
     assert tau_other.shape == (2, 3, 2)
+    torch.testing.assert_close(tau_other, reference)
     assert not any(parameter.requires_grad for parameter in predictor.parameters())
     tau_other.square().mean().backward()
     assert future["q"].grad is not None

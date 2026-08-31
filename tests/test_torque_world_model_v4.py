@@ -4,7 +4,11 @@ from unittest.mock import patch
 import torch
 
 from data_process.world_model_dataset import TorqueWorldModelDataset
-from model.pinn_model.contact_gate import ContactGateConfig
+from model.pinn_model.contact_gate import (
+    ContactGateConfig,
+    batched_hysteresis_three_phase_mask,
+    hysteresis_three_phase_mask,
+)
 from model.pinn_model.torque_world_model import TorqueWorldModel
 from train.torque_world_model_loss import TorqueWorldModelLoss
 from train.trainer.torque_world_model_opd_train import TorqueWorldModelOPDTrainer
@@ -134,6 +138,37 @@ def test_velocity_smoothness_penalizes_jerk_not_constant_acceleration():
     assert calculator._ddq_smoothness({"dq_pred": oscillating_dq}).item() > 0.0
 
 
+def test_batched_three_phase_hysteresis_matches_independent_rows():
+    generator = torch.Generator().manual_seed(23)
+    signal = torch.rand(9, 37, generator=generator) * 2.0
+    signal[:, ::7] = 0.2
+    signal[:, 3::11] = 1.6
+
+    for consecutive_frames in (1, 2, 5):
+        for backfill in (False, True):
+            expected = torch.stack(
+                [
+                    hysteresis_three_phase_mask(
+                        row,
+                        off_threshold=0.3,
+                        on_threshold=1.5,
+                        consecutive_frames=consecutive_frames,
+                        backfill=backfill,
+                    )
+                    for row in signal
+                ]
+            )
+            actual = batched_hysteresis_three_phase_mask(
+                signal,
+                off_threshold=0.3,
+                on_threshold=1.5,
+                consecutive_frames=consecutive_frames,
+                backfill=backfill,
+            )
+            torch.testing.assert_close(actual, expected)
+            assert actual.device == signal.device
+
+
 def test_opd_rollout_contact_uses_tau_free_and_backpropagates_physical_term():
     config = _config()
     config["contact_gate"] = {
@@ -233,6 +268,7 @@ def test_v3_action_index_builds_exact_consecutive_25hz_chunk():
             "prediction_horizon": 2,
             "action_condition_horizon": 3,
             "action_chunk_horizon": 3,
+            "action_rollout_horizon": 3,
             "normalize_mode": None,
             "high_timestamp_key": "timing.state_timestamp_ns",
             "anchor_timestamp_key": "timing.action_anchor_timestamp_ns",
@@ -259,6 +295,10 @@ def test_v3_action_index_builds_exact_consecutive_25hz_chunk():
     # the next 25 Hz refresh while anchors continue rolling at 100 Hz.
     assert first["action_chunk_index"].tolist() == [1, 2, 3]
     assert first["action"][:, 0].tolist() == [1.0, 2.0, 3.0]
+    assert first["action_rollout"].shape == (3, 3, joint_dim)
+    # The direct action is held for two 100 Hz rows per 25 Hz token.
+    assert first["action_rollout"][:, 0, 0].tolist() == [1.0, 1.0, 2.0]
+    assert first["action_rollout"][:, 1, 0].tolist() == [2.0, 2.0, 3.0]
     assert second_action["action_chunk_index"].tolist() == [2, 3, 4]
 
 

@@ -6,19 +6,21 @@ wm_v3_only: true
 
 train_data:
   format: lerobot_v3
+  # Relative roots are resolved from the repository root by the training
+  # script (which changes to that directory before launching Python).
   # V3 action anchors are sampled from the first command at/after each state.
   action_alignment: next
   # Optional multi-source form; all sources must expose the same WM v3 fields.
   sources:
     - name: insert_usb
       repo_id: insert_usb_lerobot_v3
-      root: ../../swm/insert_usb_lerobot_v3
+      root: ../nero_ws/runs/swm/insert_usb_lerobot_v3
     - name: push_button
       repo_id: push_button_lerobot_v3
-      root: ../../swm/push_button_lerobot_v3
+      root: ../nero_ws/runs/swm/push_button_lerobot_v3
     - name: cuccumber_peeling
       repo_id: cucumber_peeling_lerobot_v3
-      root: ../../swm/cucumber_peeling_lerobot_v3
+      root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
 
 dataloader:
   # repo_id: push_button_lerobot_v3
@@ -30,8 +32,11 @@ dataloader:
   state_history_horizon: 50
   prediction_horizon: 32
   action_condition_horizon: 8
+  # Re-anchor the direct action plan at each high-rate OPD state.  Entry zero
+  # is the current chunk; later entries cover the rollout-depth curriculum.
+  action_rollout_horizon: 16
   action_condition_mode: direct
-  action_key: action.joint
+  action_key: action.ee_pose
   high_timestamp_key: timing.state_timestamp_ns
   anchor_timestamp_key: timing.action_anchor_timestamp_ns
   action_index_key: timing.action_index
@@ -73,15 +78,21 @@ model:
   state_layers: 2
   action_layers: 2
   attention_heads: 4
-  dropout: 0.05
+  dropout: 0.01
   flow_layers: 4
   flow_attention_heads: 4
   flow_ffn_multiplier: 4
-  # Student uses 2 ODE evaluations; the Teacher checkpoint is loaded at 8.
+  # Student uses 2 Heun steps (4 velocity evaluations); Teacher uses 8 steps.
   flow_inference_steps: 2
   flow_solver: heun
   flow_source_mode: gaussian
   contact_logit_scale: 4.0
+  # Direct action chunks are complete. These diagnostics do not participate in
+  # the OPD objective and otherwise repeat work across every Student call.
+  runtime_checks: false
+  return_attention_weights: false
+  use_action_padding_mask: false
+  emit_contact_probabilities: false
 
 loss:
   flow_weight: 1.0
@@ -93,36 +104,38 @@ loss:
   tau_weight: 1.0
   contact_weight: 1.0
   contact_class_weights: auto
-  dq_weight: 0.5
-  delta_q_weight: 1.0
-  kinematic_consistency_weight: 0.05
-  ddq_smoothness_weight: 0.05
+  dq_weight: 0.25
+  delta_q_weight: 0.25
+  kinematic_consistency_weight: 0.01
+  ddq_smoothness_weight: 0.01
   ddq_smoothness_warmup_steps: 1000
   ddq_smoothness_huber_delta: 1.0
   ddq_smoothness_normalize: true
+  emit_physical_diagnostics: false
   dt: 0.01
 
 distillation:
   enabled: true
-  teacher_checkpoint_path: outputs/contact_world_model_ep1/checkpoints
+  teacher_checkpoint_path: outputs/contact_world_model_opd_sweep/20260829_005818/teacher/checkpoints/epoch_0001200.pt
   teacher_steps: 8
   student_steps: 2
   weight: 1.0
   rollout_weight: 1.0
-  rollout_steps: 4
+  rollout_steps: 2
   rollout_contact:
     enabled: true
     # Checkpoint must be trained with model.inputs=[q, dq, delta_q] and target_key=tau.
-    tau_free_checkpoint_path: ../../model/tau_free/epoch_124_val_tau_mse_nm2_0.005756.pt
+    tau_free_checkpoint_path: ../nero_ws/model/tau_free/epoch_124_val_tau_mse_nm2_0.005756.pt
     weight: 0.2
     physical_consistency_weight: 0.02
     horizon: 32
     backfill: false
     temperature: 0.05
-    max_model_batch_size: 1024
+    max_model_batch_size: 32
   curriculum:
     enabled: true
     epochs: 20
+    rollout_steps_schedule: [1, 2, 4, 8, 16]
     teacher_weight_start: 1.0
     teacher_weight_end: 0.5
     rollout_weight_start: 0.0
@@ -130,18 +143,27 @@ distillation:
 
 train:
   device: cuda:0
-  batch_size: 512
-  num_workers: 4
-  pin_memory: true
-  non_blocking_transfer: true
-  persistent_workers: true
-  prefetch_factor: 2
+  batch_size: 64
+  # Keep the student sweep within the same host-memory budget as the teacher.
+  num_workers: 2
+  prefetch_factor: 1
+  val_num_workers: 0
+  val_prefetch_factor: 1
+  val_persistent_workers: false
+  val_every: 2
+  pin_memory: false
+  non_blocking_transfer: false
+  persistent_workers: false
+  defer_metric_sync: true
+  # Keep sample metadata and raw rollout diagnostics on CPU. Contact history is
+  # included because OPD advances it alongside the continuous Teacher history.
+  device_batch_keys: [q, dq, delta_q, tau, contact, action, action_mask, action_rollout, action_rollout_mask, q_future, dq_future, delta_q_future, tau_future, contact_future]
   amp:
     enabled: true
     dtype: bfloat16
   # Epoch-based budget and chronological checkpoint retention.
-  num_epochs: 200
-  checkpoint_every_epochs: 50
+  num_epochs: 250
+  checkpoint_every_epochs: 10
   val_ratio: 0.1
   # val_episode_indices: [15, 50, 90]
   split_mode: episode
@@ -150,10 +172,23 @@ train:
   weight_decay: 0.0001
   gradient_clip_norm: 1.0
   validation_flow_time: 0.5
-  output_dir: outputs/contact_world_model_opd
+  # Monitor the same few-step integrated and free-running behavior used by the
+  # Student. Ordinary supervised validation remains available in the log.
+  rollout_validation:
+    enabled: true
+    replace_val_loss: true
+    steps: 2
+    solver: heun
+    source_seed: 1234
+    max_batches: 8
+    free_running_steps: 16
+    free_running_max_batches: 4
+    horizons: [1, 4, 8, 16, 32]
+    divergence_abs_threshold: 100.0
+  output_dir: outputs/contact_world_model_opd_11
   monitor_key: val_loss
   top_k: 2
-  save_latest_checkpoint: false
+  save_latest_checkpoint: true
   contact_sampling:
     enabled: true
     phase_weights: [1.0, 5.0, 5.0]
@@ -176,7 +211,7 @@ train:
     warmup_epochs: 20
     min_delta: 0.000001
   wandb:
-    enabled: true
+    enabled: false
     project: contact-world-model
     name: contact-wm-opd-student
     group: contact-world-model-opd
