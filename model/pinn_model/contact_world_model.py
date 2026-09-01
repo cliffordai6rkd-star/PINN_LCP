@@ -1,4 +1,4 @@
-"""Action-conditioned flow Contact World Model for robot joint state."""
+"""Action-conditioned flow Contact World Model for configurable state streams."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ class FlowDecoderBlock(nn.Module):
 
 
 class ContactWorldModel(nn.Module):
-    """Generate future q/dq/delta_q/tau and contact phase with CFM."""
+    """Generate selected future state streams and contact phase with CFM."""
 
     SUPPORTED_STATE_STREAMS = SUPPORTED_STATE_STREAMS
     PREDICTED_STATE_STREAMS = PREDICTED_STATE_STREAMS
@@ -103,7 +103,7 @@ class ContactWorldModel(nn.Module):
         "tau_future",
         "contact_future",
     )
-    MODEL_VERSION = "contact_world_model_v1"
+    MODEL_VERSION = "contact_world_model_v2"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -130,6 +130,17 @@ class ContactWorldModel(nn.Module):
             raise ValueError(f"model.inputs contains unsupported values {unknown}; choose from {list(SUPPORTED_STATE_STREAMS)}")
         if len(set(self.inputs)) != len(self.inputs):
             raise ValueError("model.inputs must not contain duplicates")
+        # The selected state streams are also the continuous prediction
+        # streams.  The module-level constant remains the complete dataset
+        # vocabulary for loaders and backwards-compatible callers.
+        self.predicted_state_streams = self.inputs
+        # Expose the selected contract on instances while retaining the
+        # module-level vocabulary constants used by the dataset.
+        self.PREDICTED_STATE_STREAMS = self.inputs
+        self.CONDITION_KEYS = self.inputs + ("action", "action_mask")
+        self.TARGET_KEYS = tuple(f"{key}_future" for key in self.inputs) + (
+            "contact_future",
+        )
         self.contact_state_count = int(model_config.get("contact_state_count", 3))
         if self.contact_state_count != 3:
             raise ValueError("model.contact_state_count must be exactly 3")
@@ -144,6 +155,7 @@ class ContactWorldModel(nn.Module):
         self.flow_inference_steps = int(model_config.get("flow_inference_steps", 8))
         self.flow_solver = str(model_config.get("flow_solver", "heun")).lower()
         self.flow_source_mode = str(model_config.get("flow_source_mode", "gaussian")).lower()
+        self.state_pooling = str(model_config.get("state_pooling", "attention")).lower()
         self.dropout = float(model_config.get("dropout", 0.1))
         self.runtime_checks = bool(model_config.get("runtime_checks", True))
         self.return_attention_weights = bool(
@@ -155,7 +167,7 @@ class ContactWorldModel(nn.Module):
         self.emit_contact_probabilities = bool(
             model_config.get("emit_contact_probabilities", True)
         )
-        self.flow_dim = 4 * self.joint_dim + self.contact_state_count
+        self.flow_dim = len(self.predicted_state_streams) * self.joint_dim + self.contact_state_count
         self._validate_config()
 
         state_dropout = self.dropout if self.state_layers > 1 else 0.0
@@ -167,11 +179,20 @@ class ContactWorldModel(nn.Module):
             )
             for key in self.inputs
         })
-        self.state_fusion = nn.Sequential(
-            nn.LayerNorm(len(self.inputs) * self.hidden_dim),
-            nn.Linear(len(self.inputs) * self.hidden_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+        # Keep each configured state stream independent until it becomes one
+        # modal token.  Distinct embeddings preserve the stream identity even
+        # when two modalities have similar numerical ranges.
+        self.modality_embeddings = nn.ParameterDict()
+        self.state_pool_queries = nn.ParameterDict()
+        for key in self.inputs:
+            embedding = nn.Parameter(torch.empty(self.hidden_dim))
+            query = nn.Parameter(torch.empty(1, 1, self.hidden_dim))
+            nn.init.normal_(embedding, mean=0.0, std=0.02)
+            nn.init.normal_(query, mean=0.0, std=0.02)
+            self.modality_embeddings[key] = embedding
+            self.state_pool_queries[key] = query
+        self.state_pool_attention = nn.MultiheadAttention(
+            self.hidden_dim, self.attention_heads, dropout=self.dropout, batch_first=True
         )
         self.action_encoder = nn.GRU(
             self.action_dim, self.hidden_dim, self.action_layers,
@@ -183,6 +204,16 @@ class ContactWorldModel(nn.Module):
             self.hidden_dim, self.attention_heads, dropout=self.dropout, batch_first=True
         )
         self.state_action_dropout = nn.Dropout(self.dropout)
+        self.action_gate = nn.Sequential(
+            nn.LayerNorm(3 * self.hidden_dim),
+            nn.Linear(3 * self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        # Start close to the ungated state representation.  The gate can then
+        # learn to open action conditioning where it is useful.
+        nn.init.zeros_(self.action_gate[-1].weight)
+        nn.init.constant_(self.action_gate[-1].bias, math.log(0.1 / 0.9))
         self.state_action_norm = nn.LayerNorm(self.hidden_dim)
         self.state_action_ffn = nn.Sequential(
             nn.Linear(self.hidden_dim, 2 * self.hidden_dim), nn.SiLU(),
@@ -231,6 +262,8 @@ class ContactWorldModel(nn.Module):
             raise ValueError("model.dropout must be in [0, 1)")
         if not math.isfinite(self.contact_logit_scale) or self.contact_logit_scale <= 0:
             raise ValueError("model.contact_logit_scale must be positive")
+        if self.state_pooling not in {"last", "attention"}:
+            raise ValueError("model.state_pooling must be 'last' or 'attention'")
         if self.hidden_dim % self.attention_heads != 0:
             raise ValueError("model.hidden_dim must be divisible by attention_heads")
         if self.hidden_dim % self.flow_attention_heads != 0:
@@ -304,22 +337,34 @@ class ContactWorldModel(nn.Module):
             raise ValueError("action does not match the state batch")
         return states, action, valid
 
+    def _pool_state_history(self, key, encoded):
+        """Pool one encoded state history into a single modality token."""
+
+        if self.state_pooling == "last":
+            return encoded[:, -1]
+        query = self.state_pool_queries[key].expand(encoded.shape[0], -1, -1)
+        pooled, _ = self.state_pool_attention(
+            query=query,
+            key=encoded,
+            value=encoded,
+            need_weights=False,
+        )
+        return pooled[:, 0]
+
     def encode_conditions(self, batch: Mapping[str, torch.Tensor]):
         states, action, valid_action = self._condition_inputs(batch)
         encoded_states = {}
+        state_token_features = []
         for key in self.inputs:
             encoded_states[key], _ = self.state_encoders[key](states[key])
-        state_features = self.state_fusion(
-            torch.cat([encoded_states[key] for key in self.inputs], dim=-1)
-        )
+            pooled = self._pool_state_history(key, encoded_states[key])
+            state_token_features.append(pooled + self.modality_embeddings[key])
+        # [B, M, d], where M=len(model.inputs).  Keeping M dynamic enables
+        # input-stream ablations without changing the prediction head.
+        state_features = torch.stack(state_token_features, dim=1)
         masked_action = action.masked_fill(~valid_action[..., None], 0.0)
         action_features, _ = self.action_encoder(masked_action)
-        state_tokens = self.state_token_norm(
-            state_features
-            + _sinusoidal_position_encoding(
-                state_features.shape[1], self.hidden_dim, state_features
-            )
-        )
+        state_tokens = self.state_token_norm(state_features)
         action_tokens = self.action_token_norm(action_features + _sinusoidal_position_encoding(action_features.shape[1], self.hidden_dim, action_features))
         action_padding_mask = (
             ~valid_action if self.use_action_padding_mask else None
@@ -343,7 +388,17 @@ class ContactWorldModel(nn.Module):
                 need_weights=False,
             )
             attention_weights = None
-        state_action_features = self.state_action_norm(state_tokens + self.state_action_dropout(attended_action))
+        denominator = valid_action.sum(dim=1, keepdim=True).to(action.dtype).clamp_min(1.0)
+        pooled_action = (action_tokens * valid_action[..., None]).sum(dim=1) / denominator
+        pooled_action_per_modal = pooled_action[:, None, :].expand(
+            -1, state_tokens.shape[1], -1
+        )
+        gate_input = torch.cat(
+            (state_tokens, attended_action, pooled_action_per_modal), dim=-1
+        )
+        action_gates = torch.sigmoid(self.action_gate(gate_input))
+        gated_action = self.state_action_dropout(attended_action) * action_gates
+        state_action_features = self.state_action_norm(state_tokens + gated_action)
         state_action_features = self.state_action_ffn_norm(state_action_features + self.state_action_ffn(state_action_features))
         condition_memory = torch.cat((state_action_features, action_tokens), dim=1)
         memory_padding_mask = None
@@ -360,17 +415,18 @@ class ContactWorldModel(nn.Module):
                 ),
                 dim=1,
             )
-        denominator = valid_action.sum(dim=1, keepdim=True).to(action.dtype)
-        pooled_action = (action_tokens * valid_action[..., None]).sum(dim=1) / denominator
+        state_summary = state_features.mean(dim=1)
         global_condition = self.global_condition_projection(
-            torch.cat((state_features[:, -1], pooled_action), dim=-1)
+            torch.cat((state_summary, pooled_action), dim=-1)
         )
         result = {
             "encoded_states": encoded_states,
+            "predicted_state_streams": self.predicted_state_streams,
             "state_features": state_features,
             "state_tokens": state_tokens,
             "action_features": action_tokens,
             "state_action_features": state_action_features,
+            "action_gates": action_gates,
             "action_mask": valid_action,
             "condition_memory": condition_memory,
             "condition_memory_padding_mask": memory_padding_mask,
@@ -382,7 +438,7 @@ class ContactWorldModel(nn.Module):
 
     def _target_flow_state(self, batch, reference):
         values = []
-        for key in PREDICTED_STATE_STREAMS:
+        for key in self.predicted_state_streams:
             value = self._require_sequence(batch, f"{key}_future", horizon=self.future_horizon, feature_dim=self.joint_dim)
             if value.shape[0] != reference.shape[0] or value.device != reference.device or value.dtype != reference.dtype:
                 raise ValueError(f"{key}_future does not match the condition batch")
@@ -468,7 +524,7 @@ class ContactWorldModel(nn.Module):
     def _decoded_output(self, flow_state):
         result = {"flow_state_pred": flow_state}
         offset = 0
-        for key in PREDICTED_STATE_STREAMS:
+        for key in self.predicted_state_streams:
             result[f"{key}_pred"] = flow_state[..., offset:offset + self.joint_dim]
             offset += self.joint_dim
         if self.contact_state_count:

@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from model.pinn_model.contact_world_model import ContactWorldModel
@@ -73,3 +74,18 @@ def test_teacher_action_contract_mismatch_is_rejected():
             assert "contract mismatch" in str(error)
         else:
             raise AssertionError("action contract mismatch was not rejected")
+
+
+def test_teacher_action_start_offset_mismatch_is_rejected():
+    config = cfg()
+    config["dataloader"]["action_start_offset"] = 0
+    config["train_data"] = {"action_alignment": "next"}
+    trainer = ContactWorldModelOPDTrainer.__new__(ContactWorldModelOPDTrainer)
+    trainer.config = config
+    teacher = {
+        "dataloader": {**config["dataloader"], "action_start_offset": 1},
+        "model": config["model"],
+        "train_data": {"action_alignment": "next"},
+    }
+    with pytest.raises(ValueError, match="contract mismatch"):
+        trainer._validate_teacher_contract(teacher, {"normalizer": {"stats": {}}})

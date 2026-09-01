@@ -292,9 +292,10 @@ class ContactWorldModelTrainer(BaseTrainer):
         self, accumulator, predictions, targets, *, prefix, horizons
     ):
         """Collect normalized aggregate and per-stream horizon errors."""
-        state_keys = PREDICTED_STATE_STREAMS
+        state_keys = self.model.predicted_state_streams
+        reference_key = state_keys[0]
         usable_horizons = [
-            horizon for horizon in horizons if horizon <= predictions["q"].shape[1]
+            horizon for horizon in horizons if horizon <= predictions[reference_key].shape[1]
         ]
         for horizon in usable_horizons:
             state_errors = []
@@ -334,7 +335,7 @@ class ContactWorldModelTrainer(BaseTrainer):
     def _accumulate_physical_metrics(
         self, accumulator, predictions, batch, *, prefix, horizons
     ):
-        state_keys = PREDICTED_STATE_STREAMS
+        state_keys = self.model.predicted_state_streams
         physical_predictions = {}
         physical_targets = {}
         for key in state_keys:
@@ -346,8 +347,9 @@ class ContactWorldModelTrainer(BaseTrainer):
             physical_targets[key] = raw_target.to(
                 device=prediction.device, dtype=prediction.dtype
             )
+        reference_key = state_keys[0]
         for horizon in horizons:
-            if horizon > physical_predictions["q"].shape[1]:
+            if horizon > physical_predictions[reference_key].shape[1]:
                 continue
             for key in state_keys:
                 error = (
@@ -450,11 +452,11 @@ class ContactWorldModelTrainer(BaseTrainer):
                     )
                 predictions = {
                     key: integrated[f"{key}_pred"]
-                    for key in PREDICTED_STATE_STREAMS
+                    for key in self.model.predicted_state_streams
                 }
                 targets = {
                     key: batch[f"{key}_future"]
-                    for key in PREDICTED_STATE_STREAMS
+                    for key in self.model.predicted_state_streams
                 }
                 self._accumulate_rollout_state_metrics(
                     accumulator,
@@ -477,12 +479,12 @@ class ContactWorldModelTrainer(BaseTrainer):
                     contact_prediction,
                     contact_target,
                     prefix="rollout_contact",
-                    count=batch["q"].shape[0],
+                    count=batch[self.model.inputs[0]].shape[0],
                 )
                 if "rollout_contact_confusion" not in contact_prefixes:
                     contact_prefixes.append("rollout_contact")
                 accumulator["rollout_batches"] += 1
-                accumulator["rollout_samples"] += batch["q"].shape[0]
+                accumulator["rollout_samples"] += batch[self.model.inputs[0]].shape[0]
                 prediction_values = [predictions[key] for key in predictions]
                 prediction_values.append(integrated.get("flow_state_pred"))
                 finite = all(
@@ -516,7 +518,7 @@ class ContactWorldModelTrainer(BaseTrainer):
                     key: batch[key].clone() for key in self.model.inputs
                 }
                 running_batch = dict(batch)
-                free_predictions = {key: [] for key in PREDICTED_STATE_STREAMS}
+                free_predictions = {key: [] for key in self.model.predicted_state_streams}
                 free_contacts = []
                 for step in range(horizon):
                     running_batch.update(history)
@@ -610,7 +612,7 @@ class ContactWorldModelTrainer(BaseTrainer):
                         free_contact_prediction,
                         free_contact_target,
                         prefix="free_running_contact",
-                        count=batch["q"].shape[0],
+                        count=batch[self.model.inputs[0]].shape[0],
                     )
                     if "free_running_contact_confusion" not in contact_prefixes:
                         contact_prefixes.append("free_running_contact")

@@ -45,7 +45,6 @@ dataloader:
   pad_future: false
 
   expert_fps: 25.0
-  action_chunk_horizon: 8
   inference_delay_s: 0.0
   action_resample: nearest
 
@@ -74,10 +73,11 @@ model:
   joint_dim: 7
   action_dim: 7
   contact_state_count: 3
-  hidden_dim: 128
+  hidden_dim: 64
   state_layers: 2
   action_layers: 2
   attention_heads: 4
+  state_pooling: attention
   dropout: 0.01
   flow_layers: 4
   flow_attention_heads: 4
@@ -202,7 +202,7 @@ train:
     use_for_validation: true
   scheduler:
     name: cosine
-    T_max: 200
+    warmup_steps: 1000
     eta_min: 0.000001
   early_stopping:
     # Keep val_loss logging without stopping before the configured epoch budget.

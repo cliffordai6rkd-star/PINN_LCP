@@ -1,4 +1,4 @@
-"""Data losses for the q/dq/delta_q/tau/contact world model.
+"""Data losses for the configurable state/contact world model.
 
 ``delta_q`` is a real
 dataset channel and is supervised directly; it is never reconstructed from a
@@ -26,6 +26,10 @@ class ContactWorldModelLoss:
         model_config = config.get("model") or {}
         loss_config = config.get("loss") or {}
         self.joint_dim = int(model_config.get("joint_dim", 7))
+        configured_inputs = model_config.get("inputs", PREDICTED_STATE_STREAMS)
+        if isinstance(configured_inputs, str):
+            configured_inputs = [configured_inputs]
+        self.predicted_state_streams = tuple(str(value).lower() for value in configured_inputs)
         self.contact_state_count = int(model_config.get("contact_state_count", 3))
         if self.contact_state_count != 3:
             raise ValueError("model.contact_state_count must be exactly 3")
@@ -151,7 +155,7 @@ class ContactWorldModelLoss:
     def _flow_slices(self):
         slices = {}
         offset = 0
-        for key in PREDICTED_STATE_STREAMS:
+        for key in self.predicted_state_streams:
             slices[key] = slice(offset, offset + self.joint_dim)
             offset += self.joint_dim
         slices["contact"] = slice(offset, offset + self.contact_state_count)
@@ -164,22 +168,27 @@ class ContactWorldModelLoss:
         losses = {
             key: F.mse_loss(prediction[..., sl], target[..., sl])
             for key, sl in slices.items()
-            if key in PREDICTED_STATE_STREAMS
+            if key in self.predicted_state_streams
         }
         zero = prediction.new_zeros(())
-        total = (
-            self.flow_q_weight * losses["q"]
-            + self.flow_dq_weight * losses["dq"]
-            + self.flow_delta_q_weight * losses["delta_q"]
-            + self.flow_tau_weight * losses["tau"]
+        stream_weights = {
+            "q": self.flow_q_weight,
+            "dq": self.flow_dq_weight,
+            "delta_q": self.flow_delta_q_weight,
+            "tau": self.flow_tau_weight,
+        }
+        total = sum(
+            (stream_weights[key] * losses[key] for key in self.predicted_state_streams),
+            zero,
         )
         # Contact logits are categorical and are trained only by the data CE
         # below.  They intentionally do not enter continuous flow MSE.
-        return total, losses["q"], losses["dq"], losses["delta_q"], losses["tau"], zero
+        metric_losses = tuple(losses.get(key, zero) for key in PREDICTED_STATE_STREAMS)
+        return total, *metric_losses, zero
 
     def _direct_losses(self, out, batch):
         result = {}
-        for key in PREDICTED_STATE_STREAMS:
+        for key in self.predicted_state_streams:
             prediction = self._required(out, f"{key}_pred")
             target = self._required(batch, f"{key}_future").to(device=prediction.device, dtype=prediction.dtype)
             if prediction.shape != target.shape:
@@ -201,8 +210,8 @@ class ContactWorldModelLoss:
         return F.cross_entropy(logits.reshape(-1, self.contact_state_count), labels.reshape(-1), weight=weight)
 
     def _kinematic_consistency(self, out, batch):
-        if self.kinematic_consistency_weight <= 0.0 or "dq" not in batch:
-            return out["q_pred"].new_zeros(())
+        if self.kinematic_consistency_weight <= 0.0 or not {"q", "dq"}.issubset(self.predicted_state_streams) or "dq" not in batch:
+            return out[f"{self.predicted_state_streams[0]}_pred"].new_zeros(())
         q_future = self._physical("q", self._required(out, "q_pred"))
         dq_future = self._physical("dq", self._required(out, "dq_pred"))
         q_history = self._physical("q", self._required(batch, "q"))
@@ -224,8 +233,9 @@ class ContactWorldModelLoss:
         return F.mse_loss(increments, velocity_integral)
 
     def _ddq_smoothness(self, out):
-        if self.ddq_smoothness_weight <= 0.0:
-            return out["dq_pred"].new_zeros(())
+        if self.ddq_smoothness_weight <= 0.0 or "dq" not in self.predicted_state_streams:
+            reference_key = self.predicted_state_streams[0]
+            return out[f"{reference_key}_pred"].new_zeros(())
         dq_future = self._physical("dq", self._required(out, "dq_pred"))
         if dq_future.shape[1] < 2:
             return dq_future.new_zeros(())
@@ -264,15 +274,24 @@ class ContactWorldModelLoss:
             raise KeyError("model output must contain flow velocity prediction and target")
         flow_loss, flow_q, flow_dq, flow_delta_q, flow_tau, flow_contact = self.flow_loss_components(flow_prediction, flow_target)
         direct = self._direct_losses(out, batch)
-        contact_loss = self._contact_loss(out, batch, out["q_pred"])
+        contact_loss = self._contact_loss(
+            out,
+            batch,
+            out[f"{self.predicted_state_streams[0]}_pred"],
+        )
         kinematic_loss = self._kinematic_consistency(out, batch)
         smoothness_loss = self._ddq_smoothness(out)
         total = (
             self.flow_weight * flow_loss
-            + self.q_weight * direct["q"]
-            + self.dq_weight * direct["dq"]
-            + self.delta_q_weight * direct["delta_q"]
-            + self.tau_weight * direct["tau"]
+            + sum(
+                (
+                    {"q": self.q_weight, "dq": self.dq_weight,
+                     "delta_q": self.delta_q_weight, "tau": self.tau_weight}[key]
+                    * direct[key]
+                    for key in self.predicted_state_streams
+                ),
+                flow_loss.new_zeros(()),
+            )
             + self.contact_weight * contact_loss
             + self.kinematic_consistency_weight * kinematic_loss
             + self.ddq_smoothness_weight * self._ddq_smoothness_factor * smoothness_loss
@@ -284,25 +303,23 @@ class ContactWorldModelLoss:
             "flow_dq_loss": flow_dq.detach(),
             "flow_delta_q_loss": flow_delta_q.detach(),
             "flow_tau_loss": flow_tau.detach(),
-            "q_loss": direct["q"].detach(),
-            "dq_loss": direct["dq"].detach(),
-            "delta_q_loss": direct["delta_q"].detach(),
-            "tau_loss": direct["tau"].detach(),
+            **{f"{key}_loss": direct[key].detach() for key in self.predicted_state_streams},
             "contact_loss": contact_loss.detach(),
             "kinematic_consistency_loss": kinematic_loss.detach(),
             "ddq_smoothness_loss": smoothness_loss.detach(),
             "ddq_smoothness_factor": flow_loss.new_tensor(self._ddq_smoothness_factor),
         }
         if self.emit_physical_diagnostics:
-            for key in PREDICTED_STATE_STREAMS:
+            for key in self.predicted_state_streams:
                 out[f"{key}_pred_physical"] = self._physical(
                     key, out[f"{key}_pred"]
                 )
-            out["ddq_pred_physical"] = (
-                torch.diff(out["dq_pred_physical"], dim=1) / self.dt
-                if out["dq_pred_physical"].shape[1] > 1
-                else out["dq_pred_physical"].new_zeros(
-                    out["dq_pred_physical"].shape
+            if "dq" in self.predicted_state_streams:
+                out["ddq_pred_physical"] = (
+                    torch.diff(out["dq_pred_physical"], dim=1) / self.dt
+                    if out["dq_pred_physical"].shape[1] > 1
+                    else out["dq_pred_physical"].new_zeros(
+                        out["dq_pred_physical"].shape
+                    )
                 )
-            )
         return total, loss_dict

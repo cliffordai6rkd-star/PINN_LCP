@@ -1920,7 +1920,6 @@ class BaseTrainer:
         
     
     def save_loss_plot(self):
-        
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -1934,54 +1933,72 @@ class BaseTrainer:
             item.get("train_eval_loss") for item in self.loss_history
         ]
         val_losses = [item.get("val_loss") for item in self.loss_history]
-        has_train_eval = any(loss is not None for loss in train_eval_losses)
-        has_val = any(loss is not None for loss in val_losses)
 
-        plt.figure()
-        plt.plot(epochs, losses, label="train online")
+        def finite_series(x_values, y_values):
+            """Drop skipped validation epochs and non-finite metrics."""
+
+            points = []
+            for x_value, y_value in zip(x_values, y_values):
+                if y_value is None:
+                    continue
+                try:
+                    y_value = float(y_value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(y_value):
+                    points.append((x_value, y_value))
+            if not points:
+                return [], []
+            return tuple(zip(*points))
+
+        train_epochs, train_values = finite_series(epochs, losses)
+        eval_epochs, eval_values = finite_series(epochs, train_eval_losses)
+        val_epochs, val_values = finite_series(epochs, val_losses)
+        train_steps, train_step_values = finite_series(steps, losses)
+        eval_steps, eval_step_values = finite_series(steps, train_eval_losses)
+        val_steps, val_step_values = finite_series(steps, val_losses)
+        has_train_eval = bool(eval_values)
+        has_val = bool(val_values)
+
+        def style_axis(axis, xlabel, ylabel):
+            axis.set_xlabel(xlabel)
+            axis.set_ylabel(ylabel)
+            axis.legend()
+            axis.grid(True)
+
+        figure, axis = plt.subplots()
+        axis.plot(train_epochs, train_values, label="train online")
         if has_train_eval:
-            plt.plot(epochs, train_eval_losses, label="train eval")
-        plt.xlabel("epoch")
-        plt.ylabel("avg_loss")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        path = self.output_dir / "loss_epoch.png"
-        # plt.savefig(path)
-        plt.close()
+            axis.plot(eval_epochs, eval_values, label="train eval")
+        style_axis(axis, "epoch", "avg_loss")
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "loss_epoch.png")
+        plt.close(figure)
 
         if has_val:
-            plt.figure()
-            plt.plot(epochs, val_losses, label="val", color="tab:orange")
-            plt.xlabel("epoch")
-            plt.ylabel("val_loss")
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            path = self.output_dir / "val_loss_epoch.png"
-            # plt.savefig(path)
-            plt.close()
+            figure, axis = plt.subplots()
+            axis.plot(val_epochs, val_values, label="val", color="tab:orange")
+            style_axis(axis, "epoch", "val_loss")
+            figure.tight_layout()
+            figure.savefig(self.output_dir / "val_loss_epoch.png")
+            plt.close(figure)
 
-        plt.figure()
-        plt.plot(steps, losses, label="train online")
+        figure, axis = plt.subplots()
+        axis.plot(train_steps, train_step_values, label="train online")
         if has_train_eval:
-            plt.plot(steps, train_eval_losses, label="train eval")
+            axis.plot(eval_steps, eval_step_values, label="train eval")
         if has_val:
-            plt.plot(steps, val_losses, label="val")
-        plt.xlabel("steps")
-        plt.ylabel("avg_loss")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        path = self.output_dir / "loss_steps.png"
-        # plt.savefig(path)
-        plt.close()
+            axis.plot(val_steps, val_step_values, label="val")
+        style_axis(axis, "steps", "avg_loss")
+        figure.tight_layout()
+        figure.savefig(self.output_dir / "loss_steps.png")
+        plt.close(figure)
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-        axes[0].plot(epochs, losses, label="train online")
+        axes[0].plot(train_epochs, train_values, label="train online")
         if has_train_eval:
-            axes[0].plot(epochs, train_eval_losses, label="train eval")
+            axes[0].plot(eval_epochs, eval_values, label="train eval")
         axes[0].set_xlabel("epoch")
         axes[0].set_ylabel("avg_loss")
         axes[0].set_title("Train Loss / Epoch")
@@ -1989,7 +2006,7 @@ class BaseTrainer:
         axes[0].grid(True)
 
         if has_val:
-            axes[1].plot(epochs, val_losses, label="val", color="tab:orange")
+            axes[1].plot(val_epochs, val_values, label="val", color="tab:orange")
         axes[1].set_xlabel("epoch")
         axes[1].set_ylabel("val_loss")
         axes[1].set_title("Val Loss / Epoch")
@@ -1997,11 +2014,11 @@ class BaseTrainer:
             axes[1].legend()
         axes[1].grid(True)
 
-        axes[2].plot(steps, losses, label="train online")
+        axes[2].plot(train_steps, train_step_values, label="train online")
         if has_train_eval:
-            axes[2].plot(steps, train_eval_losses, label="train eval")
+            axes[2].plot(eval_steps, eval_step_values, label="train eval")
         if has_val:
-            axes[2].plot(steps, val_losses, label="val")
+            axes[2].plot(val_steps, val_step_values, label="val")
         axes[2].set_xlabel("steps")
         axes[2].set_ylabel("loss")
         axes[2].set_title("Loss / Steps")

@@ -18,7 +18,7 @@ from typing import Mapping
 import torch
 import yaml
 
-from model.pinn_model.contact_world_model import PREDICTED_STATE_STREAMS
+from model.pinn_model.contact_world_model import ContactWorldModel, PREDICTED_STATE_STREAMS
 from model.pinn_model.contact_gate import (
     ContactGateConfig,
     batched_hysteresis_three_phase_mask,
@@ -185,6 +185,16 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
                 "distillation.rollout_contact.max_model_batch_size must be positive"
             )
         if self.rollout_contact_enabled:
+            required_streams = {"q", "dq", "delta_q", "tau"}
+            configured_streams = {
+                str(value).lower()
+                for value in (self.config.get("model") or {}).get("inputs", ())
+            }
+            if not required_streams.issubset(configured_streams):
+                raise ValueError(
+                    "rollout contact supervision requires model.inputs to contain "
+                    "q, dq, delta_q, and tau"
+                )
             configured_contact_states = int(
                 (self.config.get("model") or {}).get("contact_state_count", 3)
             )
@@ -283,9 +293,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         teacher_config = checkpoint.get("config", self.config)
         teacher_config = copy.deepcopy(dict(teacher_config))
-        if checkpoint.get("model_version") != "contact_world_model_v1":
+        if checkpoint.get("model_version") != ContactWorldModel.MODEL_VERSION:
             raise ValueError(
-                "Teacher checkpoint is not a Contact World Model v1 checkpoint; "
+                "Teacher checkpoint is not a compatible Contact World Model checkpoint; "
                 "retrain the Teacher with the canonical model"
             )
         self._validate_teacher_contract(teacher_config, checkpoint)
@@ -350,6 +360,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             "model.contact_state_count": (teacher_model.get("contact_state_count"), student_model.get("contact_state_count")),
             "dataloader.action_key": (teacher_data.get("action_key"), student_data.get("action_key")),
             "dataloader.action_condition_horizon": (teacher_data.get("action_condition_horizon"), student_data.get("action_condition_horizon")),
+            # The offset is part of the temporal action contract: changing it
+            # from 0 to 1 shifts every condition window by one expert token.
+            "dataloader.action_start_offset": (teacher_data.get("action_start_offset", 1), student_data.get("action_start_offset", 1)),
             "train_data.action_alignment": ((teacher_config.get("train_data") or {}).get("action_alignment"), (self.config.get("train_data") or {}).get("action_alignment")),
             "dataloader.normalize_mode": (teacher_data.get("normalize_mode"), student_data.get("normalize_mode")),
         }
@@ -383,8 +396,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
     @staticmethod
     def _state_keys(model):
         """Return state streams that can be committed to model history."""
-        del model
-        return list(PREDICTED_STATE_STREAMS)
+        if model is None:
+            return list(PREDICTED_STATE_STREAMS)
+        return list(model.predicted_state_streams)
 
     def _distillation_terms(self):
         """Return continuous state endpoint terms for OPD.
@@ -394,7 +408,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         Teacher/Student regression target.
         """
 
-        terms = [(key, f"{key}_pred", 1.0) for key in PREDICTED_STATE_STREAMS]
+        terms = [(key, f"{key}_pred", 1.0) for key in self.model.predicted_state_streams]
         return tuple(terms)
 
     def _rollout_contact_signal(self, tau_ext):
@@ -433,7 +447,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         """
 
         if not self.rollout_contact_enabled:
-            zero = student_out["q_pred"].new_zeros(())
+            zero = student_out[f"{self.model.predicted_state_streams[0]}_pred"].new_zeros(())
             return zero, {
                 "rollout_contact_ce": zero.detach(),
                 "rollout_contact_physical": zero.detach(),
@@ -615,7 +629,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             )
             weights.append(weight)
         if not losses:
-            return student_out["q_pred"].new_zeros(()), student_out
+            return student_out[f"{self.model.predicted_state_streams[0]}_pred"].new_zeros(()), student_out
         return torch.stack(losses).sum() / sum(weights), student_out
 
     def _write_back(
@@ -674,7 +688,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             rollout_steps = self.rollout_steps
         rollout_steps = int(rollout_steps)
         if rollout_steps == 0:
-            zero = batch["q"].new_zeros(())
+            zero = batch[self.model.predicted_state_streams[0]].new_zeros(())
             return zero, {
                 "rollout_contact_ce": zero.detach(),
                 "rollout_contact_physical": zero.detach(),

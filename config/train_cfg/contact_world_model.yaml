@@ -27,7 +27,6 @@ dataloader:
   state_history_horizon: 50
   prediction_horizon: 32
   action_condition_horizon: 8
-  action_chunk_horizon: 8
   action_start_offset: 1
   action_condition_mode: direct
   action_key: action.ee_pose
@@ -74,6 +73,7 @@ model:
   state_layers: 2
   action_layers: 2
   attention_heads: 4
+  state_pooling: attention
   dropout: 0.01
 
   flow_layers: 4
@@ -111,7 +111,7 @@ loss:
 
 train:
   device: cuda:0
-  batch_size: 512
+  batch_size: 64
   # Keep host-memory pressure bounded on the 15 GiB training workstation.
   # Validation runs in the main process by default (see val_num_workers).
   num_workers: 2
@@ -120,9 +120,9 @@ train:
   val_prefetch_factor: 1
   val_persistent_workers: false
   # Epoch-based budget and chronological checkpoint retention.
-  num_epochs: 2000
+  num_epochs: 1000
   # Save often enough that a host OOM loses at most a few epochs.
-  checkpoint_every_epochs: 200
+  checkpoint_every_epochs: 100
   val_ratio: 0.1
   # Match DP-style validation cadence; epoch 0 is included.
   val_every: 20  # val_episode_indices: [15, 50, 90]
@@ -165,9 +165,9 @@ train:
     # ODE integration; set to 32 for a full-horizon stress test.
     free_running_steps: 8
     free_running_max_batches: 8
-    horizons: [1, 4, 8, 16, 32]
+    horizons: [16, 32]
     divergence_abs_threshold: 100.0
-  output_dir: outputs/contact_world_model_ep1
+  output_dir: outputs/contact_world_model_ep2_multytoken
   monitor_key: val_loss
   top_k: 10
   save_latest_checkpoint: true

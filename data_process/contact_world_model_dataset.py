@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from tqdm.auto import tqdm
 
 from data_process.causal_data_filter import (
     filter_episode_values,
@@ -192,7 +193,6 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         self.future_horizon = int(self.data_config.get("prediction_horizon", 40))
         self.high_fps = int(self.data_config.get("high_fps", 80))
         self.expert_fps = float(self.data_config.get("expert_fps", 4.0))
-        self.action_horizon = int(self.data_config.get("action_chunk_horizon", 8))
         self.configured_action_condition_horizon = int(self.data_config.get("action_condition_horizon", 8))
         # Optional per-rollout action plans for OPD.  Entry zero is the
         # ordinary action chunk at the sampled state; later entries are
@@ -340,7 +340,6 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             "state_history_horizon": self.history_horizon,
             "prediction_horizon": self.future_horizon,
             "high_fps": self.high_fps,
-            "action_chunk_horizon": self.action_horizon,
             "action_condition_horizon": self.configured_action_condition_horizon,
         }
         invalid = [key for key, value in positive.items() if value <= 0]
@@ -462,7 +461,13 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             )
 
         loaded = []
-        for source_position, source_dataset in enumerate(self.source_datasets):
+        source_iterator = tqdm(
+            enumerate(self.source_datasets),
+            total=len(self.source_datasets),
+            desc="load WM sources",
+            unit="source",
+        )
+        for source_position, source_dataset in source_iterator:
             high_tensors, high_ts, anchor_ts = self._load_single_lerobot_columns(
                 source_dataset.hf_dataset,
                 source_dataset,
@@ -575,7 +580,12 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         high_tensors = {}
         source_rows = None
         block_size = None
-        for key, dataset_key in self.high_keys.items():
+        for key, dataset_key in tqdm(
+            self.high_keys.items(),
+            total=len(self.high_keys),
+            desc="convert WM columns",
+            unit="column",
+        ):
             if dataset_key not in columns:
                 # Older v3 exports did not materialize observation.delta_q.
                 # When the same row contains the command action and measured
@@ -858,10 +868,16 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             ),
         )
         columns = direct.hf_dataset[:]
-        high_tensors = {
-            key: self._as_tensor(columns[key], dtype=torch.float32).contiguous()
-            for key in self.h5_high_fields
-        }
+        high_tensors = {}
+        for key in tqdm(
+            self.h5_high_fields,
+            total=len(self.h5_high_fields),
+            desc="convert H5 WM columns",
+            unit="column",
+        ):
+            high_tensors[key] = self._as_tensor(
+                columns[key], dtype=torch.float32
+            ).contiguous()
         high_ts = self._as_tensor(
             columns["__h5_timestamp_ns"], dtype=torch.int64
         ).reshape(-1).contiguous()
