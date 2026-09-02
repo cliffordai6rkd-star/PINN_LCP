@@ -358,6 +358,11 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             "model.joint_dim": (teacher_model.get("joint_dim"), student_model.get("joint_dim")),
             "model.action_dim": (teacher_model.get("action_dim"), student_model.get("action_dim")),
             "model.contact_state_count": (teacher_model.get("contact_state_count"), student_model.get("contact_state_count")),
+            # Teacher and Student may differ in capacity, but their token and
+            # flow semantics must match for endpoint distillation to be valid.
+            "model.state_pooling": (teacher_model.get("state_pooling", "attention"), student_model.get("state_pooling", "attention")),
+            "model.flow_solver": (teacher_model.get("flow_solver", "heun"), student_model.get("flow_solver", "heun")),
+            "model.flow_source_mode": (teacher_model.get("flow_source_mode", "gaussian"), student_model.get("flow_source_mode", "gaussian")),
             "dataloader.action_key": (teacher_data.get("action_key"), student_data.get("action_key")),
             "dataloader.action_condition_horizon": (teacher_data.get("action_condition_horizon"), student_data.get("action_condition_horizon")),
             # The offset is part of the temporal action contract: changing it

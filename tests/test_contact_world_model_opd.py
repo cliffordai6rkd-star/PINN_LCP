@@ -89,3 +89,18 @@ def test_teacher_action_start_offset_mismatch_is_rejected():
     }
     with pytest.raises(ValueError, match="contract mismatch"):
         trainer._validate_teacher_contract(teacher, {"normalizer": {"stats": {}}})
+
+
+def test_teacher_state_pooling_mismatch_is_rejected():
+    config = cfg()
+    config["model"]["state_pooling"] = "attention"
+    config["train_data"] = {"action_alignment": "next"}
+    trainer = ContactWorldModelOPDTrainer.__new__(ContactWorldModelOPDTrainer)
+    trainer.config = config
+    teacher = {
+        "dataloader": config["dataloader"],
+        "model": {**config["model"], "state_pooling": "last"},
+        "train_data": config["train_data"],
+    }
+    with pytest.raises(ValueError, match="model.state_pooling"):
+        trainer._validate_teacher_contract(teacher, {"normalizer": {"stats": {}}})

@@ -1,6 +1,6 @@
 # Contact WM OPD Student configuration.
 # Train the Teacher first with contact_world_model.yaml, then point
-# distillation.teacher_checkpoint_path to a Contact World Model v1 checkpoint.
+# distillation.teacher_checkpoint_path to a Contact World Model v2 checkpoint.
 
 wm_v3_only: true
 
@@ -74,16 +74,16 @@ model:
   action_dim: 7
   contact_state_count: 3
   hidden_dim: 64
-  state_layers: 2
-  action_layers: 2
+  state_layers: 1
+  action_layers: 1
   attention_heads: 4
   state_pooling: attention
   dropout: 0.01
-  flow_layers: 4
+  flow_layers: 2
   flow_attention_heads: 4
-  flow_ffn_multiplier: 4
+  flow_ffn_multiplier: 2
   # Student uses 2 Heun steps (4 velocity evaluations); Teacher uses 8 steps.
-  flow_inference_steps: 2
+  flow_inference_steps: 4
   flow_solver: heun
   flow_source_mode: gaussian
   contact_logit_scale: 4.0
@@ -116,7 +116,7 @@ loss:
 
 distillation:
   enabled: true
-  teacher_checkpoint_path: outputs/contact_world_model_v1/checkpoints
+  teacher_checkpoint_path: outputs/contact_world_model_ep2_multytoken/checkpoints
   teacher_steps: 8
   student_steps: 2
   weight: 1.0

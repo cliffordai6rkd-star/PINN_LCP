@@ -120,12 +120,12 @@ train:
   val_prefetch_factor: 1
   val_persistent_workers: false
   # Epoch-based budget and chronological checkpoint retention.
-  num_epochs: 1000
+  num_epochs: 50
   # Save often enough that a host OOM loses at most a few epochs.
-  checkpoint_every_epochs: 100
+  checkpoint_every_epochs: 10
   val_ratio: 0.1
   # Match DP-style validation cadence; epoch 0 is included.
-  val_every: 20  # val_episode_indices: [15, 50, 90]
+  val_every: 5  # val_episode_indices: [15, 50, 90]
   split_mode: episode
   seed: 42
 
@@ -167,9 +167,9 @@ train:
     free_running_max_batches: 8
     horizons: [16, 32]
     divergence_abs_threshold: 100.0
-  output_dir: outputs/contact_world_model_ep2_multytoken
+  output_dir: outputs/contact_world_model_ep4
   monitor_key: val_loss
-  top_k: 10
+  top_k: 5
   save_latest_checkpoint: true
   contact_sampling:
     enabled: true
