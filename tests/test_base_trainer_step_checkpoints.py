@@ -56,7 +56,7 @@ def test_step_training_retains_latest_topk_and_latest_file(tmp_path):
             "batch_size": 2,
             "num_workers": 0,
             "num_epochs": 100,
-            "max_train_steps": 5,
+            "max_optimizer_steps": 5,
             "checkpoint_every_steps": 2,
             "top_k": 2,
             "save_latest_checkpoint": True,
@@ -86,6 +86,36 @@ def test_step_training_retains_latest_topk_and_latest_file(tmp_path):
     assert summary["checkpoint_every_steps"] == 2
     assert [item["global_step"] for item in summary["best_checkpoints"]] == [4, 5]
     assert trainer.scheduler.last_epoch == 5
+
+
+def test_step_checkpoint_is_not_delayed_to_epoch_boundary(tmp_path):
+    config = {
+        "train": {
+            "device": "cpu",
+            "batch_size": 1,
+            "num_workers": 0,
+            "num_epochs": 100,
+            "max_optimizer_steps": 5,
+            "checkpoint_every_steps": 2,
+            "top_k": 3,
+            "save_latest_checkpoint": True,
+            "val_ratio": 0.0,
+            "output_dir": str(tmp_path),
+            "scheduler": {"name": "none"},
+            "ema": {"enabled": False},
+            "wandb": {"enabled": False},
+        }
+    }
+    trainer = _Trainer(config)
+    trainer.save_loss_plot = lambda: None
+    trainer.train()
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    assert sorted(path.name for path in checkpoint_dir.glob("step_*.pt")) == [
+        "step_00000002.pt",
+        "step_00000004.pt",
+        "step_00000005.pt",
+    ]
 
 
 def test_step_training_defaults_null_top_k(tmp_path):

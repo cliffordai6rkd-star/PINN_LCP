@@ -220,6 +220,13 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 self.action_resample,
             )
         ).lower()
+        augmentation = self.data_config.get("action_augmentation") or {}
+        self.action_augmentation_enabled = bool(augmentation.get("enabled", False))
+        self.action_gaussian_std = float(augmentation.get("gaussian_std", 0.0))
+        self.action_temporal_jitter = int(augmentation.get("temporal_jitter", 0))
+        self.cached_policy_action_probability = float(
+            augmentation.get("cached_policy_action_probability", 0.0)
+        )
         self.pad_history = bool(self.data_config.get("pad_history", True))
         self.pad_future = bool(self.data_config.get("pad_future", False))
         self.high_timestamp_key = str(
@@ -322,6 +329,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         self.raw_idx_to_episode_end = {}
         self.raw_idx_to_episode = {}
         self._build_valid_indices()
+        self.importance_weight_by_sample_index = {}
 
         self.normalize_mode = self.data_config.get("normalize_mode", "gaussian")
         self.normalize_lowdim_keys = list(
@@ -364,6 +372,19 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         if self.action_alignment not in {"nearest", "previous", "next"}:
             raise ValueError(
                 "train_data.action_alignment must be 'previous', 'next', or 'nearest'"
+            )
+        if self.action_gaussian_std < 0.0:
+            raise ValueError("action_augmentation.gaussian_std must be non-negative")
+        if self.action_temporal_jitter < 0:
+            raise ValueError("action_augmentation.temporal_jitter must be non-negative")
+        if not 0.0 <= self.cached_policy_action_probability <= 1.0:
+            raise ValueError(
+                "action_augmentation.cached_policy_action_probability must be in [0, 1]"
+            )
+        if self.action_augmentation_enabled and self.cached_policy_action_probability > 0.0:
+            raise ValueError(
+                "cached policy-action augmentation requires a configured cached-policy "
+                "dataset field; none is available in the current schema"
             )
         if self.v3_only and not self.train_data_config.get("sources"):
             if str(self.data_config.get("repo_id", "")).strip() == "":
@@ -1447,6 +1468,15 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             sample[f"{key}_future_raw"] = sample[f"{key}_future"].clone()
         sample["contact_future"] = self.contact.index_select(0, future)
         sample["contact"] = self.contact.index_select(0, history)
+        sample["future_phase"] = torch.tensor(
+            self.future_contact_phase(high_idx), dtype=torch.long
+        )
+        sample["importance_weight"] = torch.tensor(
+            self.importance_weight_by_sample_index.get(
+                high_idx, 1.0
+            ),
+            dtype=torch.float32,
+        )
         for key in self.normalize_lowdim_keys:
             source_key = (
                 "action_raw"
@@ -1458,7 +1488,23 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             future_key = f"{key}_future"
             if future_key in sample:
                 sample[future_key] = self._normalize(key, sample[future_key])
-        sample["action"] = sample["action_raw"]
+        sample.setdefault("action", sample["action_raw"])
+        if self.action_augmentation_enabled:
+            action_value = sample["action"]
+            if self.action_temporal_jitter:
+                shift = int(
+                    torch.randint(
+                        -self.action_temporal_jitter,
+                        self.action_temporal_jitter + 1,
+                        (),
+                    ).item()
+                )
+                indices = torch.arange(action_value.shape[0]) + shift
+                indices = indices.clamp(0, action_value.shape[0] - 1)
+                action_value = action_value.index_select(0, indices)
+            if self.action_gaussian_std:
+                action_value = action_value + torch.randn_like(action_value) * self.action_gaussian_std
+            sample["action"] = action_value
         return sample
 
     def __getitem__(self, index):

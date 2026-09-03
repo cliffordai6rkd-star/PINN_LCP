@@ -19,6 +19,15 @@ train_data:
       repo_id: cucumber_peeling_lerobot_v3
       root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
 
+action_contract:
+  semantic: expert_policy_action_target
+  type: absolute_ee_pose
+  coordinate_frame: link7
+  representation: xyz_quaternion
+  quaternion_order: xyzw
+  quaternion_sign: canonical_w_nonnegative
+  absolute_or_relative: absolute
+
 dataloader:
   backend: lerobot
   v3_only: true
@@ -39,6 +48,11 @@ dataloader:
   expert_fps: 25.0
   inference_delay_s: 0.0
   action_resample: nearest
+  action_augmentation:
+    enabled: false
+    gaussian_std: 0.0
+    temporal_jitter: 0
+    cached_policy_action_probability: 0.0
 
   filters:
     q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
@@ -54,6 +68,9 @@ contact_gate:
   enabled: true
   label_mode: three_phase
   metric: tau_ext_l1
+  tau_ext_source: tau_measured_minus_tau_free
+  phase_label_mode: transition_band
+  precontact_duration_s: 0.1
   # Selected from the H5 tau_ext statistics and validated with 5-frame
   # hysteresis: free <= off, rising transition in between, contact >= on.
   # Units follow metric: N for force_xyz_l2, N.m for tau_ext_l1. Selecting
@@ -82,6 +99,8 @@ model:
   flow_inference_steps: 8
   flow_solver: heun
   flow_source_mode: gaussian
+  action_time_alignment: zoh
+  contact_head_hidden_dim: 64
   contact_logit_scale: 4.0
   # Fast-path settings: direct action chunks are complete, and these values
   # are not needed by the training objective.
@@ -99,9 +118,20 @@ loss:
   q_weight: 1.0
   tau_weight: 1.0
   contact_weight: 1.0
+  endpoint_loss:
+    enabled: true
+    initial_weight: 0.1
+    final_weight: 0.0
+    decay_fraction: 0.3
+    schedule: linear
   dq_weight: 0.25
   delta_q_weight: 0.25
   kinematic_consistency_weight: 0.01
+  # Fixed physical radian scales keep this regularizer independent of batch
+  # composition. Tune only from training-set statistics, never per batch.
+  kinematic_joint_scales: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  delta_q_consistency_weight: 0.0
+  torque_contact_weight: 0.0
   ddq_smoothness_weight: 0.01
   ddq_smoothness_warmup_steps: 5500
   ddq_smoothness_huber_delta: 1.0
@@ -119,10 +149,11 @@ train:
   val_num_workers: 0
   val_prefetch_factor: 1
   val_persistent_workers: false
-  # Epoch-based budget and chronological checkpoint retention.
-  num_epochs: 50
-  # Save often enough that a host OOM loses at most a few epochs.
-  checkpoint_every_epochs: 10
+  # Optimizer updates are the authoritative training budget. Epoch remains a
+  # data-pass/logging counter and does not terminate this run.
+  max_optimizer_steps: 50000
+  num_epochs: 1000000
+  checkpoint_every_steps: 10000
   val_ratio: 0.1
   # Match DP-style validation cadence; epoch 0 is included.
   val_every: 5  # val_episode_indices: [15, 50, 90]
@@ -141,7 +172,7 @@ train:
   defer_metric_sync: true
   # Only these tensors participate in the model/loss; indices, timestamps and
   # *_raw diagnostics stay on CPU for logging/visualization.
-  device_batch_keys: [q, dq, delta_q, tau, action, action_mask, q_future, dq_future, delta_q_future, tau_future, contact_future]
+  device_batch_keys: [q, dq, delta_q, tau, action, action_mask, q_future, dq_future, delta_q_future, tau_future, contact_future, importance_weight]
   amp:
     enabled: true
     dtype: bfloat16
@@ -151,7 +182,7 @@ train:
   # replace_val_loss is true only the monitor scalar is replaced.
   rollout_validation:
     enabled: true
-    replace_val_loss: true
+    replace_val_loss: false
     steps: 8
     solver: heun
     # Reuse the same source for every checkpoint so score changes reflect
@@ -167,12 +198,19 @@ train:
     free_running_max_batches: 8
     horizons: [16, 32]
     divergence_abs_threshold: 100.0
+  probabilistic_validation:
+    enabled: true
+    num_samples: 8
+    max_batches: 8
+    every: 1
+    replace_val_loss: true
   output_dir: outputs/contact_world_model_ep4
   monitor_key: val_loss
   top_k: 5
   save_latest_checkpoint: true
   contact_sampling:
     enabled: true
+    # free, pre-contact, contact; aggregate the existing future labels only.
     phase_weights: [1.0, 5.0, 5.0]
     future_phase_reduction: max
     replacement: true
@@ -186,7 +224,7 @@ train:
 
   scheduler:
     name: cosine
-    # Total steps are inferred from num_epochs * len(train_loader).
+    # Total schedule length is train.max_optimizer_steps.
     warmup_steps: 500
     eta_min: 0.000001
 

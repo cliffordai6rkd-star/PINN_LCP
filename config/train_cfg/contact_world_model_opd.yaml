@@ -22,6 +22,15 @@ train_data:
       repo_id: cucumber_peeling_lerobot_v3
       root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
 
+action_contract:
+  semantic: expert_policy_action_target
+  type: absolute_ee_pose
+  coordinate_frame: link7
+  representation: xyz_quaternion
+  quaternion_order: xyzw
+  quaternion_sign: canonical_w_nonnegative
+  absolute_or_relative: absolute
+
 dataloader:
   # repo_id: push_button_lerobot_v3
   # root: ../nero_ws/runs/push_button_lerobot_v3
@@ -34,7 +43,7 @@ dataloader:
   action_condition_horizon: 8
   # Re-anchor the direct action plan at each high-rate OPD state.  Entry zero
   # is the current chunk; later entries cover the rollout-depth curriculum.
-  action_rollout_horizon: 16
+  action_rollout_horizon: 17
   action_condition_mode: direct
   action_key: action.ee_pose
   high_timestamp_key: timing.state_timestamp_ns
@@ -47,6 +56,11 @@ dataloader:
   expert_fps: 25.0
   inference_delay_s: 0.0
   action_resample: nearest
+  action_augmentation:
+    enabled: false
+    gaussian_std: 0.0
+    temporal_jitter: 0
+    cached_policy_action_probability: 0.0
 
   filters:
     q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 2}]}
@@ -62,6 +76,9 @@ contact_gate:
   enabled: true
   label_mode: three_phase
   metric: tau_ext_l1
+  tau_ext_source: tau_measured_minus_tau_free
+  phase_label_mode: transition_band
+  precontact_duration_s: 0.1
   thresholds:
     tau_ext_l1: {"off": 0.75, "on": 3}
   consecutive_frames: 5
@@ -83,9 +100,11 @@ model:
   flow_attention_heads: 4
   flow_ffn_multiplier: 2
   # Student uses 2 Heun steps (4 velocity evaluations); Teacher uses 8 steps.
-  flow_inference_steps: 4
+  flow_inference_steps: 2
   flow_solver: heun
   flow_source_mode: gaussian
+  action_time_alignment: zoh
+  contact_head_hidden_dim: 32
   contact_logit_scale: 4.0
   # Direct action chunks are complete. These diagnostics do not participate in
   # the OPD objective and otherwise repeat work across every Student call.
@@ -103,10 +122,19 @@ loss:
   q_weight: 1.0
   tau_weight: 1.0
   contact_weight: 1.0
+  endpoint_loss:
+    enabled: true
+    initial_weight: 0.1
+    final_weight: 0.0
+    decay_fraction: 0.3
+    schedule: linear
   contact_class_weights: auto
   dq_weight: 0.25
   delta_q_weight: 0.25
   kinematic_consistency_weight: 0.01
+  kinematic_joint_scales: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  delta_q_consistency_weight: 0.0
+  torque_contact_weight: 0.0
   ddq_smoothness_weight: 0.01
   ddq_smoothness_warmup_steps: 1000
   ddq_smoothness_huber_delta: 1.0
@@ -116,12 +144,22 @@ loss:
 
 distillation:
   enabled: true
-  teacher_checkpoint_path: outputs/contact_world_model_ep2_multytoken/checkpoints
+  teacher_checkpoint_path: outputs/contact_world_model_ep4/checkpoints/epoch_0000030.pt
   teacher_steps: 8
   student_steps: 2
+  teacher_amp: bf16
   weight: 1.0
+  contact_temperature: 2.0
+  contact_distill_weight: 1.0
+  contact_hard_weight: 1.0
   rollout_weight: 1.0
   rollout_steps: 2
+  supervised_depths_per_batch: 1
+  rollout_history:
+    mode: mixed
+    beta_start: 0.0
+    beta_end: 1.0
+    curriculum_fraction: 1.0
   rollout_contact:
     enabled: true
     # Checkpoint must be trained with model.inputs=[q, dq, delta_q] and target_key=tau.
@@ -134,7 +172,7 @@ distillation:
     max_model_batch_size: 32
   curriculum:
     enabled: true
-    epochs: 20
+    optimizer_steps: 20000
     rollout_steps_schedule: [1, 2, 4, 8, 16]
     teacher_weight_start: 1.0
     teacher_weight_end: 0.5
@@ -157,13 +195,15 @@ train:
   defer_metric_sync: true
   # Keep sample metadata and raw rollout diagnostics on CPU. Contact history is
   # included because OPD advances it alongside the continuous Teacher history.
-  device_batch_keys: [q, dq, delta_q, tau, contact, action, action_mask, action_rollout, action_rollout_mask, q_future, dq_future, delta_q_future, tau_future, contact_future]
+  device_batch_keys: [q, dq, delta_q, tau, contact, action, action_mask, action_rollout, action_rollout_mask, q_future, dq_future, delta_q_future, tau_future, contact_future, importance_weight]
   amp:
     enabled: true
     dtype: bfloat16
-  # Epoch-based budget and chronological checkpoint retention.
-  num_epochs: 250
-  checkpoint_every_epochs: 10
+  # Optimizer updates are the authoritative Student training budget. Epoch is
+  # retained only for data iteration/logging and curriculum compatibility.
+  max_optimizer_steps: 100000
+  num_epochs: 1000000
+  checkpoint_every_steps: 10000
   val_ratio: 0.1
   # val_episode_indices: [15, 50, 90]
   split_mode: episode
@@ -176,7 +216,7 @@ train:
   # Student. Ordinary supervised validation remains available in the log.
   rollout_validation:
     enabled: true
-    replace_val_loss: true
+    replace_val_loss: false
     steps: 2
     solver: heun
     source_seed: 1234
@@ -185,12 +225,19 @@ train:
     free_running_max_batches: 4
     horizons: [1, 4, 8, 16, 32]
     divergence_abs_threshold: 100.0
+  probabilistic_validation:
+    enabled: true
+    num_samples: 8
+    max_batches: 8
+    every: 1
+    replace_val_loss: true
   output_dir: outputs/contact_world_model_opd_11
   monitor_key: val_loss
   top_k: 2
   save_latest_checkpoint: true
   contact_sampling:
     enabled: true
+    # free, pre-contact, contact; aggregate the existing future labels only.
     phase_weights: [1.0, 5.0, 5.0]
     future_phase_reduction: max
     replacement: true

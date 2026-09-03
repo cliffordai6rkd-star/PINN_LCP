@@ -19,6 +19,7 @@ import yaml
 from data_process.contact_world_model_dataset import ContactWorldModelDataset
 from model.pinn_model.contact_world_model import ContactWorldModel, PREDICTED_STATE_STREAMS
 from train.base_trainer import BaseTrainer
+from train.carswm_metrics import distribution_metrics
 from train.contact_world_model_loss import ContactWorldModelLoss
 
 
@@ -119,6 +120,26 @@ class ContactWorldModelTrainer(BaseTrainer):
             raise ValueError(
                 "train.rollout_validation.horizons must contain a positive value"
             )
+        probability_config = self.train_config.get("probabilistic_validation") or {}
+        self.probabilistic_validation_enabled = bool(
+            probability_config.get("enabled", True)
+        )
+        self.probabilistic_num_samples = int(
+            probability_config.get("num_samples", 8)
+        )
+        self.probabilistic_max_batches = int(
+            probability_config.get("max_batches", 8)
+        )
+        self.probabilistic_every = int(probability_config.get("every", 1))
+        self.probabilistic_replace_val_loss = bool(
+            probability_config.get("replace_val_loss", True)
+        )
+        if self.probabilistic_num_samples < 1:
+            raise ValueError("probabilistic_validation.num_samples must be positive")
+        if self.probabilistic_max_batches < 0 or self.probabilistic_every < 1:
+            raise ValueError(
+                "probabilistic_validation max_batches/every must be non-negative/positive"
+            )
 
     def build_dataset(self):
         return ContactWorldModelDataset(self.config, compute_normalizer=False)
@@ -170,14 +191,14 @@ class ContactWorldModelTrainer(BaseTrainer):
             )
             return
     def build_train_sampler(self, train_dataset):
-        """Optionally sample windows by the phase reached in the future target.
+        """Optionally stratify windows by their stored contact-phase labels.
 
-        Sampling by the anchor's current phase only changes the history
-        distribution. Contact prediction should learn imminent contact, so each
-        sample is weighted by the most advanced phase present in its future
-        supervision window.
+        A fixed ``max`` aggregation over the existing future phase sequence
+        assigns each window to one of the model's configured contact states.
+        No time-to-contact variable is derived or added to the sample schema.
         """
         sampling = self.train_config.get("contact_sampling") or {}
+        self.dataset.importance_weight_by_sample_index = {}
         if not bool(sampling.get("enabled", False)):
             return None
         if not hasattr(self.dataset, "contact"):
@@ -185,14 +206,15 @@ class ContactWorldModelTrainer(BaseTrainer):
         base_indices = self._sample_indices(train_dataset)
         if not base_indices:
             raise ValueError("contact_sampling requires a non-empty train dataset")
-        phase_weights = sampling.get("phase_weights", [1.0, 1.0, 1.0])
+        class_count = self.loss_calculator.contact_state_count
+        phase_weights = sampling.get("phase_weights", [1.0] * class_count)
         phase_reduction = str(sampling.get("future_phase_reduction", "max")).lower()
         if phase_reduction != "max":
             raise ValueError(
                 "train.contact_sampling.future_phase_reduction must be 'max'"
             )
 
-        def future_labels():
+        def sampling_phases():
             labels = []
             for sample_idx in base_indices:
                 high_idx = self.dataset.valid_indices[int(sample_idx)]
@@ -205,19 +227,42 @@ class ContactWorldModelTrainer(BaseTrainer):
 
         if isinstance(phase_weights, str):
             if phase_weights.lower() == "auto":
-                labels = future_labels()
-                counts = torch.bincount(labels, minlength=self.loss_calculator.contact_state_count).float()
+                labels = sampling_phases()
+                counts = torch.bincount(labels, minlength=class_count).float()
                 phase_weights = torch.where(counts > 0, counts.sum() / counts.clamp_min(1.0), torch.zeros_like(counts))
                 phase_weights = phase_weights.tolist()
             else:
                 raise ValueError("train.contact_sampling.phase_weights must be a list or 'auto'")
         phase_weights = [float(value) for value in phase_weights]
-        if len(phase_weights) != self.loss_calculator.contact_state_count or any(value < 0 for value in phase_weights):
-            raise ValueError("train.contact_sampling.phase_weights has invalid length/values")
-        labels = future_labels()
+        if len(phase_weights) != class_count or any(value < 0 for value in phase_weights):
+            raise ValueError(
+                "train.contact_sampling.phase_weights must match "
+                "model.contact_state_count and contain non-negative values"
+            )
+        labels = sampling_phases()
         weights = torch.as_tensor(phase_weights, dtype=torch.double).index_select(0, labels)
         if torch.any(weights <= 0):
-            raise ValueError("every observed phase must have a positive sampling weight")
+            raise ValueError(
+                "every observed contact phase must have a positive sampling weight"
+            )
+        importance = weights.sum() / (float(len(weights)) * weights)
+        for subset_index, correction in zip(base_indices, importance.tolist()):
+            high_idx = self.dataset.valid_indices[int(subset_index)]
+            self.dataset.importance_weight_by_sample_index[int(high_idx)] = float(
+                correction
+            )
+        sampled_probability = weights / weights.sum()
+        expected_phase_ratio = [
+            float(sampled_probability[labels == phase].sum().item())
+            for phase in range(class_count)
+        ]
+        log.info(
+            "contact-phase sampler: source_counts=%s expected_sample_ratio=%s "
+            "continuous_importance_mean=%.6f",
+            torch.bincount(labels, minlength=class_count).tolist(),
+            [round(value, 4) for value in expected_phase_ratio],
+            float(importance.mean().item()),
+        )
         return torch.utils.data.WeightedRandomSampler(
             weights,
             num_samples=int(sampling.get("num_samples", len(base_indices))),
@@ -225,7 +270,10 @@ class ContactWorldModelTrainer(BaseTrainer):
         )
 
     def compute_loss(self, batch):
-        self.loss_calculator.set_global_step(self.global_step)
+        total_steps = getattr(self, "max_optimizer_steps", None)
+        if total_steps is None and self.loader is not None:
+            total_steps = self.num_epochs * len(self.loader)
+        self.loss_calculator.set_global_step(self.global_step, total_steps)
         flow_time = None if self.model.training else self.validation_flow_time
         out = self.model(batch, flow_time=flow_time)
         loss, loss_dict = self.loss_calculator(out, batch)
@@ -665,19 +713,125 @@ class ContactWorldModelTrainer(BaseTrainer):
             metrics["rollout_loss"] = metrics["rollout_mse_h1"]
         return metrics
 
+    @torch.no_grad()
+    def _run_probabilistic_validation(self, epoch):
+        if self.val_loader is None:
+            return {}
+        accumulator = defaultdict(float)
+        training_model = self.model
+        if self.ema is not None and self.ema_use_for_validation:
+            self.model = self.ema.model
+        self.model.eval()
+        try:
+            for batch_index, raw_batch in enumerate(self.val_loader):
+                if self.probabilistic_max_batches and batch_index >= self.probabilistic_max_batches:
+                    break
+                batch = self.batch_to_device(raw_batch)
+                with self.autocast_context():
+                    samples = self.model.sample(
+                        batch,
+                        num_samples=self.probabilistic_num_samples,
+                        steps=self.rollout_steps,
+                        solver=self.rollout_solver,
+                    )
+                sample_streams = {
+                    key: samples[f"{key}_pred"].float()
+                    for key in self.model.predicted_state_streams
+                }
+                targets = {
+                    key: batch[f"{key}_future"].float()
+                    for key in self.model.predicted_state_streams
+                }
+                values = distribution_metrics(
+                    sample_streams,
+                    targets,
+                    samples.get("contact_probability"),
+                    batch.get("contact_future"),
+                )
+                state_samples = torch.cat(list(sample_streams.values()), dim=-1)
+                state_target = torch.cat(list(targets.values()), dim=-1)
+                mean_future = state_samples.mean(dim=1)
+                values["deterministic_mean_mse"] = (
+                    mean_future - state_target
+                ).square().flatten(1).mean(dim=1)
+                flat = state_samples.flatten(2)
+                medoid_index = torch.cdist(flat, flat).sum(dim=-1).argmin(dim=1)
+                medoid = state_samples[
+                    torch.arange(state_samples.shape[0], device=state_samples.device),
+                    medoid_index,
+                ]
+                values["deterministic_medoid_mse"] = (
+                    medoid - state_target
+                ).square().flatten(1).mean(dim=1)
+                for name, value in values.items():
+                    self._metric_add(
+                        accumulator, name, value, value.numel()
+                    )
+
+                future_phase = raw_batch.get("future_phase")
+                if future_phase is not None:
+                    names = (
+                        ("free", "precontact", "contact")
+                        if self.loss_calculator.contact_state_count == 3
+                        else tuple(
+                            f"phase_{index}"
+                            for index in range(
+                                self.loss_calculator.contact_state_count
+                            )
+                        )
+                    )
+                    future_phase = future_phase.reshape(-1).round().long()
+                    for phase, group in enumerate(names):
+                        cpu_mask = future_phase == phase
+                        mask = cpu_mask.to(device=state_samples.device)
+                        if not mask.any():
+                            continue
+                        for name in (
+                            "energy_score",
+                            "min_ade",
+                            "sample_spread",
+                            "contact_entropy",
+                        ):
+                            value = values.get(name)
+                            if value is not None:
+                                self._metric_add(
+                                    accumulator,
+                                    f"phase_{group}_{name}",
+                                    value[mask],
+                                    int(mask.sum().item()),
+                                )
+                accumulator["probabilistic_batches"] += 1
+        finally:
+            self.model = training_model
+        metrics = self._metric_finalize(accumulator)
+        metrics["probabilistic_batches"] = int(
+            accumulator.get("probabilistic_batches", 0)
+        )
+        metrics["probabilistic_num_samples"] = self.probabilistic_num_samples
+        metrics["probabilistic_epoch"] = int(epoch)
+        return metrics
+
     def validate_one_epoch(self, epoch):
         # First retain the ordinary flow/direct/physics validation diagnostics.
         val_loss = super().validate_one_epoch(epoch)
-        if not self.rollout_validation_enabled or self.val_loader is None:
-            return val_loss
-        rollout_metrics = self._run_rollout_validation(epoch)
-        self.last_val_epoch_metrics.update(rollout_metrics)
-        if self.rollout_replace_val_loss:
-            replacement = rollout_metrics.get("rollout_mse_h32")
-            if replacement is None:
-                replacement = rollout_metrics.get("rollout_mse_h1")
-            if replacement is not None:
-                val_loss = float(replacement)
+        if self.rollout_validation_enabled and self.val_loader is not None:
+            rollout_metrics = self._run_rollout_validation(epoch)
+            self.last_val_epoch_metrics.update(rollout_metrics)
+            if self.rollout_replace_val_loss:
+                replacement = rollout_metrics.get("rollout_mse_h32")
+                if replacement is None:
+                    replacement = rollout_metrics.get("rollout_mse_h1")
+                if replacement is not None:
+                    val_loss = float(replacement)
+        if (
+            self.probabilistic_validation_enabled
+            and self.val_loader is not None
+            and int(epoch) % self.probabilistic_every == 0
+        ):
+            probability_metrics = self._run_probabilistic_validation(epoch)
+            self.last_val_epoch_metrics.update(probability_metrics)
+            if self.probabilistic_replace_val_loss and "energy_score" in probability_metrics:
+                val_loss = float(probability_metrics["energy_score"])
         return val_loss
 
 

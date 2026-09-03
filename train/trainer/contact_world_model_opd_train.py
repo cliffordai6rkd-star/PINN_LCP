@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import logging
+from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Mapping
@@ -48,6 +49,28 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         self.distill_weight = float(distill.get("weight", 1.0))
         self.rollout_weight = float(distill.get("rollout_weight", 1.0))
         self.rollout_steps = int(distill.get("rollout_steps", 4))
+        self.supervised_depths_per_batch = int(
+            distill.get("supervised_depths_per_batch", 1)
+        )
+        self.contact_distill_temperature = float(
+            distill.get("contact_temperature", 2.0)
+        )
+        self.contact_distill_weight = float(
+            distill.get("contact_distill_weight", 1.0)
+        )
+        self.contact_hard_weight = float(distill.get("contact_hard_weight", 1.0))
+        teacher_amp = distill.get("teacher_amp", False)
+        self.teacher_amp = False if teacher_amp is False else str(teacher_amp).lower()
+        rollout_history = distill.get("rollout_history") or {}
+        self.rollout_history_mode = str(
+            rollout_history.get("mode", "mixed")
+        ).lower()
+        self.history_beta_start = float(rollout_history.get("beta_start", 0.0))
+        self.history_beta_end = float(rollout_history.get("beta_end", 1.0))
+        self.history_curriculum_fraction = float(
+            rollout_history.get("curriculum_fraction", 1.0)
+        )
+        self.depth_sample_counts = defaultdict(int)
         curriculum = distill.get("curriculum") or {}
         configured_rollout_schedule = curriculum.get(
             "rollout_steps_schedule",
@@ -59,6 +82,14 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             int(value) for value in configured_rollout_schedule
         )
         self.curriculum_enabled = bool(curriculum.get("enabled", True))
+        configured_curriculum_steps = curriculum.get("optimizer_steps")
+        self.curriculum_optimizer_steps = (
+            None
+            if configured_curriculum_steps is None
+            else int(configured_curriculum_steps)
+        )
+        # Compatibility only for old configs. New CARS-WM configs express the
+        # curriculum directly in optimizer updates.
         self.curriculum_epochs = int(curriculum.get("epochs", 100))
         self.teacher_weight_start = float(
             curriculum.get("teacher_weight_start", self.distill_weight)
@@ -120,6 +151,22 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             raise ValueError("distillation weights must be non-negative")
         if self.rollout_steps < 0:
             raise ValueError("distillation.rollout_steps must be non-negative")
+        if self.supervised_depths_per_batch < 1:
+            raise ValueError("distillation.supervised_depths_per_batch must be positive")
+        if self.contact_distill_temperature <= 0.0:
+            raise ValueError("distillation.contact_temperature must be positive")
+        if min(self.contact_distill_weight, self.contact_hard_weight) < 0.0:
+            raise ValueError("contact distillation weights must be non-negative")
+        if self.teacher_amp not in {False, "bf16", "bfloat16"}:
+            raise ValueError("distillation.teacher_amp must be false or bf16")
+        if self.rollout_history_mode not in {"recorded", "student", "mixed"}:
+            raise ValueError(
+                "distillation.rollout_history.mode must be recorded, student, or mixed"
+            )
+        if not 0.0 <= self.history_beta_start <= 1.0 or not 0.0 <= self.history_beta_end <= 1.0:
+            raise ValueError("rollout history beta values must be in [0, 1]")
+        if not 0.0 < self.history_curriculum_fraction <= 1.0:
+            raise ValueError("rollout_history.curriculum_fraction must be in (0, 1]")
         if not self.rollout_steps_schedule or any(
             value < 0 for value in self.rollout_steps_schedule
         ):
@@ -152,14 +199,23 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         )
         if (
             configured_action_rollout is not None
-            and int(configured_action_rollout) < max(self.rollout_steps_schedule)
+            and int(configured_action_rollout) <= max(self.rollout_steps_schedule)
         ):
             raise ValueError(
                 "dataloader.action_rollout_horizon must cover the rollout "
-                "steps schedule"
+                "depth plus its re-anchored supervised action condition"
             )
-        if self.curriculum_epochs <= 0:
-            raise ValueError("distillation.curriculum.epochs must be positive")
+        if (
+            self.curriculum_optimizer_steps is not None
+            and self.curriculum_optimizer_steps <= 0
+        ):
+            raise ValueError(
+                "distillation.curriculum.optimizer_steps must be positive"
+            )
+        if self.curriculum_optimizer_steps is None and self.curriculum_epochs <= 0:
+            raise ValueError(
+                "distillation.curriculum optimizer_steps/epochs must be positive"
+            )
         if min(
             self.teacher_weight_start,
             self.teacher_weight_end,
@@ -299,6 +355,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
                 "retrain the Teacher with the canonical model"
             )
         self._validate_teacher_contract(teacher_config, checkpoint)
+        ContactWorldModel(teacher_config).validate_checkpoint_contract(
+            checkpoint.get("carswm_contract")
+        )
         teacher_config.setdefault("model", {})["flow_inference_steps"] = self.teacher_steps
         self.teacher = self._student_model_from_config(teacher_config).to(self.device)
         state_dict = checkpoint.get("model") or checkpoint.get("model_raw")
@@ -408,9 +467,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
     def _distillation_terms(self):
         """Return continuous state endpoint terms for OPD.
 
-        Contact is intentionally absent: its categorical logits are trained
-        from recorded phase labels by the ordinary data loss, not from a
-        Teacher/Student regression target.
+        Contact logits are handled separately with temperature-scaled KL.
         """
 
         terms = [(key, f"{key}_pred", 1.0) for key in self.model.predicted_state_streams]
@@ -578,16 +635,23 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         )
 
     def _teacher_predict(self, batch, *, source_noise=None):
-        """Generate a frozen Teacher target without inheriting Student AMP."""
+        """Generate one frozen Teacher target at the requested condition."""
 
         # Keep Teacher targets in the original FP32 path even when the Student
         # uses autocast.  This preserves the distillation target exactly while
         # still allowing the trainable model to use mixed precision.
         autocast_context = getattr(self, "autocast_context", None)
+        use_amp = bool(getattr(self, "teacher_amp", False)) and str(
+            getattr(self, "device", "cpu")
+        ).startswith("cuda")
         context = (
-            autocast_context(enabled=False)
-            if autocast_context is not None
-            else nullcontext()
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if use_amp
+            else (
+                autocast_context(enabled=False)
+                if autocast_context is not None
+                else nullcontext()
+            )
         )
         with context:
             with torch.no_grad():
@@ -622,20 +686,58 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         )
         losses = []
         weights = []
+        importance = student_batch.get("importance_weight")
         for _, output_key, weight in self._distillation_terms():
             if weight == 0.0:
                 continue
+            per_sample = self.loss_calculator._per_sample_mean(
+                (
+                    student_out[output_key]
+                    - teacher_out[output_key].detach().to(
+                        dtype=student_out[output_key].dtype
+                    )
+                ).square()
+            )
             losses.append(
                 weight
-                * torch.nn.functional.mse_loss(
-                    student_out[output_key],
-                    teacher_out[output_key].detach(),
-                )
+                * self.loss_calculator._weighted_mean(per_sample, importance)
             )
             weights.append(weight)
-        if not losses:
-            return student_out[f"{self.model.predicted_state_streams[0]}_pred"].new_zeros(()), student_out
-        return torch.stack(losses).sum() / sum(weights), student_out
+        reference = student_out[f"{self.model.predicted_state_streams[0]}_pred"]
+        continuous_loss = (
+            torch.stack(losses).sum() / sum(weights)
+            if losses
+            else reference.new_zeros(())
+        )
+        temperature = float(getattr(self, "contact_distill_temperature", 2.0))
+        student_logits = student_out["contact_logits"]
+        teacher_logits = teacher_out["contact_logits"].detach().to(
+            dtype=student_logits.dtype
+        )
+        teacher_probability = torch.softmax(teacher_logits / temperature, dim=-1)
+        contact_kl = torch.nn.functional.kl_div(
+            torch.log_softmax(student_logits / temperature, dim=-1),
+            teacher_probability,
+            reduction="batchmean",
+        ) * (temperature * temperature) / student_logits.shape[1]
+        hard_ce = reference.new_zeros(())
+        if "contact_future" in student_batch:
+            labels = student_batch["contact_future"].squeeze(-1).round().long()
+            hard_ce = torch.nn.functional.cross_entropy(
+                student_logits.reshape(-1, student_logits.shape[-1]),
+                labels.reshape(-1),
+            )
+        total = (
+            continuous_loss
+            + float(getattr(self, "contact_distill_weight", 1.0)) * contact_kl
+            + float(getattr(self, "contact_hard_weight", 1.0)) * hard_ce
+        )
+        student_out["distill_metrics"] = {
+            "continuous_distill_loss": continuous_loss.detach(),
+            "contact_distill_kl": contact_kl.detach(),
+            "contact_distill_hard_ce": hard_ce.detach(),
+        }
+        return total, student_out
 
     def _write_back(
         self,
@@ -644,6 +746,8 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         rollout_step=0,
         *,
         advance_action=True,
+        recorded_batch=None,
+        history_beta=1.0,
     ):
         next_batch = dict(batch)
         for key in self._state_keys(self.model):
@@ -653,9 +757,17 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             prediction = student_out[f"{key}_pred"]
             # One high-rate state is committed per rollout iteration. Detach
             # keeps memory bounded while still exposing Student-state errors.
-            next_batch[key] = torch.cat(
-                (history[:, 1:], prediction[:, :1].detach()), dim=1
-            )
+            committed = prediction[:, :1].detach()
+            if recorded_batch is not None and f"{key}_future" in recorded_batch:
+                depth = int(rollout_step)
+                recorded = recorded_batch[f"{key}_future"][:, depth : depth + 1]
+                if recorded.shape[1] != 1:
+                    raise ValueError("recorded future does not cover rollout depth")
+                committed = (
+                    (1.0 - float(history_beta)) * recorded
+                    + float(history_beta) * committed
+                )
+            next_batch[key] = torch.cat((history[:, 1:], committed), dim=1)
         contact_prediction = student_out.get("contact_state_pred")
         if contact_prediction is None and "contact_logits" in student_out:
             contact_prediction = student_out["contact_logits"].argmax(
@@ -666,6 +778,15 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
                 (batch["contact"][:, 1:], contact_prediction[:, :1].detach()),
                 dim=1,
             )
+        for target_key in (
+            *(f"{key}_future" for key in self._state_keys(self.model)),
+            "contact_future",
+        ):
+            target = batch.get(target_key)
+            if torch.is_tensor(target) and target.ndim >= 2 and target.shape[1] > 0:
+                next_batch[target_key] = torch.cat(
+                    (target[:, 1:], target[:, -1:]), dim=1
+                )
         # Direct actions are low-rate chunks, but each OPD state rollout must
         # use the chunk re-anchored at its new high-rate state.  The dataset
         # supplies these chunks as [B, R, A, D], where entry zero is the
@@ -685,9 +806,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
     def _rollout_distill(
         self,
         batch,
-        initial_teacher_out=None,
-        initial_source_noise=None,
         rollout_steps=None,
+        sampled_depth=None,
+        history_beta=1.0,
     ):
         if rollout_steps is None:
             rollout_steps = self.rollout_steps
@@ -699,52 +820,57 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
                 "rollout_contact_physical": zero.detach(),
                 "rollout_tau_ext_norm": zero.detach(),
             }
+        depth = (
+            int(sampled_depth)
+            if sampled_depth is not None
+            else int(
+                torch.randint(1, rollout_steps + 1, (), device="cpu").item()
+            )
+        )
+        if not 1 <= depth <= rollout_steps:
+            raise ValueError("sampled rollout depth must be in [1, rollout_steps]")
         student_current = dict(batch)
-        losses = []
-        contact_metrics = []
-        for step in range(rollout_steps):
-            teacher_out = initial_teacher_out if step == 0 else None
-            source_noise = (
-                initial_source_noise
-                if step == 0 and initial_source_noise is not None
-                else self._sample_source_noise(student_current)
-            )
-            loss, student_out = self._endpoint_distill(
+        for step in range(depth):
+            # Intermediate states create the Student-induced condition only.
+            # They are detached, and no Teacher/contact pseudo-label is called.
+            student_out = self.model.predict(
                 student_current,
-                # Guided OPD relabels the frozen Teacher on the same
-                # Student-induced history.  Student write-back is detached,
-                # so this changes the state distribution without introducing
-                # full-horizon BPTT.
-                student_current,
-                teacher_out=teacher_out,
-                source_noise=source_noise,
+                steps=self.student_steps,
+                solver=self.model.flow_solver,
             )
-            contact_loss, current_contact_metrics = self._rollout_contact_loss(
-                student_current, student_out
-            )
-            losses.append(loss + contact_loss)
-            contact_metrics.append(current_contact_metrics)
             student_current = self._write_back(
                 student_current,
                 student_out,
                 rollout_step=step,
-                advance_action=step + 1 < rollout_steps,
+                advance_action=True,
+                recorded_batch=batch,
+                history_beta=history_beta,
             )
-        metrics = {}
-        for key in (
-            "rollout_contact_ce",
-            "rollout_contact_physical",
-            "rollout_tau_ext_norm",
-        ):
-            metrics[key] = torch.stack([item[key] for item in contact_metrics]).mean()
-        return torch.stack(losses).mean(), metrics
+        source_noise = self._sample_source_noise(student_current)
+        loss, supervised_out = self._endpoint_distill(
+            student_current,
+            teacher_batch=student_current,
+            source_noise=source_noise,
+        )
+        contact_loss, metrics = self._rollout_contact_loss(
+            student_current, supervised_out
+        )
+        metrics.update(supervised_out.get("distill_metrics") or {})
+        metrics["sampled_depth"] = float(depth)
+        if not hasattr(self, "depth_sample_counts"):
+            self.depth_sample_counts = defaultdict(int)
+        self.depth_sample_counts[depth] += 1
+        return loss + contact_loss, metrics
 
     def _curriculum_state(self):
         if not self.curriculum_enabled:
             progress = 1.0
         else:
-            batches_per_epoch = max(len(self.loader), 1) if self.loader is not None else 1
-            total_steps = max(self.curriculum_epochs * batches_per_epoch, 1)
+            if self.curriculum_optimizer_steps is not None:
+                total_steps = self.curriculum_optimizer_steps
+            else:
+                batches_per_epoch = max(len(self.loader), 1) if self.loader is not None else 1
+                total_steps = max(self.curriculum_epochs * batches_per_epoch, 1)
             progress = min(max(self.global_step / total_steps, 0.0), 1.0)
         teacher_weight = (
             (1.0 - progress) * self.teacher_weight_start
@@ -767,50 +893,96 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         stage = min(int(float(progress) * len(schedule)), len(schedule) - 1)
         return int(schedule[stage])
 
+    def _history_beta(self, progress):
+        if self.rollout_history_mode == "recorded":
+            return 0.0
+        if self.rollout_history_mode == "student":
+            return 1.0
+        fraction = min(float(progress) / self.history_curriculum_fraction, 1.0)
+        return (
+            (1.0 - fraction) * self.history_beta_start
+            + fraction * self.history_beta_end
+        )
+
+    def _sample_supervision_depths(self, maximum_depth):
+        maximum_depth = int(maximum_depth)
+        if maximum_depth <= 0:
+            return ()
+        count = min(self.supervised_depths_per_batch, maximum_depth)
+        return tuple(
+            int(value) + 1
+            for value in torch.randperm(maximum_depth, device="cpu")[:count].tolist()
+        )
+
     def compute_loss(self, batch):
         # Keep ordinary future-label supervision as an anchor for the first
         # stage; OPD then supplies the frozen Teacher and on-policy terms.
         base_loss, out = super().compute_loss(batch)
-        if not self.distill_enabled:
+        if not self.distill_enabled or not self.model.training:
             return base_loss, out
         progress, teacher_weight, rollout_weight = self._curriculum_state()
         rollout_steps = self._rollout_steps_for_progress(progress)
-        # The first rollout Teacher context is identical to the direct
-        # endpoint context.  Reuse its frozen target, while recomputing the
-        # Student path so training-time dropout behavior remains unchanged.
+        history_beta = self._history_beta(progress)
+        # Depth zero is computed exactly once on the recorded condition.
         source_noise = self._sample_source_noise(batch)
         teacher_out = self._teacher_predict(batch, source_noise=source_noise)
-        distill_loss, _ = self._endpoint_distill(
+        distill_loss, direct_out = self._endpoint_distill(
             batch,
             teacher_out=teacher_out,
             source_noise=source_noise,
         )
-        rollout_loss, rollout_contact_metrics = self._rollout_distill(
-            batch,
-            initial_teacher_out=teacher_out,
-            initial_source_noise=source_noise,
-            rollout_steps=rollout_steps,
+        depths = self._sample_supervision_depths(rollout_steps)
+        rollout_losses = []
+        rollout_metrics = []
+        for depth in depths:
+            current_loss, current_metrics = self._rollout_distill(
+                batch,
+                rollout_steps=rollout_steps,
+                sampled_depth=depth,
+                history_beta=history_beta,
+            )
+            rollout_losses.append(current_loss)
+            rollout_metrics.append(current_metrics)
+        rollout_loss = (
+            torch.stack(rollout_losses).mean()
+            if rollout_losses
+            else base_loss.new_zeros(())
         )
         total = (
             base_loss
             + teacher_weight * distill_loss
             + rollout_weight * rollout_loss
         )
+        aggregated_rollout_metrics = {}
+        metric_keys = {
+            key for item in rollout_metrics for key in item
+        }
+        for key in metric_keys:
+            values = [item[key] for item in rollout_metrics if key in item]
+            tensors = [
+                value
+                if torch.is_tensor(value)
+                else base_loss.new_tensor(float(value))
+                for value in values
+            ]
+            aggregated_rollout_metrics[key] = torch.stack(tensors).mean().detach()
         out["loss_dict"].update(
             {
                 "distill_loss": distill_loss.detach(),
                 "rollout_distill_loss": rollout_loss.detach(),
-                **{
-                    key: value.detach()
-                    for key, value in rollout_contact_metrics.items()
-                },
+                **direct_out.get("distill_metrics", {}),
+                **aggregated_rollout_metrics,
                 "opd_curriculum_progress": progress,
                 "opd_teacher_weight": teacher_weight,
                 "opd_rollout_weight": rollout_weight,
                 "opd_rollout_steps": float(rollout_steps),
+                "opd_history_beta": float(history_beta),
+                "opd_teacher_calls": float(1 + len(depths)),
                 "opd_total_loss": total.detach(),
             }
         )
+        for depth, count in self.depth_sample_counts.items():
+            out["loss_dict"][f"opd_depth_{depth}_sample_count"] = float(count)
         return total, out
 
 

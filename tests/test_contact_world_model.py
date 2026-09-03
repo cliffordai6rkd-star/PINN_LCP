@@ -55,12 +55,36 @@ def test_flow_targets_and_contact_are_separate():
     model = ContactWorldModel(cfg)
     values = batch(cfg)
     output = model(values, flow_time=0.5)
-    assert output["flow_velocity_pred"].shape == (2, 4, 11)
+    assert output["flow_velocity_pred"].shape == (2, 4, 8)
+    assert output["flow_target_state"].shape[-1] == 8
+    assert output["flow_source_state"].shape[-1] == 8
     assert output["contact_logits"].shape == (2, 4, 3)
     loss, metrics = ContactWorldModelLoss(cfg)(output, values)
     loss.backward()
     assert "flow_contact_loss" not in metrics
     assert "contact_loss" in metrics
+    assert any(parameter.grad is not None for parameter in model.contact_head.parameters())
+
+
+def test_contact_head_depends_on_its_generated_continuous_sample():
+    cfg = config()
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    encoded = model.encode_conditions(values)
+    continuous = torch.randn(2, 4, model.flow_dim, requires_grad=True)
+    model.contact_logits(continuous, encoded).square().mean().backward()
+    assert continuous.grad is not None
+    assert torch.any(continuous.grad != 0)
+
+
+def test_different_source_noise_generates_different_futures():
+    cfg = config()
+    model = ContactWorldModel(cfg).eval()
+    values = batch(cfg)
+    first = model.predict(values, source_noise=torch.zeros(2, 4, 8))
+    second = model.predict(values, source_noise=torch.ones(2, 4, 8))
+    assert not torch.equal(first["flow_state_pred"], second["flow_state_pred"])
+    assert first["contact_logits"].shape == (2, 4, 3)
 
 
 def test_missing_selected_state_is_rejected_without_zero_fill():
@@ -81,8 +105,8 @@ def test_selected_streams_define_continuous_output_contract():
     assert model.predicted_state_streams == ("q", "delta_q", "tau")
     assert model.PREDICTED_STATE_STREAMS == model.predicted_state_streams
     assert model.TARGET_KEYS == ("q_future", "delta_q_future", "tau_future", "contact_future")
-    assert model.flow_dim == 3 * 2 + 3
-    assert output["flow_velocity_pred"].shape == (2, 4, 9)
+    assert model.flow_dim == 3 * 2
+    assert output["flow_velocity_pred"].shape == (2, 4, 6)
     assert all(f"{key}_pred" in output for key in ("q", "delta_q", "tau"))
     assert "dq_pred" not in output
     loss, metrics = ContactWorldModelLoss(cfg)(output, values)
@@ -97,6 +121,29 @@ def test_contract_allows_ablation_without_q():
     values.pop("q", None)
     values.pop("q_future", None)
     output = model(values, flow_time=0.5)
-    assert output["flow_velocity_pred"].shape[-1] == 2 * 2 + 3
+    assert output["flow_velocity_pred"].shape[-1] == 2 * 2
     loss, _ = ContactWorldModelLoss(cfg)(output, values)
     assert torch.isfinite(loss)
+
+
+def test_endpoint_schedule_and_delta_q_contract():
+    cfg = config()
+    calculator = ContactWorldModelLoss(cfg)
+    calculator.set_global_step(0, 100)
+    assert calculator.endpoint_weight == pytest.approx(0.1)
+    calculator.set_global_step(15, 100)
+    assert calculator.endpoint_weight == pytest.approx(0.05)
+    calculator.set_global_step(30, 100)
+    assert calculator.endpoint_weight == pytest.approx(0.0)
+    assert calculator.delta_q_consistency_weight == 0.0
+
+
+def test_kinematic_loss_is_zero_for_trapezoidal_integration():
+    cfg = config()
+    calculator = ContactWorldModelLoss(cfg)
+    values = batch(cfg)
+    values["q"][:] = 0.0
+    values["dq"][:] = 1.0
+    q = torch.arange(1, 5, dtype=torch.float32)[None, :, None].repeat(2, 1, 2) * 0.01
+    out = {"q_pred": q, "dq_pred": torch.ones_like(q)}
+    assert torch.max(calculator._kinematic_consistency(out, values)) < 1.0e-8

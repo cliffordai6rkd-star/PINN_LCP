@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -26,6 +27,10 @@ class ContactGateConfig:
     probability_threshold: float = 0.5
     positive_class_weight: float | str = "auto"
     label_cache_path: str | None = None
+    phase_label_mode: str = "transition_band"
+    precontact_frames: int | None = None
+    precontact_duration_s: float | None = None
+    state_rate_hz: float = 100.0
 
     @classmethod
     def from_config(cls, config: Mapping):
@@ -84,6 +89,22 @@ class ContactGateConfig:
                 if values.get("label_cache_path") is None
                 else str(values["label_cache_path"])
             ),
+            phase_label_mode=str(
+                values.get("phase_label_mode", "transition_band")
+            ).lower(),
+            precontact_frames=(
+                None
+                if values.get("precontact_frames") is None
+                else int(values["precontact_frames"])
+            ),
+            precontact_duration_s=(
+                None
+                if values.get("precontact_duration_s") is None
+                else float(values["precontact_duration_s"])
+            ),
+            state_rate_hz=float(
+                (config.get("dataloader") or {}).get("high_fps", 100.0)
+            ),
         )
         result.validate()
         return result
@@ -93,6 +114,31 @@ class ContactGateConfig:
             raise ValueError(
                 "contact_gate.label_mode must be 'binary' or 'three_phase'"
             )
+        if self.phase_label_mode not in {"transition_band", "temporal_precontact"}:
+            raise ValueError(
+                "contact_gate.phase_label_mode must be 'transition_band' or "
+                "'temporal_precontact'"
+            )
+        if self.precontact_frames is not None and self.precontact_frames < 0:
+            raise ValueError("contact_gate.precontact_frames must be non-negative")
+        if (
+            self.precontact_duration_s is not None
+            and self.precontact_duration_s < 0.0
+        ):
+            raise ValueError(
+                "contact_gate.precontact_duration_s must be non-negative"
+            )
+        if (
+            self.phase_label_mode == "temporal_precontact"
+            and self.precontact_frames is None
+            and self.precontact_duration_s is None
+        ):
+            raise ValueError(
+                "temporal_precontact requires precontact_frames or "
+                "precontact_duration_s"
+            )
+        if not math.isfinite(self.state_rate_hz) or self.state_rate_hz <= 0.0:
+            raise ValueError("dataloader.high_fps must be positive")
         if self.metric not in {"force_xyz_l2", "wrench_l2", "tau_ext_l1", "tau_ext_l2"}:
             raise ValueError(
                 "contact_gate.metric must be force_xyz_l2, wrench_l2, tau_ext_l1, or tau_ext_l2"
@@ -429,13 +475,38 @@ def contact_phase_labels_from_signal(
         end = int(end)
         if start < 0 or end <= start or end > values.shape[0]:
             raise ValueError(f"invalid episode bounds [{start}, {end})")
-        labels[start:end, 0] = hysteresis_three_phase_mask(
-            values[start:end],
-            on_threshold=config.on_threshold,
-            off_threshold=config.off_threshold,
-            consecutive_frames=config.consecutive_frames,
-            backfill=True,
-        )
+        episode_signal = values[start:end]
+        if config.phase_label_mode == "transition_band":
+            episode_labels = hysteresis_three_phase_mask(
+                episode_signal,
+                on_threshold=config.on_threshold,
+                off_threshold=config.off_threshold,
+                consecutive_frames=config.consecutive_frames,
+                backfill=True,
+            )
+        else:
+            contact = hysteresis_binary_mask(
+                episode_signal,
+                on_threshold=config.on_threshold,
+                off_threshold=config.off_threshold,
+                consecutive_frames=config.consecutive_frames,
+                backfill=True,
+            ).to(dtype=torch.bool)
+            episode_labels = torch.zeros_like(episode_signal, dtype=torch.float32)
+            episode_labels[contact] = 2.0
+            precontact_frames = config.precontact_frames
+            if precontact_frames is None:
+                state_rate_hz = float(getattr(config, "state_rate_hz", 100.0))
+                precontact_frames = int(
+                    round(float(config.precontact_duration_s or 0.0) * state_rate_hz)
+                )
+            onset = contact & ~torch.cat(
+                (torch.zeros(1, dtype=torch.bool, device=contact.device), contact[:-1])
+            )
+            for onset_index in torch.nonzero(onset, as_tuple=False).reshape(-1).tolist():
+                pre_start = max(0, int(onset_index) - int(precontact_frames))
+                episode_labels[pre_start:onset_index] = 1.0
+        labels[start:end, 0] = episode_labels
     return labels
 
 

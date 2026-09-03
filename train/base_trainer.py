@@ -210,7 +210,9 @@ class BaseTrainer:
         self.lr = float(self.train_config.get("lr", 1e-4))
         self.weight_decay = float(self.train_config.get("weight_decay", 1e-4))
         self.num_epochs = int(self.train_config.get("num_epochs", 20))
-        configured_max_steps = self.train_config.get("max_train_steps")
+        configured_max_steps = self.train_config.get(
+            "max_optimizer_steps", self.train_config.get("max_train_steps")
+        )
         self.max_train_steps = (
             None if configured_max_steps is None else int(configured_max_steps)
         )
@@ -228,7 +230,7 @@ class BaseTrainer:
         )
         self.max_optimizer_steps = None
         if self.max_train_steps is not None and self.max_train_steps <= 0:
-            raise ValueError("train.max_train_steps must be positive")
+            raise ValueError("train.max_optimizer_steps must be positive")
         if self.checkpoint_every_steps < 0:
             raise ValueError("train.checkpoint_every_steps must be non-negative")
         if self.checkpoint_every_epochs < 0:
@@ -865,6 +867,10 @@ class BaseTrainer:
             },
         }
 
+    def _model_checkpoint_metadata(self):
+        contract = getattr(self.model, "checkpoint_contract", None)
+        return {"carswm_contract": contract()} if callable(contract) else {}
+
     @staticmethod
     def _save_checkpoint_atomic(checkpoint, path):
         """Write a checkpoint atomically so an interrupted save is ignored."""
@@ -911,6 +917,9 @@ class BaseTrainer:
                 f"resume checkpoint model_version {checkpoint.get('model_version')!r} "
                 f"does not match {expected_model_version!r}; retrain with the current model"
             )
+        validate_contract = getattr(self.model, "validate_checkpoint_contract", None)
+        if callable(validate_contract):
+            validate_contract(checkpoint.get("carswm_contract"))
 
         model_state = checkpoint.get("model")
         raw_model_state = checkpoint.get("model_raw")
@@ -1521,6 +1530,22 @@ class BaseTrainer:
             ):
                 self.scheduler.step()
 
+            # Step-budgeted runs checkpoint on the exact optimizer update,
+            # independent of DataLoader/epoch boundaries.
+            if (
+                self.step_based_training
+                and self.checkpoint_every_steps > 0
+                and self.global_step % self.checkpoint_every_steps == 0
+            ):
+                self.save_step_checkpoint(
+                    epoch,
+                    {
+                        "avg_loss": float(loss.detach().item()),
+                        "train_loss_online": float(loss.detach().item()),
+                        "val_loss": None,
+                    },
+                )
+
             loss_value = loss.detach().item()
             total_loss += loss_value * batch_size
             num_samples += batch_size
@@ -1808,10 +1833,7 @@ class BaseTrainer:
             # decision as an uninterrupted run.
             stop_early = self.should_stop_early(epoch, metrics)
 
-            if self.step_based_training:
-                if self.global_step % self.checkpoint_every_steps == 0:
-                    self.save_step_checkpoint(epoch, metrics)
-            else:
+            if not self.step_based_training:
                 completed_epoch = epoch + 1
                 if self.checkpoint_every_epochs > 0:
                     if completed_epoch % self.checkpoint_every_epochs == 0:
@@ -2073,6 +2095,7 @@ class BaseTrainer:
                     "normalize_lowdim_keys"
                 ),
             },
+            **self._model_checkpoint_metadata(),
         }
         checkpoint.update(
             self._checkpoint_runtime_state(resume_epoch=int(epoch) + 1)
@@ -2137,7 +2160,8 @@ class BaseTrainer:
                 "eps": self.dataset.normalizer.eps,
                 "normalize_mode": self.config["dataloader"].get("normalize_mode"),
                 "normalize_lowdim_keys": self.config["dataloader"].get("normalize_lowdim_keys"),
-            }
+            },
+            **self._model_checkpoint_metadata(),
         }
         ckpt.update(self._checkpoint_runtime_state(resume_epoch=int(epoch) + 1))
 
@@ -2186,6 +2210,7 @@ class BaseTrainer:
                     "normalize_lowdim_keys"
                 ),
             },
+            **self._model_checkpoint_metadata(),
         }
         checkpoint.update(self._checkpoint_runtime_state(resume_epoch=epoch))
         path = self.ckpt_dir / f"epoch_{epoch:07d}.pt"
@@ -2259,7 +2284,8 @@ class BaseTrainer:
                 "eps": self.dataset.normalizer.eps,
                 "normalize_mode": self.config["dataloader"].get("normalize_mode"),
                 "normalize_lowdim_keys": self.config["dataloader"].get("normalize_lowdim_keys"),
-            }
+            },
+            **self._model_checkpoint_metadata(),
         }
         ckpt.update(self._checkpoint_runtime_state(resume_epoch=int(epoch) + 1))
 

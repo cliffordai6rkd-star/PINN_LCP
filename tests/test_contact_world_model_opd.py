@@ -31,7 +31,7 @@ def test_opd_reuses_source_and_relabels_teacher_on_student_history():
     trainer.student_steps = 1
     trainer.loss_calculator = ContactWorldModelLoss(config)
     trainer.rollout_contact_enabled = False
-    trainer._sample_source_noise = lambda value: torch.zeros(1, 3, 11)
+    trainer._sample_source_noise = lambda value: torch.zeros(1, 3, 8)
     calls = []
     original = trainer.teacher.predict
 
@@ -41,10 +41,40 @@ def test_opd_reuses_source_and_relabels_teacher_on_student_history():
 
     trainer.teacher.predict = predict
     value = batch()
-    loss, _ = trainer._rollout_distill(value, rollout_steps=2)
+    loss, _ = trainer._rollout_distill(value, rollout_steps=2, sampled_depth=2)
     assert torch.isfinite(loss)
-    assert len(calls) == 2
-    assert not torch.equal(calls[0], calls[1])
+    assert len(calls) == 1
+    assert not torch.equal(calls[0], value["q"][:, -1:])
+
+
+def test_opd_teacher_and_student_share_source_noise():
+    config = cfg()
+    trainer = ContactWorldModelOPDTrainer.__new__(ContactWorldModelOPDTrainer)
+    trainer.model = ContactWorldModel(config)
+    trainer.teacher = ContactWorldModel(config)
+    trainer.teacher_steps = 1
+    trainer.student_steps = 1
+    trainer.loss_calculator = ContactWorldModelLoss(config)
+    source = torch.randn(1, 3, 8)
+    seen = {}
+    original_teacher = trainer.teacher.predict
+    original_student = trainer.model.predict_differentiable
+
+    def teacher(value, **kwargs):
+        seen["teacher"] = kwargs["source_noise"]
+        return original_teacher(value, **kwargs)
+
+    def student(value, **kwargs):
+        seen["student"] = kwargs["source_noise"]
+        return original_student(value, **kwargs)
+
+    trainer.teacher.predict = teacher
+    trainer.model.predict_differentiable = student
+    loss, output = trainer._endpoint_distill(batch(), source_noise=source)
+    assert torch.isfinite(loss)
+    assert seen["teacher"] is source
+    assert seen["student"] is source
+    assert "contact_distill_kl" in output["distill_metrics"]
 
 
 def test_opd_write_back_commits_all_streams_first_frame_and_action_chunk():

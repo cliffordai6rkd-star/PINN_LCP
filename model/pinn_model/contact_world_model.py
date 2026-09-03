@@ -103,12 +103,13 @@ class ContactWorldModel(nn.Module):
         "tau_future",
         "contact_future",
     )
-    MODEL_VERSION = "contact_world_model_v2"
+    MODEL_VERSION = "carswm_v1"
 
     def __init__(self, config: Mapping):
         super().__init__()
         if not isinstance(config, Mapping):
             raise TypeError("config must be a mapping")
+        self._config = config
         data_config = config.get("dataloader") or {}
         model_config = config.get("model") or {}
         self.history_horizon = int(data_config.get("state_history_horizon", 50))
@@ -116,6 +117,11 @@ class ContactWorldModel(nn.Module):
         self.action_condition_horizon = int(data_config.get("action_condition_horizon", 8))
         self.joint_dim = int(model_config.get("joint_dim", 7))
         self.action_dim = int(model_config.get("action_dim", 7))
+        self.state_rate_hz = float(data_config.get("high_fps", 100.0))
+        self.action_rate_hz = float(data_config.get("expert_fps", 25.0))
+        self.action_time_alignment = str(
+            model_config.get("action_time_alignment", "zoh")
+        ).lower()
 
         configured_inputs = model_config.get("inputs")
         if configured_inputs is None:
@@ -167,7 +173,9 @@ class ContactWorldModel(nn.Module):
         self.emit_contact_probabilities = bool(
             model_config.get("emit_contact_probabilities", True)
         )
-        self.flow_dim = len(self.predicted_state_streams) * self.joint_dim + self.contact_state_count
+        # Contact is categorical and is deliberately not transported by the
+        # continuous flow.  For the default four streams this is exactly 28.
+        self.flow_dim = len(self.predicted_state_streams) * self.joint_dim
         self._validate_config()
 
         state_dropout = self.dropout if self.state_layers > 1 else 0.0
@@ -238,6 +246,21 @@ class ContactWorldModel(nn.Module):
         self.flow_output = nn.Sequential(
             nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.flow_dim)
         )
+        contact_hidden_dim = int(
+            model_config.get("contact_head_hidden_dim", max(self.hidden_dim // 2, 16))
+        )
+        self.contact_state_projection = nn.Sequential(
+            nn.LayerNorm(self.flow_dim),
+            nn.Linear(self.flow_dim, self.hidden_dim),
+            nn.SiLU(),
+        )
+        self.contact_head = nn.Sequential(
+            nn.LayerNorm(3 * self.hidden_dim),
+            nn.Linear(3 * self.hidden_dim, contact_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(contact_hidden_dim, self.contact_state_count),
+        )
 
     def _validate_config(self):
         positive = {
@@ -275,6 +298,106 @@ class ContactWorldModel(nn.Module):
                 "model.flow_source_mode must be 'gaussian'; state-to-state "
                 "sources are no longer supported"
             )
+        if not math.isfinite(self.state_rate_hz) or self.state_rate_hz <= 0.0:
+            raise ValueError("dataloader.high_fps must be positive")
+        if not math.isfinite(self.action_rate_hz) or self.action_rate_hz <= 0.0:
+            raise ValueError("dataloader.expert_fps must be positive")
+        if self.action_time_alignment not in {"zoh", "linear"}:
+            raise ValueError("model.action_time_alignment must be 'zoh' or 'linear'")
+
+    def checkpoint_contract(self):
+        """Return the complete semantic contract stored beside model weights."""
+
+        data_config = self._config.get("dataloader") or {}
+        action_config = self._config.get("action_contract") or {}
+        contact_config = self._config.get("contact_gate") or {}
+        thresholds = (contact_config.get("thresholds") or {}).get(
+            str(contact_config.get("metric", "tau_ext_l1")).lower(), {}
+        )
+        return {
+            "schema_version": 1,
+            "model_version": self.MODEL_VERSION,
+            "state_contract": "robot_state_streams_v1",
+            "input_state_streams": list(self.inputs),
+            "predicted_continuous_streams": list(self.predicted_state_streams),
+            "joint_dim": self.joint_dim,
+            "history_horizon": self.history_horizon,
+            "future_horizon": self.future_horizon,
+            "action_horizon": self.action_condition_horizon,
+            "state_rate_hz": self.state_rate_hz,
+            "action_rate_hz": self.action_rate_hz,
+            "action": {
+                "semantic": str(
+                    action_config.get("semantic", "expert_policy_action_target")
+                ),
+                "type": str(action_config.get("type", "absolute_ee_pose")),
+                "dimension": self.action_dim,
+                "coordinate_frame": str(
+                    action_config.get("coordinate_frame", "link7")
+                ),
+                "representation": str(
+                    action_config.get("representation", "xyz_quaternion")
+                ),
+                "quaternion_order": str(
+                    action_config.get("quaternion_order", "xyzw")
+                ),
+                "quaternion_sign": str(
+                    action_config.get("quaternion_sign", "canonical_w_nonnegative")
+                ),
+                "absolute_or_relative": str(
+                    action_config.get("absolute_or_relative", "absolute")
+                ),
+                "dataset_key": str(data_config.get("action_key", "action.ee_pose")),
+                "start_offset": int(data_config.get("action_start_offset", 1)),
+                "dataset_alignment": str(
+                    (self._config.get("train_data") or {}).get(
+                        "action_alignment", data_config.get("action_resample", "next")
+                    )
+                ),
+                "future_token_alignment": self.action_time_alignment,
+                "inference_delay_s": float(data_config.get("inference_delay_s", 0.0)),
+            },
+            "flow": {
+                "dimension": self.flow_dim,
+                "source": self.flow_source_mode,
+                "solver": self.flow_solver,
+                "steps": self.flow_inference_steps,
+            },
+            "contact": {
+                "classes": ["free", "precontact_or_transition", "contact"],
+                "label_mode": str(contact_config.get("label_mode", "three_phase")),
+                "phase_label_mode": str(
+                    contact_config.get("phase_label_mode", "transition_band")
+                ),
+                "tau_ext_source": str(
+                    contact_config.get("tau_ext_source", "tau_measured_minus_tau_free")
+                ),
+                "norm": str(contact_config.get("metric", "tau_ext_l1")),
+                "off_threshold": thresholds.get(
+                    "off", thresholds.get(False, contact_config.get("off_threshold"))
+                ),
+                "on_threshold": thresholds.get(
+                    "on", thresholds.get(True, contact_config.get("on_threshold"))
+                ),
+                "hysteresis_frames": int(contact_config.get("consecutive_frames", 3)),
+                "precontact_frames": contact_config.get("precontact_frames"),
+                "precontact_duration_s": contact_config.get("precontact_duration_s"),
+            },
+        }
+
+    def validate_checkpoint_contract(self, actual):
+        expected = self.checkpoint_contract()
+        if not isinstance(actual, Mapping):
+            raise ValueError(
+                "checkpoint has no carswm_contract; legacy checkpoints are structurally "
+                "incompatible and must be retrained"
+            )
+        if dict(actual) != expected:
+            raise ValueError(
+                "CARS-WM checkpoint contract mismatch: "
+                f"checkpoint={dict(actual)!r}, expected={expected!r}"
+            )
+        return expected
 
     @staticmethod
     def _require_sequence(batch, key, *, horizon=None, feature_dim=None):
@@ -443,20 +566,6 @@ class ContactWorldModel(nn.Module):
             if value.shape[0] != reference.shape[0] or value.device != reference.device or value.dtype != reference.dtype:
                 raise ValueError(f"{key}_future does not match the condition batch")
             values.append(value)
-        if self.contact_state_count:
-            contact = batch.get("contact_future")
-            if contact is None:
-                raise KeyError("missing batch key 'contact_future'")
-            if not torch.is_tensor(contact) or contact.ndim != 3 or tuple(contact.shape[1:]) != (self.future_horizon, 1):
-                actual = None if not torch.is_tensor(contact) else tuple(contact.shape)
-                raise ValueError(f"contact_future must have shape [B, {self.future_horizon}, 1], got {actual}")
-            contact = contact.to(device=reference.device, dtype=reference.dtype)
-            if self.runtime_checks and torch.any((contact < 0) | (contact >= self.contact_state_count)):
-                raise ValueError("contact_future contains an invalid phase")
-            index = contact.squeeze(-1).round().to(dtype=torch.long)
-            logits = reference.new_full((*index.shape, self.contact_state_count), -float(self.contact_logit_scale))
-            logits.scatter_(-1, index[..., None], float(self.contact_logit_scale))
-            values.append(logits)
         return torch.cat(values, dim=-1)
 
     def _gaussian_flow_source(self, reference, source_noise=None):
@@ -521,24 +630,58 @@ class ContactWorldModel(nn.Module):
             features = block(features, encoded["condition_memory"], encoded.get("condition_memory_padding_mask"))
         return self.flow_output(features), features
 
-    def _decoded_output(self, flow_state):
+    def _time_aligned_action_features(self, encoded):
+        """Map each high-rate future token to its low-rate action token."""
+
+        action = encoded["action_features"]
+        future_time = torch.arange(
+            self.future_horizon, device=action.device, dtype=action.dtype
+        ) / self.state_rate_hz
+        position = future_time * self.action_rate_hz
+        if self.action_time_alignment == "zoh":
+            index = torch.floor(position).long().clamp(0, action.shape[1] - 1)
+            return action.index_select(1, index)
+        left = torch.floor(position).long().clamp(0, action.shape[1] - 1)
+        right = (left + 1).clamp(0, action.shape[1] - 1)
+        alpha = (position - left.to(position.dtype))[None, :, None]
+        return (
+            (1.0 - alpha) * action.index_select(1, left)
+            + alpha * action.index_select(1, right)
+        )
+
+    def contact_logits(self, continuous_trajectory, encoded):
+        expected = (
+            continuous_trajectory.shape[0],
+            self.future_horizon,
+            self.flow_dim,
+        )
+        if continuous_trajectory.ndim != 3 or tuple(continuous_trajectory.shape) != expected:
+            raise ValueError(
+                "continuous_trajectory must have shape "
+                f"[B, {self.future_horizon}, {self.flow_dim}]"
+            )
+        state = self.contact_state_projection(continuous_trajectory)
+        global_condition = encoded["global_condition"][:, None, :].expand_as(state)
+        action = self._time_aligned_action_features(encoded)
+        return self.contact_head(torch.cat((state, global_condition, action), dim=-1))
+
+    def _decoded_output(self, flow_state, encoded):
         result = {"flow_state_pred": flow_state}
         offset = 0
         for key in self.predicted_state_streams:
             result[f"{key}_pred"] = flow_state[..., offset:offset + self.joint_dim]
             offset += self.joint_dim
-        if self.contact_state_count:
-            logits = flow_state[..., offset:offset + self.contact_state_count]
-            result["contact_logits"] = logits
-            if self.emit_contact_probabilities or not self.training:
-                probability = torch.softmax(logits, dim=-1)
-                state = probability.argmax(dim=-1, keepdim=True).to(flow_state.dtype)
-                result.update(
-                    {
-                        "contact_probability": probability,
-                        "contact_state_pred": state,
-                    }
-                )
+        logits = self.contact_logits(flow_state, encoded)
+        result["contact_logits"] = logits
+        if self.emit_contact_probabilities or not self.training:
+            probability = torch.softmax(logits, dim=-1)
+            state = probability.argmax(dim=-1, keepdim=True).to(flow_state.dtype)
+            result.update(
+                {
+                    "contact_probability": probability,
+                    "contact_state_pred": state,
+                }
+            )
         return result
 
     def forward(self, batch, *, flow_time=None, source_noise=None):
@@ -565,7 +708,7 @@ class ContactWorldModel(nn.Module):
             "velocity_target": velocity_target,
             "flow_features": flow_features,
         }
-        result.update(self._decoded_output(endpoint))
+        result.update(self._decoded_output(endpoint, encoded))
         return result
 
     def integrate_flow(self, source_state, encoded, *, steps=None, solver=None):
@@ -600,8 +743,42 @@ class ContactWorldModel(nn.Module):
             "flow_source_state": source,
             "flow_source_noise": source,
         }
-        result.update(self._decoded_output(generated))
+        result.update(self._decoded_output(generated, encoded))
         return result
+
+    @torch.no_grad()
+    def sample(self, batch, *, num_samples=1, steps=None, solver=None, source_noise=None):
+        """Draw K conditional futures and retain the sample dimension."""
+
+        num_samples = int(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        if source_noise is not None:
+            expected = (
+                batch[self.inputs[0]].shape[0],
+                num_samples,
+                self.future_horizon,
+                self.flow_dim,
+            )
+            if not torch.is_tensor(source_noise) or tuple(source_noise.shape) != expected:
+                actual = None if not torch.is_tensor(source_noise) else tuple(source_noise.shape)
+                raise ValueError(f"source_noise must have shape {expected}, got {actual}")
+        draws = [
+            self.predict(
+                batch,
+                steps=steps,
+                solver=solver,
+                source_noise=(None if source_noise is None else source_noise[:, index]),
+            )
+            for index in range(num_samples)
+        ]
+        keys = [f"{key}_pred" for key in self.predicted_state_streams]
+        keys.extend(("flow_state_pred", "contact_logits", "contact_probability", "contact_state_pred"))
+        return {
+            key: torch.stack([draw[key] for draw in draws], dim=1)
+            for key in keys
+            if all(key in draw for draw in draws)
+        }
 
     def predict_differentiable(self, batch, *, steps=None, solver=None, source_noise=None):
         encoded = self.encode_conditions(batch)
@@ -613,5 +790,5 @@ class ContactWorldModel(nn.Module):
             "flow_source_state": source,
             "flow_source_noise": source,
         }
-        result.update(self._decoded_output(generated))
+        result.update(self._decoded_output(generated, encoded))
         return result
