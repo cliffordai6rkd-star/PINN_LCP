@@ -75,3 +75,37 @@ def test_weighted_mean_applies_per_sample_correction():
     weight = torch.tensor([2.0, 0.5])
     result = ContactWorldModelLoss._weighted_mean(value, weight)
     assert result == pytest.approx(1.75)
+
+
+def test_action_rollout_times_use_reanchored_v3_table_without_per_row_search():
+    dataset = ContactWorldModelDataset.__new__(ContactWorldModelDataset)
+    dataset.action_rollout_horizon = 3
+    dataset.action_condition_horizon = 2
+    dataset.action_start_offset = 1
+    dataset.inference_delay_ns = 0
+    dataset.high_timestamps = torch.tensor(
+        [0, 10_000_000, 20_000_000, 30_000_000], dtype=torch.int64
+    )
+    dataset.action_indices = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+    episode = {"dataset_to_index": 4}
+    dataset._action_tables = {
+        id(episode): {
+            "indices": torch.tensor([0, 1, 2], dtype=torch.long),
+            "rows": torch.tensor([0, 1, 2], dtype=torch.long),
+            "times": torch.tensor(
+                [0, 40_000_000, 80_000_000], dtype=torch.int64
+            ),
+        }
+    }
+
+    times = dataset._action_rollout_times_for_anchor(0, episode)
+    torch.testing.assert_close(
+        times,
+        torch.tensor(
+            [
+                [0.04, 0.08],
+                [0.03, 0.07],
+                [0.02, 0.06],
+            ]
+        ),
+    )

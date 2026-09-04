@@ -22,7 +22,11 @@ from data_process.contact_world_model_dataset import ContactWorldModelDataset
 from model.pinn_model.contact_world_model import ContactWorldModel, PREDICTED_STATE_STREAMS
 from train.base_trainer import BaseTrainer
 from train.carswm_checkpoint_viz import render_checkpoint_summary
-from train.carswm_metrics import distribution_metrics
+from train.carswm_metrics import (
+    contact_confusion_matrix,
+    contact_macro_f1_from_confusion,
+    distribution_metrics,
+)
 from train.contact_world_model_loss import ContactWorldModelLoss
 
 
@@ -436,6 +440,175 @@ class ContactWorldModelTrainer(BaseTrainer):
             return ("free", "pre_contact", "contact")
         return tuple(f"phase_{index}" for index in range(int(class_count)))
 
+    @staticmethod
+    def _metric_slug(value):
+        slug = "".join(
+            character.lower() if character.isalnum() else "_"
+            for character in str(value)
+        ).strip("_")
+        while "__" in slug:
+            slug = slug.replace("__", "_")
+        return slug or "unknown"
+
+    def _task_names(self):
+        dataset = getattr(self, "dataset", None)
+        specs = getattr(dataset, "lerobot_source_specs", None) or []
+        if specs:
+            return tuple(str(spec.get("name", f"task_{index}")) for index, spec in enumerate(specs))
+        names = {}
+        for episode in getattr(dataset, "episodes", ()):
+            task_index = int(episode.get("source_index", 0))
+            names.setdefault(task_index, str(episode.get("source_name", f"task_{task_index}")))
+        if not names:
+            return ("task_0",)
+        return tuple(names.get(index, f"task_{index}") for index in range(max(names) + 1))
+
+    def _accumulate_task_distribution_metrics(
+        self, accumulator, values, batch, *, prefix
+    ):
+        """Accumulate distribution metrics per source task.
+
+        Multi-source validation must not let the largest task dominate the
+        reported score.  ``task_index`` is metadata and remains on CPU, so the
+        grouping is intentionally performed with a CPU mask before reducing
+        the metric tensors.
+        """
+
+        task_index = batch.get("task_index")
+        if task_index is None:
+            return
+        task_index = torch.as_tensor(task_index).reshape(-1).long()
+        if not values:
+            return
+        names = self._task_names()
+        for task in torch.unique(task_index, sorted=True).tolist():
+            if task < 0:
+                continue
+            mask = task_index == int(task)
+            task_name = names[int(task)] if int(task) < len(names) else f"task_{task}"
+            task_slug = self._metric_slug(task_name)
+            for name, value in values.items():
+                # Macro-F1 is finalized from a confusion matrix over all
+                # validation frames, never by averaging per-window values.
+                if name == "contact_macro_f1":
+                    continue
+                if not torch.is_tensor(value) or value.ndim == 0:
+                    continue
+                self._metric_add(
+                    accumulator,
+                    f"{prefix}_task_{task_slug}__{name}",
+                    value[mask.to(device=value.device)],
+                    int(mask.sum().item()),
+                )
+
+    @staticmethod
+    def _accumulate_contact_confusion(
+        accumulator, probability_samples, target, *, key
+    ):
+        if probability_samples is None or target is None:
+            return False
+        confusion = contact_confusion_matrix(probability_samples, target).cpu()
+        previous = accumulator.get(key)
+        accumulator[key] = confusion if previous is None else previous + confusion
+        return True
+
+    def _accumulate_task_contact_confusion(
+        self, accumulator, probability_samples, target, metadata_batch, *, prefix
+    ):
+        """Accumulate contact confusion globally within each source task."""
+
+        task_index = metadata_batch.get("task_index")
+        if probability_samples is None or target is None or task_index is None:
+            return
+        task_index = torch.as_tensor(task_index).reshape(-1).long()
+        if task_index.shape[0] != probability_samples.shape[0]:
+            raise ValueError("task_index must have one entry per validation sample")
+        names = self._task_names()
+        for task in torch.unique(task_index, sorted=True).tolist():
+            if task < 0:
+                continue
+            mask = task_index == int(task)
+            task_name = names[int(task)] if int(task) < len(names) else f"task_{task}"
+            task_slug = self._metric_slug(task_name)
+            probability_task = probability_samples[mask.to(probability_samples.device)]
+            target_task = target[mask.to(target.device)]
+            confusion = contact_confusion_matrix(
+                probability_task, target_task
+            ).cpu()
+            key = f"{prefix}_task_{task_slug}__contact_confusion"
+            previous = accumulator.get(key)
+            accumulator[key] = confusion if previous is None else previous + confusion
+
+    @staticmethod
+    def _finalize_distribution_contact_metrics(
+        accumulator, metrics, *, key, metric_prefix
+    ):
+        confusion = accumulator.pop(key, None)
+        if confusion is None:
+            return
+        confusion = confusion.to(dtype=torch.float32)
+        total = confusion.sum().clamp_min(1.0)
+        metrics[f"{metric_prefix}contact_accuracy"] = float(
+            torch.diag(confusion).sum().item() / total.item()
+        )
+        metrics[f"{metric_prefix}contact_macro_f1"] = float(
+            contact_macro_f1_from_confusion(confusion).item()
+        )
+        true_positive = torch.diag(confusion)
+        support = confusion.sum(dim=1)
+        predicted = confusion.sum(dim=0)
+        precision = true_positive / predicted.clamp_min(1.0)
+        recall = true_positive / support.clamp_min(1.0)
+        f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1.0e-8)
+        for phase, value in enumerate(f1.tolist()):
+            metrics[f"{metric_prefix}contact_f1_phase{phase}"] = float(value)
+
+    @staticmethod
+    def _finalize_task_macro_metrics(metrics, *, prefix):
+        """Average task-level scalar metrics with one equal weight per task."""
+
+        marker = f"{prefix}_task_"
+        task_values = defaultdict(dict)
+        for key, value in metrics.items():
+            if not key.startswith(marker):
+                continue
+            remainder = key[len(marker):]
+            if "__" not in remainder:
+                continue
+            task, metric = remainder.split("__", 1)
+            if metric.endswith("_nonfinite"):
+                continue
+            task_values[metric][task] = value
+        for metric, values in task_values.items():
+            if values:
+                metrics[f"{prefix}_task_macro_{metric}"] = float(
+                    sum(values.values()) / len(values)
+                )
+
+    @staticmethod
+    def _finalize_task_contact_metrics(accumulator, metrics, *, prefix):
+        """Convert each task's accumulated contact confusion into metrics."""
+
+        marker = f"{prefix}_task_"
+        for key in tuple(accumulator):
+            if not key.startswith(marker) or not key.endswith("__contact_confusion"):
+                continue
+            remainder = key[len(marker) : -len("__contact_confusion")]
+            confusion = accumulator.pop(key).to(dtype=torch.float32)
+            true_positive = torch.diag(confusion)
+            support = confusion.sum(dim=1)
+            predicted = confusion.sum(dim=0)
+            precision = true_positive / predicted.clamp_min(1.0)
+            recall = true_positive / support.clamp_min(1.0)
+            f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1.0e-8)
+            task_prefix = f"{prefix}_task_{remainder}__"
+            metrics[task_prefix + "contact_accuracy"] = float(
+                true_positive.sum().item() / confusion.sum().clamp_min(1.0).item()
+            )
+            metrics[task_prefix + "contact_macro_f1"] = float(f1.mean().item())
+            for phase, value in enumerate(f1.tolist()):
+                metrics[task_prefix + f"contact_f1_phase{phase}"] = float(value)
+
     def _validation_base_indices(self):
         if self.val_loader is None:
             return []
@@ -492,11 +665,28 @@ class ContactWorldModelTrainer(BaseTrainer):
             records = []
             for name, index in selected.items():
                 sample = self.dataset[index]
+                task_index = int(torch.as_tensor(sample.get("task_index", 0)).item())
+                task_names = self._task_names()
+                phase_index = int(
+                    self.dataset.future_contact_phase(
+                        self.dataset.valid_indices[index], reduction="max"
+                    )
+                )
                 records.append(
                     {
                         "name": name,
                         "index": index,
                         "raw_index": int(self.dataset.valid_indices[index]),
+                        "task_name": (
+                            task_names[task_index]
+                            if task_index < len(task_names)
+                            else f"task_{task_index}"
+                        ),
+                        "phase_name": (
+                            phase_names[phase_index]
+                            if 0 <= phase_index < len(phase_names)
+                            else f"phase_{phase_index}"
+                        ),
                         "batch": default_collate([sample]),
                     }
                 )
@@ -521,6 +711,10 @@ class ContactWorldModelTrainer(BaseTrainer):
             },
             "raw_anchor_indices": {
                 record["name"]: record["raw_index"] for record in records
+            },
+            "paired_validation_indices": {
+                str(name): int(index)
+                for name, index in self.checkpoint_visualization_paired_indices.items()
             },
             "num_samples": self.checkpoint_visualization_num_samples,
             "seed": self.checkpoint_visualization_seed,
@@ -564,7 +758,15 @@ class ContactWorldModelTrainer(BaseTrainer):
         visualization_model.eval()
         plot_records = []
         metric_values = defaultdict(list)
-        scale_values = {"q": [], "tau": []}
+        task_metric_values = defaultdict(lambda: defaultdict(list))
+        visualization_contact_confusion = None
+        visualization_task_contact_confusion = {}
+        scale_values = {
+            "q": [],
+            "tau": [],
+            "q_endpoint_norm": [],
+            "tau_peak_norm": [],
+        }
         try:
             for record in self._checkpoint_visualization_records:
                 batch = self.batch_to_device(record["batch"])
@@ -594,7 +796,30 @@ class ContactWorldModelTrainer(BaseTrainer):
                     batch.get("contact_future"),
                 )
                 for key, value in metrics.items():
+                    if key == "contact_macro_f1":
+                        continue
                     metric_values[key].append(value.detach().float().reshape(-1).cpu())
+                    task_metric_values[record.get("task_name", "task_0")][key].append(
+                        value.detach().float().reshape(-1).cpu()
+                    )
+                contact_probability = samples.get("contact_probability")
+                contact_target = batch.get("contact_future")
+                if contact_probability is not None and contact_target is not None:
+                    confusion = contact_confusion_matrix(
+                        contact_probability, contact_target
+                    ).cpu()
+                    visualization_contact_confusion = (
+                        confusion
+                        if visualization_contact_confusion is None
+                        else visualization_contact_confusion + confusion
+                    )
+                    task_name = record.get("task_name", "task_0")
+                    previous = visualization_task_contact_confusion.get(task_name)
+                    visualization_task_contact_confusion[task_name] = (
+                        confusion
+                        if previous is None
+                        else previous + confusion
+                    )
                 physical_samples = {
                     key: self._checkpoint_visualization_physical(key, value)[0].cpu()
                     for key, value in normalized_samples.items()
@@ -609,9 +834,21 @@ class ContactWorldModelTrainer(BaseTrainer):
                     )
                 scale_values["q"].extend((physical_samples["q"], physical_targets["q"]))
                 scale_values["tau"].extend((physical_samples["tau"], physical_targets["tau"]))
+                q_endpoint_norm = torch.linalg.vector_norm(
+                    physical_samples["q"][:, -1, :], dim=-1
+                )
+                tau_peak_norm = torch.linalg.vector_norm(
+                    physical_samples["tau"], dim=-1
+                ).max(dim=1).values
+                scale_values["q_endpoint_norm"].append(
+                    q_endpoint_norm
+                )
+                scale_values["tau_peak_norm"].append(tau_peak_norm)
                 plot_records.append(
                     {
                         "name": record["name"],
+                        "task_name": record.get("task_name", "task_0"),
+                        "phase_name": record.get("phase_name", record["name"]),
                         "samples": {
                             key: value.numpy() for key, value in physical_samples.items()
                         },
@@ -626,6 +863,55 @@ class ContactWorldModelTrainer(BaseTrainer):
             visualization_model.train(was_training)
 
         metrics = self._mean_metric_dict(metric_values)
+        for task_name, values in task_metric_values.items():
+            task_slug = self._metric_slug(task_name)
+            for key, entries in values.items():
+                metrics[f"task_{task_slug}_{key}"] = float(
+                    torch.cat(entries).mean().item()
+                )
+        task_metric_names = sorted(
+            {
+                key
+                for values in task_metric_values.values()
+                for key in values
+            }
+        )
+        for key in task_metric_names:
+            task_values = [
+                float(torch.cat(values[key]).mean().item())
+                for values in task_metric_values.values()
+                if key in values
+            ]
+            if task_values:
+                metrics[f"task_macro_{key}"] = sum(task_values) / len(task_values)
+        if visualization_contact_confusion is not None:
+            metrics["contact_macro_f1"] = float(
+                contact_macro_f1_from_confusion(
+                    visualization_contact_confusion
+                ).item()
+            )
+        task_contact_f1 = []
+        for task_name, confusion in visualization_task_contact_confusion.items():
+            task_slug = self._metric_slug(task_name)
+            confusion = confusion.to(dtype=torch.float32)
+            true_positive = torch.diag(confusion)
+            support = confusion.sum(dim=1)
+            predicted = confusion.sum(dim=0)
+            precision = true_positive / predicted.clamp_min(1.0)
+            recall = true_positive / support.clamp_min(1.0)
+            f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1.0e-8)
+            metrics[f"task_{task_slug}_contact_accuracy"] = float(
+                true_positive.sum().item() / confusion.sum().clamp_min(1.0).item()
+            )
+            task_f1 = float(f1.mean().item())
+            metrics[f"task_{task_slug}_contact_macro_f1"] = task_f1
+            task_contact_f1.append(task_f1)
+            for phase, value in enumerate(f1.tolist()):
+                metrics[f"task_{task_slug}_contact_f1_phase{phase}"] = float(value)
+        if task_contact_f1:
+            metrics["task_macro_contact_macro_f1"] = sum(task_contact_f1) / len(
+                task_contact_f1
+            )
         metrics.update(
             {
                 "step": int(self.global_step),
@@ -929,6 +1215,14 @@ class ContactWorldModelTrainer(BaseTrainer):
         condition = {key: history[key] for key in self.model.inputs}
         condition["action"] = action_rollout[:, int(anchor)]
         condition["action_mask"] = action_rollout_mask[:, int(anchor)]
+        action_rollout_time = batch.get("action_rollout_time")
+        if action_rollout_time is not None:
+            if action_rollout_time.ndim != 3 or int(anchor) >= action_rollout_time.shape[1]:
+                raise ValueError(
+                    "action_rollout_time must have shape [B, R, A] and cover "
+                    "the feedback anchor"
+                )
+            condition["action_time"] = action_rollout_time[:, int(anchor)]
         return condition
 
     def _append_feedback_measurements(self, history, batch, start, stop):
@@ -1073,7 +1367,7 @@ class ContactWorldModelTrainer(BaseTrainer):
         }
 
     def _accumulate_feedback_interval(
-        self, accumulator, batch, batch_index, interval
+        self, accumulator, batch, batch_index, interval, *, metadata_batch=None
     ):
         prefix = f"feedback_u{int(interval)}"
         result = self._feedback_reconditioned_samples(
@@ -1086,12 +1380,33 @@ class ContactWorldModelTrainer(BaseTrainer):
             result["contact_target"],
         )
         for name, value in values.items():
+            if name == "contact_macro_f1":
+                continue
             self._metric_add(
                 accumulator,
                 f"{prefix}_{name}",
                 value,
                 value.numel(),
             )
+        self._accumulate_task_distribution_metrics(
+            accumulator,
+            values,
+            metadata_batch if metadata_batch is not None else batch,
+            prefix=prefix,
+        )
+        self._accumulate_contact_confusion(
+            accumulator,
+            result["contact_probability"],
+            result["contact_target"],
+            key=f"{prefix}_contact_confusion",
+        )
+        self._accumulate_task_contact_confusion(
+            accumulator,
+            result["contact_probability"],
+            result["contact_target"],
+            metadata_batch if metadata_batch is not None else batch,
+            prefix=prefix,
+        )
 
         phase_names = self._feedback_phase_names(
             self.loss_calculator.contact_state_count
@@ -1103,6 +1418,8 @@ class ContactWorldModelTrainer(BaseTrainer):
                 if not mask.any():
                     continue
                 for name, value in segment["metrics"].items():
+                    if name == "contact_macro_f1":
+                        continue
                     self._metric_add(
                         accumulator,
                         f"{prefix}_phase_{phase_name}_{name}",
@@ -1227,7 +1544,11 @@ class ContactWorldModelTrainer(BaseTrainer):
                 ):
                     for interval in self.feedback_measurement_update_intervals:
                         self._accumulate_feedback_interval(
-                            accumulator, batch, batch_index, interval
+                            accumulator,
+                            batch,
+                            batch_index,
+                            interval,
+                            metadata_batch=raw_batch,
                         )
 
                 if self.free_running_steps <= 0:
@@ -1256,6 +1577,19 @@ class ContactWorldModelTrainer(BaseTrainer):
                             running_batch["action_mask"] = batch[
                                 "action_rollout_mask"
                             ][:, step]
+                        if "action_rollout_time" in batch:
+                            running_batch["action_time"] = batch[
+                                "action_rollout_time"
+                            ][:, step]
+                    # Future timestamps in ``running_batch`` belong to the
+                    # previous query anchor. Remove them before each
+                    # recursive query so the model uses a fresh local
+                    # physical-time origin; action_rollout_time, when
+                    # available, is already relative to this step's anchor.
+                    running_batch.pop("future_time", None)
+                    running_batch.pop("future_timestamp_ns", None)
+                    if "action_rollout" not in batch:
+                        running_batch.pop("action_time", None)
                     step_noise = self._fixed_source_noise(
                         running_batch, batch_index, step=step + 1
                     )
@@ -1367,6 +1701,18 @@ class ContactWorldModelTrainer(BaseTrainer):
         metrics = self._metric_finalize(accumulator)
         for prefix in contact_prefixes:
             metrics.update(self._finalize_contact_metrics(accumulator, prefix=prefix))
+        for interval in self.feedback_measurement_update_intervals:
+            prefix = f"feedback_u{interval}_"
+            self._finalize_distribution_contact_metrics(
+                accumulator,
+                metrics,
+                key=f"{prefix}contact_confusion",
+                metric_prefix=prefix,
+            )
+            self._finalize_task_contact_metrics(
+                accumulator, metrics, prefix=f"feedback_u{interval}"
+            )
+            self._finalize_task_macro_metrics(metrics, prefix=f"feedback_u{interval}")
         metrics["rollout_batches"] = int(accumulator.get("rollout_batches", 0))
         metrics["rollout_samples"] = int(accumulator.get("rollout_samples", 0))
         metrics["rollout_nonfinite_batches"] = int(
@@ -1502,9 +1848,27 @@ class ContactWorldModelTrainer(BaseTrainer):
                     medoid - state_target
                 ).square().flatten(1).mean(dim=1)
                 for name, value in values.items():
+                    if name == "contact_macro_f1":
+                        continue
                     self._metric_add(
                         accumulator, name, value, value.numel()
                     )
+                self._accumulate_task_distribution_metrics(
+                    accumulator, values, raw_batch, prefix="probabilistic"
+                )
+                self._accumulate_contact_confusion(
+                    accumulator,
+                    samples.get("contact_probability"),
+                    batch.get("contact_future"),
+                    key="probabilistic_contact_confusion",
+                )
+                self._accumulate_task_contact_confusion(
+                    accumulator,
+                    samples.get("contact_probability"),
+                    batch.get("contact_future"),
+                    raw_batch,
+                    prefix="probabilistic",
+                )
 
                 future_phase = raw_batch.get("future_phase")
                 if future_phase is not None:
@@ -1542,6 +1906,16 @@ class ContactWorldModelTrainer(BaseTrainer):
         finally:
             self.model = training_model
         metrics = self._metric_finalize(accumulator)
+        self._finalize_distribution_contact_metrics(
+            accumulator,
+            metrics,
+            key="probabilistic_contact_confusion",
+            metric_prefix="",
+        )
+        self._finalize_task_contact_metrics(
+            accumulator, metrics, prefix="probabilistic"
+        )
+        self._finalize_task_macro_metrics(metrics, prefix="probabilistic")
         metrics["probabilistic_batches"] = int(
             accumulator.get("probabilistic_batches", 0)
         )

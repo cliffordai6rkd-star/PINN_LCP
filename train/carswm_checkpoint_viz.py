@@ -94,7 +94,17 @@ def render_checkpoint_summary(
     for color, record in zip(colors, records):
         q_endpoint = np.asarray(record["samples"]["q"])[:, -1, wrist_joint_index]
         tau_endpoint = np.asarray(record["samples"]["tau"])[:, -1, wrist_joint_index]
-        ax_scatter.scatter(q_endpoint, tau_endpoint, alpha=0.55, s=18, color=color, label=record["name"])
+        task_name = record.get("task_name", "task")
+        phase_name = record.get("phase_name", record.get("name", "phase"))
+        label = f"{task_name} / {phase_name}"
+        ax_scatter.scatter(
+            q_endpoint,
+            tau_endpoint,
+            alpha=0.55,
+            s=18,
+            color=color,
+            label=label,
+        )
         ax_scatter.scatter(
             np.asarray(record["targets"]["q"])[-1, wrist_joint_index],
             np.asarray(record["targets"]["tau"])[-1, wrist_joint_index],
@@ -103,7 +113,11 @@ def render_checkpoint_summary(
             linewidth=2,
             color=color,
         )
-    ax_scatter.set(title="D  q-tau endpoint modes", xlabel="q endpoint [rad]", ylabel="tau endpoint [Nm]")
+    ax_scatter.set(
+        title="D  Phase-conditioned endpoint samples",
+        xlabel="q endpoint, wrist joint [rad]",
+        ylabel="tau endpoint, wrist joint [Nm]",
+    )
     ax_scatter.set_xlim(*scales["q"])
     ax_scatter.set_ylim(*scales["tau"])
     ax_scatter.legend(fontsize=8)

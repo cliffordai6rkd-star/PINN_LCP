@@ -19,13 +19,22 @@ sampling uses a fixed `max` aggregation of the contact-phase labels already in
 each future window, with importance correction for the original empirical
 risk.
 
-The Teacher and OPD Student use the same simplified architecture. Each selected
-state stream has an independent GRU whose final hidden state is one modality
-token. An action GRU produces the future action tokens, and the state and action
-tokens are concatenated directly into the condition memory. Every Flow block
-then applies future-token self-attention, cross-attention to that condition
-memory, and an FFN before predicting the conditional velocity field. Teacher
-and Student differ only in configured capacity and Flow integration steps.
+The Teacher encodes each selected state stream with an independent GRU, encodes
+the action chunk with a separate GRU plus elapsed physical-time embeddings, and
+uses state-to-action cross-attention (state queries, action keys/values) before
+forming the condition memory as action-aware state tokens plus the raw action
+tokens. Future Flow tokens likewise receive elapsed physical-time embeddings.
+Every Flow block then applies future-token self-attention, cross-attention to
+that condition memory, and an FFN before predicting the conditional velocity
+field. Teacher and Student differ only in configured capacity and Flow
+integration steps.
+
+The WM action export uses the same expert action fields and causal snapshot
+rule as `VA_h5_v3`: a configurable recorded camera timeline is sampled at the
+nominal 25 Hz rate, the latest expert label at or before each camera timestamp
+is selected, and that label is held on the raw 100 Hz state rows by ZOH. The
+resulting timestamps are retained so the model can align action and future
+tokens in physical seconds.
 
 ## Training
 
@@ -42,7 +51,7 @@ The authoritative budgets and checkpoint cadence are the
 `train.max_optimizer_steps` and `train.checkpoint_every_steps` values in each
 YAML. The old `max_train_steps` key is accepted only as a compatibility alias.
 
-Every CARS-WM checkpoint contains `model_version: carswm_v2` and a complete
+Every CARS-WM checkpoint contains `model_version: carswm_v3` and a complete
 `carswm_contract`. Older ContactWorldModel checkpoints do not satisfy this
 contract and must be retrained.
 
@@ -59,8 +68,9 @@ fixed_samples.json
 plot_scales.json
 ```
 
-The PNG contains q and tau trajectories, contact probabilities, q-tau endpoint
-modes, distribution metrics, and contact calibration metrics. Aggregate
+The PNG contains q and tau trajectories, contact probabilities,
+phase-conditioned endpoint samples, distribution metrics, and contact
+calibration metrics. Aggregate
 Energy Score/minADE/minFDE are computed in normalized space; plots are
 denormalized. Contact-onset error is evaluation-only.
 
@@ -82,6 +92,17 @@ coverage, contact calibration/classification metrics, and metrics grouped by
 the existing free/transition/contact phase labels. A scored segment is assigned
 to the maximum existing phase label present in that segment; no time-to-contact
 target or bin is derived.
+
+For multi-task sources, validation also emits `*_task_<name>_*` metrics and
+equal-weight `*_task_macro_*` averages. The task macro is the reported
+cross-task comparison; the sample-count-weighted aggregate remains available
+for compatibility. Panel D is intentionally named **Phase-conditioned
+endpoint samples**: colors identify different task/phase conditions and do not
+claim that those clusters are multiple futures for one identical condition.
+Evidence for condition-similar, future-different behavior requires an explicitly
+curated matched validation group, for example via `paired_validation_indices`.
+Checkpoint visualization JSON/PNG files generated before the NLL and global
+confusion-matrix fixes are stale and must be regenerated from their checkpoints.
 
 This is an **offline measurement-updated evaluation** using ground-truth
 measurements from the validation dataset. It must not be reported as real

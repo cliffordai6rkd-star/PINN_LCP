@@ -78,7 +78,9 @@ features:
     rate: action
     dtype: float32
     shape: [7]
-    h5_path: teleop/q_follower
+    # Match the high-level VA expert action semantic (command target), not the
+    # measured follower state used by observation.joint.
+    h5_path: teleop/q_cmd
     timestamp_path: teleop/timestamp_us
     resample: previous
   action.ee_pose:

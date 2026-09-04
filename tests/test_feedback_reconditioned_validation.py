@@ -245,6 +245,12 @@ def test_feedback_metrics_use_feedback_prefixes_and_existing_phase_labels():
 
     trainer._accumulate_feedback_interval(accumulator, _batch(), 0, interval=4)
     metrics = trainer._metric_finalize(accumulator)
+    trainer._finalize_distribution_contact_metrics(
+        accumulator,
+        metrics,
+        key="feedback_u4_contact_confusion",
+        metric_prefix="feedback_u4_",
+    )
 
     assert "feedback_u4_energy_score" in metrics
     assert "feedback_u4_min_ade" in metrics

@@ -44,27 +44,67 @@ def marginal_coverage(samples, target):
     return ((target >= lower) & (target <= upper)).float().mean(dim=(1, 2))
 
 
-def contact_metrics(probability_samples, target):
+def contact_confusion_matrix(probability_samples, target):
+    """Return one confusion matrix over the complete batch and horizon.
+
+    Contact metrics are sequence classification metrics.  Computing F1 per
+    window makes absent classes look like errors, so callers that aggregate
+    validation must accumulate this matrix across all evaluated windows.
+    """
+
     if probability_samples.ndim != 4 or probability_samples.shape[-1] < 2:
-        raise ValueError("contact probabilities must have shape [B,K,H,C], C >= 2")
+        raise ValueError(
+            "contact probabilities must have shape [B,K,H,C], C >= 2"
+        )
     class_count = probability_samples.shape[-1]
     labels = target.squeeze(-1).round().long()
+    if (
+        labels.ndim != 2
+        or labels.shape[0] != probability_samples.shape[0]
+        or labels.shape[1] != probability_samples.shape[2]
+    ):
+        raise ValueError(
+            "contact target must have shape [B,H,1] matching probabilities"
+        )
     if torch.any(labels < 0) or torch.any(labels >= class_count):
         raise ValueError("contact target contains a phase outside [0, C)")
     probability = probability_samples.mean(dim=1).clamp_min(1.0e-8)
-    nll = -probability.gather(-1, labels[..., None]).squeeze(-1).mean(dim=1)
+    prediction = probability.argmax(dim=-1)
+    return torch.bincount(
+        labels.reshape(-1) * class_count + prediction.reshape(-1),
+        minlength=class_count * class_count,
+    ).reshape(class_count, class_count)
+
+
+def contact_macro_f1_from_confusion(confusion):
+    if confusion.ndim != 2 or confusion.shape[0] != confusion.shape[1]:
+        raise ValueError("contact confusion matrix must be square")
+    true_positive = torch.diag(confusion).float()
+    support = confusion.sum(dim=1).float()
+    predicted = confusion.sum(dim=0).float()
+    precision = true_positive / predicted.clamp_min(1.0)
+    recall = true_positive / support.clamp_min(1.0)
+    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1.0e-8)
+    return f1.mean()
+
+
+def contact_metrics(probability_samples, target):
+    if probability_samples.ndim != 4 or probability_samples.shape[-1] < 2:
+        raise ValueError("contact probabilities must have shape [B,K,H,C], C >= 2")
+    confusion = contact_confusion_matrix(probability_samples, target)
+    class_count = probability_samples.shape[-1]
+    labels = target.squeeze(-1).round().long()
+    probability = probability_samples.mean(dim=1).clamp_min(1.0e-8)
+    nll = -torch.log(
+        probability.gather(-1, labels[..., None]).squeeze(-1)
+    ).mean(dim=1)
     one_hot = F.one_hot(labels, num_classes=class_count).to(probability.dtype)
     brier = (probability - one_hot).square().sum(dim=-1).mean(dim=1)
     prediction = probability.argmax(dim=-1)
-    f1_values = []
-    for phase in range(class_count):
-        true_positive = ((prediction == phase) & (labels == phase)).sum(dim=1).float()
-        predicted = (prediction == phase).sum(dim=1).float()
-        support = (labels == phase).sum(dim=1).float()
-        precision = true_positive / predicted.clamp_min(1.0)
-        recall = true_positive / support.clamp_min(1.0)
-        f1_values.append(2.0 * precision * recall / (precision + recall).clamp_min(1.0e-8))
-    macro_f1 = torch.stack(f1_values, dim=1).mean(dim=1)
+    # This is the macro-F1 for the complete batch/horizon represented by this
+    # call.  Validation code additionally accumulates the underlying matrix
+    # across batches before reporting its final value.
+    macro_f1 = contact_macro_f1_from_confusion(confusion)
 
     def onset(value):
         contact = value == class_count - 1
@@ -110,6 +150,8 @@ def distribution_metrics(samples_by_stream, targets_by_stream, contact_probabili
 
 
 __all__ = [
+    "contact_confusion_matrix",
+    "contact_macro_f1_from_confusion",
     "contact_metrics",
     "distribution_metrics",
     "energy_score",

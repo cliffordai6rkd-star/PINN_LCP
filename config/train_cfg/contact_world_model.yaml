@@ -4,8 +4,8 @@ train_data:
   format: lerobot_v3
   # Relative roots are resolved from the repository root by the training
   # script (which changes to that directory before launching Python).
-  # V3 action anchors are sampled from the first command at/after each state.
-  action_alignment: next
+  # V3 action anchors follow the recorded wrist-camera timeline. The action
+  # chunk uses the next expert snapshot after the currently held command.
   # Optional multi-source form. Each source is loaded as an independent
   # LeRobot v3 dataset and concatenated episode-wise by the WM dataloader.
   sources:
@@ -49,7 +49,8 @@ dataloader:
 
   expert_fps: 25.0
   inference_delay_s: 0.0
-  action_resample: nearest
+  # Match VA_h5_v3's causal action snapshot rule at each camera anchor.
+  action_resample: previous
   action_augmentation:
     enabled: false
     gaussian_std: 0.0
@@ -106,6 +107,7 @@ model:
   flow_solver: heun
   flow_source_mode: gaussian
   action_time_alignment: zoh
+  state_to_action_attention_heads: 4
   contact_head_hidden_dim: 64
   runtime_checks: false
   use_action_padding_mask: false
@@ -174,7 +176,7 @@ train:
   defer_metric_sync: true
   # Only these tensors participate in the model/loss; indices, timestamps and
   # *_raw diagnostics stay on CPU for logging/visualization.
-  device_batch_keys: [q, dq, delta_q, tau, action, action_mask, action_rollout, action_rollout_mask, q_future, dq_future, delta_q_future, tau_future, contact_future, importance_weight]
+  device_batch_keys: [q, dq, delta_q, tau, action, action_mask, action_time, future_time, action_rollout, action_rollout_time, action_rollout_mask, q_future, dq_future, delta_q_future, tau_future, contact_future, importance_weight]
   amp:
     enabled: true
     dtype: bfloat16
@@ -220,6 +222,9 @@ train:
     # Empty means: deterministically choose the first validation anchor for
     # each existing contact phase and persist the exact indices in a manifest.
     fixed_validation_indices: {}
+    # Optional curated same-condition/different-future records. These are
+    # plotted as explicit matched references; ordinary phase anchors are not
+    # interpreted as a multimodal set.
     paired_validation_indices: {}
     num_samples: 32
     seed: 2027

@@ -46,16 +46,16 @@ def test_independent_state_encoders_and_fused_shapes(inputs, count):
     assert first.isdisjoint(id(parameter) for parameter in model.state_encoders[inputs[-1]].parameters())
     output = model(batch(cfg), flow_time=0.5)
     assert output["state_tokens"].shape == (2, count, 8)
+    assert output["state_action_tokens"].shape == (2, count, 8)
     assert output["condition_memory"].shape == (2, count + 3, 8)
     assert output["action_tokens"].shape == (2, 3, 8)
     torch.testing.assert_close(
         output["condition_memory"],
-        torch.cat((output["state_tokens"], output["action_tokens"]), dim=1),
+        torch.cat((output["state_action_tokens"], output["action_tokens"]), dim=1),
     )
-    assert not hasattr(model, "state_pool_attention")
-    assert not hasattr(model, "state_to_action_attention")
-    assert not hasattr(model, "action_gate")
-    assert not hasattr(model, "global_condition_projection")
+    assert hasattr(model, "state_to_action_attention")
+    assert output["action_time"].shape == (2, 3)
+    assert output["future_time"].shape == (2, 4)
 
 
 def test_flow_block_uses_self_attention_cross_attention_and_ffn():
@@ -70,6 +70,10 @@ def test_flow_block_uses_self_attention_cross_attention_and_ffn():
     assert any(parameter.grad is not None for parameter in block.ffn.parameters())
     assert any(
         parameter.grad is not None
+        for parameter in model.state_to_action_attention.parameters()
+    )
+    assert any(
+        parameter.grad is not None
         for encoder in model.state_encoders.values()
         for parameter in encoder.parameters()
     )
@@ -79,13 +83,17 @@ def test_flow_block_uses_self_attention_cross_attention_and_ffn():
 def test_checkpoint_contract_identifies_simplified_token_architecture():
     model = ContactWorldModel(config())
     contract = model.checkpoint_contract()
-    assert model.MODEL_VERSION == "carswm_v2"
-    assert contract["schema_version"] == 2
+    assert model.MODEL_VERSION == "carswm_v3"
+    assert contract["schema_version"] == 3
     assert contract["architecture"] == {
-        "condition_encoder": "modality_gru_action_gru_concat",
+        "condition_encoder": "modality_gru_action_gru_state_to_action_cross_attention",
         "state_token": "final_gru_hidden",
         "flow_decoder": "self_attention_cross_attention_ffn",
+        "condition_memory": "state_action_aware_state_plus_raw_action",
+        "action_time_encoding": "physical_seconds_fourier_mlp",
+        "future_time_encoding": "physical_seconds_fourier_mlp",
     }
+    assert contract["action"]["dataset_alignment"] == "previous"
     incompatible = dict(contract)
     incompatible["model_version"] = "carswm_v1"
     with pytest.raises(ValueError, match="contract mismatch"):
@@ -106,6 +114,71 @@ def test_flow_targets_and_contact_are_separate():
     assert "flow_contact_loss" not in metrics
     assert "contact_loss" in metrics
     assert any(parameter.grad is not None for parameter in model.contact_head.parameters())
+
+
+def test_physical_time_changes_action_tokens_and_contact_alignment():
+    cfg = config()
+    model = ContactWorldModel(cfg).eval()
+    values = batch(cfg)
+    first = model.encode_conditions(values)
+    values["action_time"] = torch.tensor(
+        [[0.10, 0.20, 0.30], [0.10, 0.20, 0.30]]
+    )
+    shifted = model.encode_conditions(values)
+    assert not torch.equal(first["action_tokens"], shifted["action_tokens"])
+    assert not torch.equal(first["action_time"], shifted["action_time"])
+    assert shifted["future_time"].shape == (2, 4)
+
+
+def test_physical_time_prefers_recorded_irregular_timestamps():
+    cfg = config()
+    model = ContactWorldModel(cfg).eval()
+    values = batch(cfg)
+    values["history_timestamp_ns"] = torch.tensor(
+        [
+            [100_000_000, 110_000_000, 120_000_000, 130_000_000, 140_000_000],
+            [200_000_000, 210_000_000, 220_000_000, 230_000_000, 240_000_000],
+        ],
+        dtype=torch.int64,
+    )
+    values["action_chunk_timestamp_ns"] = torch.tensor(
+        [
+            [181_000_000, 223_000_000, 281_000_000],
+            [281_000_000, 323_000_000, 381_000_000],
+        ],
+        dtype=torch.int64,
+    )
+    values["future_timestamp_ns"] = torch.tensor(
+        [
+            [151_000_000, 162_000_000, 177_000_000, 201_000_000],
+            [251_000_000, 262_000_000, 277_000_000, 301_000_000],
+        ],
+        dtype=torch.int64,
+    )
+    encoded = model.encode_conditions(values)
+    torch.testing.assert_close(
+        encoded["action_time"],
+        torch.tensor([[0.041, 0.083, 0.141], [0.041, 0.083, 0.141]]),
+    )
+    torch.testing.assert_close(
+        encoded["future_time"],
+        torch.tensor([[0.011, 0.022, 0.037, 0.061], [0.011, 0.022, 0.037, 0.061]]),
+    )
+
+
+def test_zoh_action_alignment_uses_physical_seconds():
+    cfg = config()
+    model = ContactWorldModel(cfg).eval()
+    encoded = {
+        "action_tokens": torch.tensor([[[10.0], [20.0], [30.0]]]),
+        "action_time": torch.tensor([[0.04, 0.08, 0.14]]),
+        "future_time": torch.tensor([[0.01, 0.04, 0.05, 0.10]]),
+    }
+    aligned = model._time_aligned_action_features(encoded)
+    torch.testing.assert_close(
+        aligned,
+        torch.tensor([[[10.0], [10.0], [10.0], [20.0]]]),
+    )
 
 
 def test_contact_head_depends_on_its_generated_continuous_sample():
@@ -195,7 +268,8 @@ def test_teacher_inputs_and_outputs_are_independent():
     assert model.predicted_state_streams == ("q", "tau")
     assert model.PREDICTED_STATE_STREAMS == ("q", "tau")
     assert model.CONDITION_KEYS == (
-        "q", "dq", "delta_q", "tau", "action", "action_mask"
+        "q", "dq", "delta_q", "tau", "action", "action_mask",
+        "action_time", "future_time"
     )
     assert model.TARGET_KEYS == ("q_future", "tau_future", "contact_future")
     assert model.flow_dim == 2 * model.joint_dim

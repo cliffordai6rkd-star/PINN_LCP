@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from data_process.tool.h5_2_lerobotev3 import H5Dataset
 from data_process.tool.h5_v3_wm import (
@@ -194,3 +195,17 @@ def test_manifest_records_expert_camera_zoh_contract(tmp_path):
     assert manifest["action_sampling"] == "previous_expert_label"
     assert manifest["action_upsampling"] == "zoh_previous_camera_anchor"
     assert manifest["action_contract"] == "high_level_expert_camera_snapshot_v1"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["push_button", "insert_usb", "cucumber_peeling"],
+)
+def test_swm_joint_action_matches_va_command_semantics(name):
+    config_path = (
+        Path(__file__).parents[1] / "config" / "shape_meta" / "swm" / f"{name}.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["timeline"]["action_fps"] == 25
+    assert config["features"]["action.joint"]["h5_path"] == "teleop/q_cmd"
+    assert config["features"]["action.joint"]["resample"] == "previous"

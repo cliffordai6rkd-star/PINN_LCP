@@ -970,7 +970,14 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
 
     def _build_virtual_episodes(self):
         episodes = []
-        for episode in self.source_dataset.meta.episodes:
+        source_name = (
+            self.lerobot_source_specs[0]["name"]
+            if self.lerobot_source_specs
+            else str(self.repo_id or "task_0")
+        )
+        for local_episode_position, episode in enumerate(
+            self.source_dataset.meta.episodes
+        ):
             row_start = int(episode["dataset_from_index"])
             row_end = int(episode["dataset_to_index"])
             high_start = row_start * self.packed_window_size
@@ -978,6 +985,11 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             episodes.append(
                 {
                     **dict(episode),
+                    "source_index": 0,
+                    "source_name": source_name,
+                    "source_episode_index": int(
+                        episode.get("episode_index", local_episode_position)
+                    ),
                     "source_dataset_from_index": row_start,
                     "source_dataset_to_index": row_end,
                     "dataset_from_index": high_start,
@@ -1125,6 +1137,74 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         return self.high_tensors["action"].index_select(0, rows).reshape(
             horizon, self.action_condition_horizon, -1
         )
+
+    def _action_rollout_times_for_anchor(self, high_idx, episode):
+        """Return each re-anchored action chunk in seconds from its state anchor."""
+
+        horizon = self.action_rollout_horizon
+        if horizon <= 0:
+            return None
+        end = int(episode["dataset_to_index"])
+        state_indices = torch.arange(
+            int(high_idx), int(high_idx) + horizon, dtype=torch.long
+        )
+        if int(state_indices[-1]) >= end:
+            raise IndexError("action rollout crosses the episode boundary")
+
+        table = self._action_tables.get(id(episode))
+        if table is not None:
+            current_indices = self.action_indices.index_select(0, state_indices)
+            positions = torch.searchsorted(table["indices"], current_indices)
+            if torch.any(positions >= table["indices"].numel()):
+                raise IndexError("state row refers to an unknown action index")
+            if torch.any(
+                table["indices"].index_select(0, positions) != current_indices
+            ):
+                raise IndexError("state row refers to an unknown action index")
+
+            starts = positions + self.action_start_offset
+            if torch.any(starts >= table["indices"].numel()):
+                raise IndexError(
+                    "future action chunk crosses the available action table"
+                )
+            if self.inference_delay_ns:
+                desired_times = (
+                    table["times"].index_select(0, starts)
+                    + self.inference_delay_ns
+                )
+                starts = torch.searchsorted(
+                    table["times"], desired_times, right=False
+                )
+                if torch.any(starts >= table["indices"].numel()):
+                    raise IndexError(
+                        "future action chunk crosses the available action table"
+                    )
+            token_offsets = torch.arange(
+                self.action_condition_horizon, dtype=torch.long
+            )
+            chunk_positions = starts[:, None] + token_offsets[None, :]
+            if torch.any(chunk_positions >= table["indices"].numel()):
+                raise IndexError(
+                    "future action chunk crosses the available action table"
+                )
+            target_times = table["times"].index_select(
+                0, chunk_positions.reshape(-1)
+            ).reshape(horizon, self.action_condition_horizon)
+            anchor_times = self.high_timestamps.index_select(0, state_indices)
+            return (
+                target_times.to(dtype=torch.float64)
+                - anchor_times.to(dtype=torch.float64)[:, None]
+            ).mul(1.0e-9).to(dtype=torch.float32)
+
+        times = []
+        for state_index in state_indices.tolist():
+            action = self._action_for_anchor(int(state_index), episode)
+            anchor_time = self.high_timestamps[int(state_index)]
+            times.append(
+                (action["target_times"].to(dtype=torch.float64) - anchor_time.to(dtype=torch.float64))
+                * 1.0e-9
+            )
+        return torch.stack(times, dim=0).to(dtype=torch.float32)
 
     def _build_contact_labels(self):
         bounds = [
@@ -1441,6 +1521,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         action = self._action_for_anchor(high_idx, episode)
         sample = {
             "sample_idx": torch.tensor(high_idx, dtype=torch.long),
+            "task_index": torch.tensor(
+                int(episode.get("source_index", 0)), dtype=torch.long
+            ),
             "history_indices": history,
             "future_indices": future,
             "history_timestamp_ns": self.high_timestamps.index_select(0, history),
@@ -1451,10 +1534,21 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             "expert_action_chunk_abs": action["action_chunk"],
             "action_raw": action["condition"],
             "action_mask": action["condition_mask"],
+            "action_time": (
+                action["target_times"].to(dtype=torch.float64)
+                - self.high_timestamps[high_idx].to(dtype=torch.float64)
+            ).mul(1.0e-9).to(dtype=torch.float32),
+            "future_time": (
+                self.high_timestamps.index_select(0, future).to(dtype=torch.float64)
+                - self.high_timestamps[high_idx].to(dtype=torch.float64)
+            ).mul(1.0e-9).to(dtype=torch.float32),
         }
         if self.action_rollout_horizon:
             action_rollout = self._action_rollout_for_anchor(high_idx, episode)
             sample["action_rollout"] = self._normalize("action", action_rollout)
+            sample["action_rollout_time"] = self._action_rollout_times_for_anchor(
+                high_idx, episode
+            )
             sample["action_rollout_mask"] = torch.ones(
                 self.action_rollout_horizon,
                 self.configured_action_condition_horizon,
