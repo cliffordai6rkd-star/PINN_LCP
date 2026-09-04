@@ -90,6 +90,33 @@ def test_opd_write_back_commits_all_streams_first_frame_and_action_chunk():
     assert torch.equal(next_value["action"], value["action_rollout"][:, 1])
 
 
+def test_opd_write_back_uses_recorded_future_for_unpredicted_inputs():
+    config = cfg()
+    config["model"]["outputs"] = ["q", "tau"]
+    trainer = ContactWorldModelOPDTrainer.__new__(ContactWorldModelOPDTrainer)
+    trainer.model = ContactWorldModel(config)
+    value = batch()
+    predicted = {
+        "q_pred": torch.ones(1, 3, 2) * 5,
+        "tau_pred": torch.ones(1, 3, 2) * 7,
+    }
+
+    next_value = trainer._write_back(
+        value,
+        predicted,
+        rollout_step=1,
+        advance_action=False,
+        recorded_batch=value,
+    )
+
+    torch.testing.assert_close(next_value["q"][:, -1], predicted["q_pred"][:, 0])
+    torch.testing.assert_close(next_value["tau"][:, -1], predicted["tau_pred"][:, 0])
+    torch.testing.assert_close(next_value["dq"][:, -1], value["dq_future"][:, 1])
+    torch.testing.assert_close(
+        next_value["delta_q"][:, -1], value["delta_q_future"][:, 1]
+    )
+
+
 def test_teacher_action_contract_mismatch_is_rejected():
     config = cfg()
     config["dataloader"]["action_key"] = "action.ee_pose"
@@ -129,3 +156,25 @@ def test_teacher_and_student_use_the_same_simplified_architecture_contract():
     teacher = {"dataloader": config["dataloader"], "model": config["model"], "train_data": config["train_data"]}
     trainer.dataset = type("Dataset", (), {"normalizer": type("Norm", (), {"stats": {}})()})()
     trainer._validate_teacher_contract(teacher, {"normalizer": {"stats": {}}})
+
+
+def test_opd_rejects_teacher_student_output_contract_mismatch():
+    config = cfg()
+    config["train_data"] = {"action_alignment": "next"}
+    trainer = ContactWorldModelOPDTrainer.__new__(ContactWorldModelOPDTrainer)
+    trainer.config = config
+    trainer.dataset = type(
+        "Dataset", (), {"normalizer": type("Norm", (), {"stats": {}})()}
+    )()
+    teacher_model = dict(config["model"])
+    teacher_model["outputs"] = ["q", "tau"]
+    teacher = {
+        "dataloader": config["dataloader"],
+        "model": teacher_model,
+        "train_data": config["train_data"],
+    }
+
+    with pytest.raises(ValueError, match="model.outputs"):
+        trainer._validate_teacher_contract(
+            teacher, {"normalizer": {"stats": {}}}
+        )

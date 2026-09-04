@@ -9,12 +9,15 @@ from model.pinn_model.contact_world_model import (
 from train.contact_world_model_loss import ContactWorldModelLoss
 
 
-def config(inputs=None):
-    return {
+def config(inputs=None, outputs=None):
+    result = {
         "dataloader": {"state_history_horizon": 5, "prediction_horizon": 4, "action_condition_horizon": 3, "high_fps": 100, "normalize_mode": None},
         "model": {"inputs": list(inputs or SUPPORTED_STATE_STREAMS), "joint_dim": 2, "action_dim": 2, "contact_state_count": 3, "hidden_dim": 8, "state_layers": 1, "action_layers": 1, "flow_layers": 1, "flow_attention_heads": 2, "flow_ffn_multiplier": 2, "flow_inference_steps": 2, "flow_solver": "heun", "flow_source_mode": "gaussian", "dropout": 0.0},
         "loss": {"dt": 0.01, "kinematic_consistency_weight": 0.01, "ddq_smoothness_weight": 0.01},
     }
+    if outputs is not None:
+        result["model"]["outputs"] = list(outputs)
+    return result
 
 
 def batch(cfg):
@@ -173,6 +176,95 @@ def test_selected_streams_define_continuous_output_contract():
     loss, metrics = ContactWorldModelLoss(cfg)(output, values)
     assert torch.isfinite(loss)
     assert "dq_loss" not in metrics
+
+
+def test_teacher_inputs_and_outputs_are_independent():
+    cfg = config(
+        inputs=["q", "dq", "delta_q", "tau"],
+        outputs=["q", "tau"],
+    )
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    values.pop("dq_future")
+    values.pop("delta_q_future")
+
+    output = model(values, flow_time=0.5)
+
+    assert tuple(model.state_encoders) == ("q", "dq", "delta_q", "tau")
+    assert model.outputs == ("q", "tau")
+    assert model.predicted_state_streams == ("q", "tau")
+    assert model.PREDICTED_STATE_STREAMS == ("q", "tau")
+    assert model.CONDITION_KEYS == (
+        "q", "dq", "delta_q", "tau", "action", "action_mask"
+    )
+    assert model.TARGET_KEYS == ("q_future", "tau_future", "contact_future")
+    assert model.flow_dim == 2 * model.joint_dim
+    assert output["flow_velocity_pred"].shape == (2, 4, 4)
+    assert "q_pred" in output and "tau_pred" in output
+    assert "dq_pred" not in output and "delta_q_pred" not in output
+    loss, metrics = ContactWorldModelLoss(cfg)(output, values)
+    assert torch.isfinite(loss)
+    assert "q_loss" in metrics and "tau_loss" in metrics
+    assert "dq_loss" not in metrics and "delta_q_loss" not in metrics
+
+    contract = model.checkpoint_contract()
+    assert contract["input_state_streams"] == ["q", "dq", "delta_q", "tau"]
+    assert contract["predicted_continuous_streams"] == ["q", "tau"]
+
+
+def test_teacher_can_predict_a_stream_not_used_as_history():
+    cfg = config(inputs=["q", "dq"], outputs=["q", "tau"])
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    output = model(values, flow_time=0.5)
+
+    assert tuple(model.state_encoders) == ("q", "dq")
+    assert model.predicted_state_streams == ("q", "tau")
+    assert "tau" not in values
+    assert output["tau_pred"].shape == (2, 4, 2)
+    loss, _ = ContactWorldModelLoss(cfg)(output, values)
+    assert torch.isfinite(loss)
+
+
+@pytest.mark.parametrize(
+    "outputs,match",
+    [
+        ([], "at least one"),
+        (["q", "q"], "duplicates"),
+        (["q", "temperature"], "unsupported"),
+    ],
+)
+def test_invalid_teacher_outputs_are_rejected(outputs, match):
+    cfg = config(outputs=outputs)
+    with pytest.raises(ValueError, match=match):
+        ContactWorldModel(cfg)
+    with pytest.raises(ValueError, match=match):
+        ContactWorldModelLoss(cfg)
+
+
+def test_null_outputs_fall_back_to_inputs():
+    cfg = config(inputs=["q", "tau"])
+    cfg["model"]["outputs"] = None
+    model = ContactWorldModel(cfg)
+    calculator = ContactWorldModelLoss(cfg)
+
+    assert model.outputs == ("q", "tau")
+    assert calculator.predicted_state_streams == ("q", "tau")
+
+
+def test_disabled_cross_stream_regularizers_allow_reduced_outputs():
+    cfg = config(inputs=["q", "dq", "delta_q", "tau"], outputs=["tau"])
+    cfg["loss"]["kinematic_consistency_weight"] = 0.0
+    cfg["loss"]["ddq_smoothness_weight"] = 0.0
+    values = batch(cfg)
+    values.pop("q_future")
+    values.pop("dq_future")
+    values.pop("delta_q_future")
+    model = ContactWorldModel(cfg)
+
+    loss, _ = ContactWorldModelLoss(cfg)(model(values, flow_time=0.5), values)
+
+    assert torch.isfinite(loss)
 
 
 def test_contract_allows_ablation_without_q():

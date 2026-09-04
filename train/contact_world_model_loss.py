@@ -29,7 +29,19 @@ class ContactWorldModelLoss:
         configured_inputs = model_config.get("inputs", PREDICTED_STATE_STREAMS)
         if isinstance(configured_inputs, str):
             configured_inputs = [configured_inputs]
-        self.predicted_state_streams = tuple(str(value).lower() for value in configured_inputs)
+        configured_outputs = model_config.get("outputs")
+        if configured_outputs is None:
+            configured_outputs = configured_inputs
+        if isinstance(configured_outputs, str):
+            configured_outputs = [configured_outputs]
+        self.predicted_state_streams = tuple(str(value).lower() for value in configured_outputs)
+        if not self.predicted_state_streams:
+            raise ValueError("model.outputs must contain at least one state stream")
+        unknown = sorted(set(self.predicted_state_streams) - set(PREDICTED_STATE_STREAMS))
+        if unknown:
+            raise ValueError(f"model.outputs contains unsupported values {unknown}")
+        if len(set(self.predicted_state_streams)) != len(self.predicted_state_streams):
+            raise ValueError("model.outputs must not contain duplicates")
         self.contact_state_count = int(model_config.get("contact_state_count", 3))
         if self.contact_state_count < 2:
             raise ValueError("model.contact_state_count must be at least 2")
@@ -301,7 +313,11 @@ class ContactWorldModelLoss:
         return frame_loss.mean(dim=1)
 
     def _kinematic_consistency(self, out, batch):
-        if self.kinematic_consistency_weight <= 0.0 or not {"q", "dq"}.issubset(self.predicted_state_streams) or "dq" not in batch:
+        if (
+            self.kinematic_consistency_weight <= 0.0
+            or not {"q", "dq"}.issubset(self.predicted_state_streams)
+            or not {"q", "dq"}.issubset(batch)
+        ):
             reference = out[f"{self.predicted_state_streams[0]}_pred"]
             return reference.new_zeros(reference.shape[0])
         q_future = self._physical("q", self._required(out, "q_pred"))
@@ -377,6 +393,10 @@ class ContactWorldModelLoss:
         reference = out[f"{self.predicted_state_streams[0]}_pred"]
         if self.delta_q_consistency_weight <= 0.0:
             return reference.new_zeros(reference.shape[0])
+        if not {"q", "delta_q"}.issubset(self.predicted_state_streams):
+            raise ValueError(
+                "delta_q_consistency_weight requires q and delta_q outputs"
+            )
         if "q_cmd_future" not in batch:
             raise ValueError(
                 "delta_q_consistency_weight requires an explicitly aligned "

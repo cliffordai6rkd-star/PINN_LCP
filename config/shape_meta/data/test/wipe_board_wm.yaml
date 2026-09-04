@@ -11,14 +11,14 @@ task: wipe_board_world_model
 # LeRobot needs a nominal fps, but this converter does not create a 100 Hz
 # grid. It writes every action-labeled original teleop row exactly once and
 # preserves its physical timestamp in timing.state_timestamp_ns. Boundary rows
-# without a valid camera-anchor next action are discarded.
+# without a valid camera-anchor previous action are discarded.
 fps: 100
 
 timeline:
   mode: raw_lowdim_action_hold
   state_timestamp_path: teleop/timestamp_us
-  # Match wipe_board_dp.yaml: use every recorded wrist timestamp directly;
-  # each anchor selects the first teleop action at or after it.
+  # Use every recorded wrist timestamp directly; each anchor selects the
+  # latest causal teleop action label at or before it.
   action_fps: 25
   action_anchor_timestamp_path: cameras/wrist/timestamp_us
   max_action_gap_s: 0.020
@@ -63,12 +63,12 @@ features:
     h5_path: teleop/tau_ext_cal
     align: index
 
-  # Sample exactly once on the same camera anchors used by wipe_board_dp.yaml,
-  # then hold the direct q_cmd action over the raw teleop rows.
+  # Sample exactly once on the camera anchors, then ZOH-hold the direct q_cmd
+  # action over the raw teleop rows.
   action.joint:
     rate: action
     dtype: float32
     shape: [7]
     h5_path: teleop/q_cmd
     timestamp_path: teleop/timestamp_us
-    resample: next
+    resample: previous

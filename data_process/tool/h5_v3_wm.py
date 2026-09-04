@@ -2,13 +2,16 @@
 
 State features are copied by raw index from ``teleop/timestamp_us``; this
 converter never creates a new high-rate grid. Actions intentionally match the
-DP conversion contract:
+high-level expert conversion contract:
 
-1. every recorded wrist-camera timestamp is an action anchor (no new grid);
-2. every anchor selects the first teleop action row at or after it (``next``);
-3. that sampled action is held on raw lowdim rows until the next camera anchor.
+1. every timestamp on the configured nominally 25 Hz camera timeline is an
+   action anchor (no synthetic grid);
+2. every anchor selects the latest teleop action label at or before it
+   (``previous``), exactly as ``VA_h5_v3.py`` does;
+3. that expert action label is held on 100 Hz state rows until the next camera
+   anchor (ZOH).
 
-Raw state rows without a valid camera-anchor ``next`` action are omitted.
+Raw state rows without a valid camera-anchor ``previous`` action are omitted.
 Retained rows keep their original indices and timestamps.
 """
 
@@ -41,6 +44,7 @@ from data_process.tool.h5_2_lerobotev3 import (
 
 WM_TIMELINE_MODE = "raw_lowdim_action_hold"
 WM_MANIFEST_NAME = "world_model_timeline.json"
+ACTION_PERIOD_RELATIVE_TOLERANCE = 0.10
 GENERATED_TIMING_FEATURES = {
     "timing.state_timestamp_ns": {"dtype": "int64", "shape": (1,)},
     "timing.action_anchor_timestamp_ns": {"dtype": "int64", "shape": (1,)},
@@ -54,8 +58,8 @@ GENERATED_TIMING_FEATURES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Copy raw lowdim H5 rows to LeRobot v3 and hold DP-compatible "
-            "camera-rate actions on those rows."
+            "Copy raw lowdim H5 rows to LeRobot v3 and ZOH-hold causal "
+            "camera-rate expert actions on those rows."
         )
     )
     parser.add_argument("--config", "-c", type=Path, required=True)
@@ -179,9 +183,9 @@ def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
         sources = normalize_h5_sources(
             key, raw_spec, dual_rate=(rate == "action")
         )
-        required_method = "index" if rate == "state" else "next"
+        required_method = "index" if rate == "state" else "previous"
         if any(source["method"] != required_method for source in sources):
-            contract = "align='index'" if rate == "state" else "resample='next'"
+            contract = "align='index'" if rate == "state" else "resample='previous'"
             raise ValueError(f"Feature {key!r} must use {contract}.")
         if rate == "state":
             wrong_timestamps = {
@@ -252,13 +256,34 @@ def _raw_timestamps_to_ns(h5_dataset: H5Dataset, values, timestamp_path: str):
     return np.rint(raw.astype(np.float64) * scale_to_ns).astype(np.int64)
 
 
-def _dp_action_anchors(h5_dataset: H5Dataset, raw_camera_timestamps, path: str, fps: int):
-    """Return the exact recorded wrist timestamps used by camera_rows DP."""
+def _expert_action_anchors(
+    h5_dataset: H5Dataset, raw_camera_timestamps, path: str, fps: int
+):
+    """Return exact timestamps from the configured expert camera timeline.
 
-    del fps
-    values = h5_dataset.np.asarray(raw_camera_timestamps).reshape(-1)
-    # Validate through the common parser, but never modify the timestamps.
-    h5_dataset._timestamps_seconds(values, path)
+    ``fps`` is the nominal action cadence stored in the dataset contract.  The
+    recorded camera timestamps remain authoritative so WM labels are identical
+    to the high-level expert dataset even when acquisition has small jitter.
+    """
+
+    if int(fps) <= 0:
+        raise ValueError("timeline.action_fps must be positive")
+    np = h5_dataset.np
+    values = np.asarray(raw_camera_timestamps).reshape(-1)
+    # Validate through the common parser, but never regularize or interpolate
+    # the camera timeline.
+    seconds = h5_dataset._timestamps_seconds(values, path)
+    if seconds.size > 1:
+        expected_period_s = 1.0 / float(fps)
+        median_period_s = float(np.median(np.diff(seconds)))
+        relative_error = abs(median_period_s - expected_period_s) / expected_period_s
+        if relative_error > ACTION_PERIOD_RELATIVE_TOLERANCE:
+            observed_fps = 1.0 / median_period_s
+            raise ValueError(
+                f"Configured action camera timeline {path!r} runs at approximately "
+                f"{observed_fps:.3f} Hz, not action_fps={fps}. Select the camera "
+                "timeline used by the high-level expert dataset."
+            )
     return values.copy()
 
 
@@ -289,7 +314,7 @@ def build_wm_episode_cache(
     raw_state_seconds = h5_dataset._timestamps_seconds(
         raw_state_timestamps, state_timestamp_path
     )
-    all_action_anchor_raw = _dp_action_anchors(
+    all_action_anchor_raw = _expert_action_anchors(
         h5_dataset,
         raw_camera_timestamps,
         camera_timestamp_path,
@@ -302,22 +327,24 @@ def build_wm_episode_cache(
     action_source_seconds = h5_dataset._timestamps_seconds(
         datasets[action_source_path][:], action_source_path
     )
-    next_indices = np.searchsorted(
-        action_source_seconds, all_action_anchor_seconds, side="left"
-    )
-    anchor_valid = next_indices < len(action_source_seconds)
-    safe_next = next_indices.clip(0, len(action_source_seconds) - 1)
+    previous_indices = np.searchsorted(
+        action_source_seconds, all_action_anchor_seconds, side="right"
+    ) - 1
+    anchor_valid = previous_indices >= 0
+    safe_previous = previous_indices.clip(0, len(action_source_seconds) - 1)
     anchor_valid &= (
-        action_source_seconds[safe_next] - all_action_anchor_seconds
+        all_action_anchor_seconds - action_source_seconds[safe_previous]
         <= float(timeline["max_action_gap_s"]) + 1.0e-12
     )
     action_anchor_raw = all_action_anchor_raw[anchor_valid]
     action_anchor_seconds = all_action_anchor_seconds[anchor_valid]
     if action_anchor_seconds.size == 0:
-        raise ValueError(f"No camera anchor has a valid next action in {h5_path}.")
+        raise ValueError(
+            f"No camera anchor has a valid previous expert action in {h5_path}."
+        )
 
     # A raw lowdim row belongs to the latest recorded camera anchor at/before
-    # it. If that camera anchor has no legal next action, the row has no label
+    # it. If that camera anchor has no legal previous action, the row has no label
     # and is excluded rather than padded or marked for downstream filtering.
     raw_camera_index = np.searchsorted(
         all_action_anchor_seconds, raw_state_seconds, side="right"
@@ -391,7 +418,7 @@ def build_wm_episode_cache(
             h5_dataset._validate_resample_targets(
                 timestamp_seconds[source["timestamp_path"]],
                 action_anchor_seconds,
-                "next",
+                "previous",
                 float(max_gap_s),
                 mapping["lerobot_key"],
                 h5_path,
@@ -421,7 +448,7 @@ def build_wm_episode_cache(
 
     source_path = spec["action_source_timestamp_path"]
     selected_source_indices = h5_dataset._point_sample_indices(
-        timestamp_seconds[source_path], action_anchor_seconds, "next"
+        timestamp_seconds[source_path], action_anchor_seconds, "previous"
     )
     source_ns = _raw_timestamps_to_ns(
         h5_dataset, datasets[source_path][:], source_path
@@ -463,7 +490,7 @@ def write_wm_manifest(output_path: Path, spec: Mapping[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     timeline = spec["timeline"]
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": WM_TIMELINE_MODE,
         "row_sampling": "action_labeled_raw_state_index",
         "nominal_lerobot_fps": spec["fps"],
@@ -472,9 +499,11 @@ def write_wm_manifest(output_path: Path, spec: Mapping[str, Any]) -> Path:
             "action_anchor_timestamp_path"
         ],
         "action_fps": timeline["action_fps"],
-        "action_anchor_grid": "recorded_camera_rows",
-        "action_sampling": "next",
-        "action_upsampling": "previous_anchor_hold",
+        "action_fps_validation": "median_camera_period_within_10_percent",
+        "action_anchor_grid": "configured_recorded_camera_rows",
+        "action_sampling": "previous_expert_label",
+        "action_upsampling": "zoh_previous_camera_anchor",
+        "action_contract": "high_level_expert_camera_snapshot_v1",
         "unlabeled_state_rows": "drop",
         "action_update_key": "timing.action_update",
         "feature_filters": {

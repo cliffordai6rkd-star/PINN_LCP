@@ -64,6 +64,33 @@ modes, distribution metrics, and contact calibration metrics. Aggregate
 Energy Score/minADE/minFDE are computed in normalized space; plots are
 denormalized. Contact-onset error is evaluation-only.
 
+## Feedback-reconditioned validation
+
+Validation records three distinct behaviors. `rollout_*` scores one open-loop
+future from the initial recorded history. `free_running_*` recursively inserts
+the model's predicted state into later histories. `feedback_u{interval}_*`
+instead scores at most `interval` 100 Hz state steps, inserts the corresponding
+recorded `q`, `dq`, `delta_q`, and `tau` measurements, re-anchors the future
+action chunk, and predicts again.
+
+The configured `train.rollout_validation.measurement_update_intervals` default
+is `[1, 4, 8, 32]`. Each update consumes the matching `action_rollout` and
+`action_rollout_mask` entry. Fixed source noise and validation EMA weights make
+the metrics comparable across checkpoints. With multiple samples, every
+`feedback_u*` family includes Energy Score, minADE, minFDE, sample spread, 90%
+coverage, contact calibration/classification metrics, and metrics grouped by
+the existing free/transition/contact phase labels. A scored segment is assigned
+to the maximum existing phase label present in that segment; no time-to-contact
+target or bin is derived.
+
+This is an **offline measurement-updated evaluation** using ground-truth
+measurements from the validation dataset. It must not be reported as real
+closed-loop robot task performance. This path is maintained for Teacher
+validation only and is explicitly disabled for the OPD Student. It does not
+change the training loss;
+`rollout_validation.replace_val_loss` must be explicitly enabled to use the
+configured `replace_val_loss_metric` as the validation monitor.
+
 ## Benchmark and tests
 
 ```bash

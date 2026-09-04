@@ -210,6 +210,8 @@ train:
   # Student. Ordinary supervised validation remains available in the log.
   rollout_validation:
     enabled: true
+    # Teacher-only feedback-reconditioned validation is not maintained for OPD.
+    feedback_reconditioned: false
     replace_val_loss: false
     steps: 2
     solver: heun

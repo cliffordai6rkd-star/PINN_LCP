@@ -242,14 +242,27 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             )
         if self.rollout_contact_enabled:
             required_streams = {"q", "dq", "delta_q", "tau"}
-            configured_streams = {
+            configured_inputs = {
                 str(value).lower()
                 for value in (self.config.get("model") or {}).get("inputs", ())
             }
-            if not required_streams.issubset(configured_streams):
+            configured_outputs = (self.config.get("model") or {}).get("outputs")
+            if configured_outputs is None:
+                configured_outputs = configured_inputs
+            if isinstance(configured_outputs, str):
+                configured_outputs = [configured_outputs]
+            configured_outputs = {
+                str(value).lower() for value in configured_outputs
+            }
+            if not required_streams.issubset(configured_inputs):
                 raise ValueError(
                     "rollout contact supervision requires model.inputs to contain "
                     "q, dq, delta_q, and tau"
+                )
+            if not {"q", "tau"}.issubset(configured_outputs):
+                raise ValueError(
+                    "rollout contact supervision requires model.outputs to contain "
+                    "q and tau"
                 )
             configured_contact_states = int(
                 (self.config.get("model") or {}).get("contact_state_count", 3)
@@ -412,8 +425,21 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         teacher_model = teacher_config.get("model") or {}
         student_data = self.config.get("dataloader") or {}
         teacher_data = teacher_config.get("dataloader") or {}
+
+        def _stream_tuple(value, fallback=()):
+            if value is None:
+                value = fallback
+            if isinstance(value, str):
+                value = [value]
+            return tuple(str(item).lower() for item in value)
+
+        teacher_inputs = _stream_tuple(teacher_model.get("inputs"))
+        student_inputs = _stream_tuple(student_model.get("inputs"))
+        teacher_outputs = _stream_tuple(teacher_model.get("outputs"), teacher_inputs)
+        student_outputs = _stream_tuple(student_model.get("outputs"), student_inputs)
         fields = {
-            "model.inputs": (tuple(teacher_model.get("inputs", ())), tuple(student_model.get("inputs", ()))),
+            "model.inputs": (teacher_inputs, student_inputs),
+            "model.outputs": (teacher_outputs, student_outputs),
             "model.joint_dim": (teacher_model.get("joint_dim"), student_model.get("joint_dim")),
             "model.action_dim": (teacher_model.get("action_dim"), student_model.get("action_dim")),
             "model.contact_state_count": (teacher_model.get("contact_state_count"), student_model.get("contact_state_count")),
@@ -459,7 +485,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         """Return state streams that can be committed to model history."""
         if model is None:
             return list(PREDICTED_STATE_STREAMS)
-        return list(model.predicted_state_streams)
+        return [key for key in model.predicted_state_streams if key in model.inputs]
 
     def _distillation_terms(self):
         """Return continuous state endpoint terms for OPD.
@@ -765,6 +791,23 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
                     + float(history_beta) * committed
                 )
             next_batch[key] = torch.cat((history[:, 1:], committed), dim=1)
+        # Inputs that are not part of the continuous output contract cannot be
+        # fed back from a prediction.  When recorded future values are
+        # available, advance those histories with the measured stream so an
+        # asymmetric teacher/student contract remains well-defined.
+        if self.model is not None and recorded_batch is not None:
+            predicted = set(self.model.predicted_state_streams)
+            for key in self.model.inputs:
+                if key in predicted or key not in batch:
+                    continue
+                recorded = recorded_batch.get(f"{key}_future")
+                if recorded is None:
+                    continue
+                depth = int(rollout_step)
+                value = recorded[:, depth : depth + 1]
+                if value.shape[1] != 1:
+                    raise ValueError("recorded future does not cover rollout depth")
+                next_batch[key] = torch.cat((batch[key][:, 1:], value), dim=1)
         contact_prediction = student_out.get("contact_state_pred")
         if contact_prediction is None and "contact_logits" in student_out:
             contact_prediction = student_out["contact_logits"].argmax(

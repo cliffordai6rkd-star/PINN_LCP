@@ -63,7 +63,7 @@ class ContactWorldModelTrainer(BaseTrainer):
         self.rollout_replace_val_loss = bool(
             rollout_config.get("replace_val_loss", False)
         )
-        self.rollout_steps = int(
+        self.rollout_validation_steps = int(
             rollout_config.get(
                 "steps", (self.config.get("model") or {}).get(
                     "flow_inference_steps", 8
@@ -79,6 +79,48 @@ class ContactWorldModelTrainer(BaseTrainer):
         ).lower()
         self.rollout_source_seed = int(rollout_config.get("source_seed", 1234))
         self.rollout_max_batches = int(rollout_config.get("max_batches", 0))
+        self.feedback_reconditioned_enabled = bool(
+            rollout_config.get("feedback_reconditioned", True)
+        )
+        configured_update_intervals = rollout_config.get(
+            "measurement_update_intervals", [1, 4, 8, 32]
+        )
+        if not isinstance(configured_update_intervals, (list, tuple)):
+            raise ValueError(
+                "train.rollout_validation.measurement_update_intervals must be "
+                "a sequence"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in configured_update_intervals
+        ):
+            raise ValueError(
+                "train.rollout_validation.measurement_update_intervals must "
+                "contain positive integers"
+            )
+        self.feedback_measurement_update_intervals = (
+            tuple(sorted({int(value) for value in configured_update_intervals}))
+            if self.feedback_reconditioned_enabled
+            else ()
+        )
+        self.feedback_num_samples = int(rollout_config.get("num_samples", 8))
+        self.feedback_max_batches = int(
+            rollout_config.get("feedback_max_batches", self.rollout_max_batches)
+        )
+        default_feedback_metric = (
+            f"feedback_u{max(self.feedback_measurement_update_intervals)}_energy_score"
+            if self.feedback_measurement_update_intervals
+            else "rollout_mse_h32"
+        )
+        self.rollout_replace_val_loss_metric = str(
+            rollout_config.get("replace_val_loss_metric", default_feedback_metric)
+        ).strip()
+        if not self.rollout_replace_val_loss_metric:
+            raise ValueError(
+                "train.rollout_validation.replace_val_loss_metric must not be empty"
+            )
         self.free_running_steps = int(
             rollout_config.get("free_running_steps", 8)
         )
@@ -105,15 +147,23 @@ class ContactWorldModelTrainer(BaseTrainer):
                     "train.rollout_validation.divergence_abs_threshold must be "
                     "positive or null"
                 )
-        if self.rollout_steps <= 0:
+        if self.rollout_validation_steps <= 0:
             raise ValueError("train.rollout_validation.steps must be positive")
         if self.rollout_solver not in {"euler", "heun"}:
             raise ValueError(
                 "train.rollout_validation.solver must be 'euler' or 'heun'"
             )
-        if self.rollout_max_batches < 0 or self.free_running_max_batches < 0:
+        if (
+            self.rollout_max_batches < 0
+            or self.free_running_max_batches < 0
+            or self.feedback_max_batches < 0
+        ):
             raise ValueError(
                 "train.rollout_validation max_batches values must be non-negative"
+            )
+        if self.feedback_num_samples < 1:
+            raise ValueError(
+                "train.rollout_validation.num_samples must be positive"
             )
         if self.free_running_steps < 0:
             raise ValueError(
@@ -123,6 +173,30 @@ class ContactWorldModelTrainer(BaseTrainer):
             raise ValueError(
                 "train.rollout_validation.horizons must contain a positive value"
             )
+        if (
+            self.rollout_validation_enabled
+            and self.feedback_measurement_update_intervals
+        ):
+            future_horizon = int(
+                (self.config.get("dataloader") or {}).get(
+                    "prediction_horizon", 32
+                )
+            )
+            required_action_rollout = max(
+                ((future_horizon - 1) // interval) * interval + 1
+                for interval in self.feedback_measurement_update_intervals
+            )
+            configured_action_rollout = int(
+                (self.config.get("dataloader") or {}).get(
+                    "action_rollout_horizon", 0
+                )
+            )
+            if configured_action_rollout < required_action_rollout:
+                raise ValueError(
+                    "dataloader.action_rollout_horizon must be at least "
+                    f"{required_action_rollout} for feedback-reconditioned "
+                    "validation"
+                )
         probability_config = self.train_config.get("probabilistic_validation") or {}
         self.probabilistic_validation_enabled = bool(
             probability_config.get("enabled", True)
@@ -202,7 +276,7 @@ class ContactWorldModelTrainer(BaseTrainer):
             if not {"q", "tau"}.issubset(configured_streams):
                 raise ValueError(
                     "six-panel checkpoint visualization requires q and tau in "
-                    "model.inputs; disable it for other valid M stream selections"
+                    "model.outputs; disable it for other valid output selections"
                 )
             for key, limits in self.checkpoint_visualization_plot_ranges.items():
                 if len(limits) != 2 or not limits[0] < limits[1]:
@@ -531,7 +605,7 @@ class ContactWorldModelTrainer(BaseTrainer):
                 }
                 if "q" not in physical_samples or "tau" not in physical_samples:
                     raise ValueError(
-                        "checkpoint visualization panels require q and tau in model.inputs"
+                        "checkpoint visualization panels require q and tau in model.outputs"
                     )
                 scale_values["q"].extend((physical_samples["q"], physical_targets["q"]))
                 scale_values["tau"].extend((physical_samples["tau"], physical_targets["tau"]))
@@ -636,11 +710,12 @@ class ContactWorldModelTrainer(BaseTrainer):
                 metrics[name + "_nonfinite"] = nonfinite
         return metrics
 
-    def _fixed_source_noise(self, batch, batch_index, *, step=0):
+    def _fixed_source_noise(
+        self, batch, batch_index, *, step=0, num_samples=None
+    ):
         """Generate reproducible Gaussian sources for comparable checkpoints."""
         reference = batch[self.model.inputs[0]]
-        shape = (
-            reference.shape[0],
+        shape = (reference.shape[0],) + (
             self.model.future_horizon,
             self.model.flow_dim,
         )
@@ -648,7 +723,18 @@ class ContactWorldModelTrainer(BaseTrainer):
         generator.manual_seed(
             self.rollout_source_seed + int(batch_index) * 1009 + int(step) * 9176
         )
-        source = torch.randn(shape, generator=generator, dtype=torch.float32)
+        if num_samples is None:
+            source = torch.randn(
+                shape, generator=generator, dtype=torch.float32
+            )
+        else:
+            # Sample-major generation makes draw zero bitwise identical to the
+            # deterministic open-loop source for every batch element.
+            source = torch.randn(
+                (int(num_samples),) + shape,
+                generator=generator,
+                dtype=torch.float32,
+            ).permute(1, 0, 2, 3).contiguous()
         return source.to(device=reference.device, dtype=reference.dtype)
 
     def _denormalize(self, key, value):
@@ -805,6 +891,255 @@ class ContactWorldModelTrainer(BaseTrainer):
             result[f"{prefix}_f1_phase{phase}"] = float(value)
         return result
 
+    @staticmethod
+    def _feedback_phase_names(class_count):
+        if int(class_count) == 3:
+            return ("free", "transition", "contact")
+        return tuple(f"phase_{index}" for index in range(int(class_count)))
+
+    def _feedback_condition_batch(self, batch, history, anchor):
+        """Build only the causal conditions available at one feedback anchor."""
+
+        action_rollout = batch.get("action_rollout")
+        action_rollout_mask = batch.get("action_rollout_mask")
+        if action_rollout is None or action_rollout_mask is None:
+            raise KeyError(
+                "feedback-reconditioned validation requires action_rollout and "
+                "action_rollout_mask"
+            )
+        if action_rollout.ndim != 4:
+            raise ValueError(
+                "action_rollout must have shape [B, R, A, Da] for "
+                "feedback-reconditioned validation"
+            )
+        if action_rollout_mask.ndim != 3:
+            raise ValueError(
+                "action_rollout_mask must have shape [B, R, A] for "
+                "feedback-reconditioned validation"
+            )
+        if tuple(action_rollout_mask.shape) != tuple(action_rollout.shape[:-1]):
+            raise ValueError(
+                "action_rollout_mask shape must match action_rollout [B, R, A]"
+            )
+        if int(anchor) >= action_rollout.shape[1]:
+            raise ValueError(
+                "action_rollout does not cover feedback anchor "
+                f"{int(anchor)}"
+            )
+        condition = {key: history[key] for key in self.model.inputs}
+        condition["action"] = action_rollout[:, int(anchor)]
+        condition["action_mask"] = action_rollout_mask[:, int(anchor)]
+        return condition
+
+    def _append_feedback_measurements(self, history, batch, start, stop):
+        """Advance history exclusively with recorded measurements in [start, stop)."""
+
+        updated = {}
+        for key in self.model.inputs:
+            future_key = f"{key}_future"
+            recorded = batch.get(future_key)
+            if recorded is None:
+                raise KeyError(
+                    "feedback-reconditioned validation requires recorded future "
+                    f"measurements in {future_key!r}"
+                )
+            if int(stop) > recorded.shape[1]:
+                raise ValueError(
+                    f"{future_key} does not cover feedback update ending at {stop}"
+                )
+            history_length = history[key].shape[1]
+            measured = recorded[:, int(start) : int(stop)]
+            updated[key] = torch.cat((history[key], measured), dim=1)[
+                :, -history_length:
+            ]
+        return updated
+
+    @torch.no_grad()
+    def _feedback_reconditioned_samples(self, batch, batch_index, interval):
+        """Sample one measurement-updated offline trajectory.
+
+        The model sees only state history through the current anchor. Predictions
+        are retained for scoring but are never inserted into a later history.
+        """
+
+        interval = int(interval)
+        if interval <= 0:
+            raise ValueError("feedback measurement interval must be positive")
+        horizon = int(self.model.future_horizon)
+        history = {key: batch[key].clone() for key in self.model.inputs}
+        sample_chunks = {
+            key: [] for key in self.model.predicted_state_streams
+        }
+        target_chunks = {
+            key: [] for key in self.model.predicted_state_streams
+        }
+        contact_probability_chunks = []
+        contact_target = batch.get("contact_future")
+        if contact_target is None or contact_target.shape[1] < horizon:
+            raise ValueError(
+                "contact_future must cover the complete feedback validation horizon"
+            )
+        segments = []
+        anchors = []
+        for anchor in range(0, horizon, interval):
+            stop = min(anchor + interval, horizon)
+            condition = self._feedback_condition_batch(batch, history, anchor)
+            source_noise = self._fixed_source_noise(
+                condition,
+                batch_index,
+                step=anchor,
+                num_samples=self.feedback_num_samples,
+            )
+            with self.autocast_context():
+                sampled = self.model.sample(
+                    condition,
+                    num_samples=self.feedback_num_samples,
+                    steps=self.rollout_validation_steps,
+                    solver=self.rollout_solver,
+                    source_noise=source_noise,
+                )
+            segment_samples = {}
+            segment_targets = {}
+            for key in self.model.predicted_state_streams:
+                future_key = f"{key}_future"
+                target = batch.get(future_key)
+                if target is None or target.shape[1] < horizon:
+                    raise ValueError(
+                        f"{future_key} must cover the complete feedback "
+                        "validation horizon"
+                    )
+                segment_samples[key] = sampled[f"{key}_pred"][
+                    :, :, : stop - anchor
+                ].float()
+                segment_targets[key] = target[:, anchor:stop].float()
+                sample_chunks[key].append(segment_samples[key])
+                target_chunks[key].append(segment_targets[key])
+
+            segment_contact_probability = sampled.get("contact_probability")
+            if segment_contact_probability is not None:
+                segment_contact_probability = segment_contact_probability[
+                    :, :, : stop - anchor
+                ].float()
+                contact_probability_chunks.append(segment_contact_probability)
+            segment_contact_target = contact_target[:, anchor:stop]
+            segment_metrics = distribution_metrics(
+                segment_samples,
+                segment_targets,
+                segment_contact_probability,
+                segment_contact_target,
+            )
+            segment_phase = (
+                segment_contact_target.reshape(
+                    segment_contact_target.shape[0], -1
+                )
+                .round()
+                .long()
+                .max(dim=1)
+                .values
+            )
+            segments.append(
+                {
+                    "anchor": anchor,
+                    "stop": stop,
+                    "phase": segment_phase,
+                    "metrics": segment_metrics,
+                }
+            )
+            anchors.append(anchor)
+            history = self._append_feedback_measurements(
+                history, batch, anchor, stop
+            )
+
+        samples = {
+            key: torch.cat(chunks, dim=2)
+            for key, chunks in sample_chunks.items()
+        }
+        targets = {
+            key: torch.cat(chunks, dim=1)
+            for key, chunks in target_chunks.items()
+        }
+        contact_probability = (
+            torch.cat(contact_probability_chunks, dim=2)
+            if contact_probability_chunks
+            else None
+        )
+        return {
+            "anchors": tuple(anchors),
+            "samples": samples,
+            "targets": targets,
+            "contact_probability": contact_probability,
+            "contact_target": contact_target[:, :horizon],
+            "segments": segments,
+        }
+
+    def _accumulate_feedback_interval(
+        self, accumulator, batch, batch_index, interval
+    ):
+        prefix = f"feedback_u{int(interval)}"
+        result = self._feedback_reconditioned_samples(
+            batch, batch_index, interval
+        )
+        values = distribution_metrics(
+            result["samples"],
+            result["targets"],
+            result["contact_probability"],
+            result["contact_target"],
+        )
+        for name, value in values.items():
+            self._metric_add(
+                accumulator,
+                f"{prefix}_{name}",
+                value,
+                value.numel(),
+            )
+
+        phase_names = self._feedback_phase_names(
+            self.loss_calculator.contact_state_count
+        )
+        for segment in result["segments"]:
+            phase = segment["phase"]
+            for phase_index, phase_name in enumerate(phase_names):
+                mask = phase == phase_index
+                if not mask.any():
+                    continue
+                for name, value in segment["metrics"].items():
+                    self._metric_add(
+                        accumulator,
+                        f"{prefix}_phase_{phase_name}_{name}",
+                        value[mask],
+                        int(mask.sum().item()),
+                    )
+
+        sample_values = list(result["samples"].values())
+        finite = all(
+            bool(torch.isfinite(value).all().item()) for value in sample_values
+        )
+        max_abs = max(
+            float(
+                value.detach()
+                .abs()
+                .nan_to_num(posinf=float("inf"))
+                .max()
+                .item()
+            )
+            for value in sample_values
+        )
+        accumulator[f"{prefix}_batches"] += 1
+        accumulator[f"{prefix}_evaluated_samples"] += batch[
+            self.model.inputs[0]
+        ].shape[0]
+        accumulator[f"{prefix}_segments"] += len(result["segments"])
+        accumulator[f"{prefix}_nonfinite_batches"] += int(not finite)
+        accumulator[f"{prefix}_max_abs"] = max(
+            accumulator[f"{prefix}_max_abs"], max_abs
+        )
+        if (
+            self.rollout_divergence_threshold is not None
+            and (not finite or max_abs > self.rollout_divergence_threshold)
+        ):
+            accumulator[f"{prefix}_diverged_batches"] += 1
+
+    @torch.no_grad()
     def _run_rollout_validation(self, epoch):
         if self.val_loader is None:
             return {}
@@ -823,7 +1158,7 @@ class ContactWorldModelTrainer(BaseTrainer):
                 with self.autocast_context():
                     integrated = self.model.predict(
                         batch,
-                        steps=self.rollout_steps,
+                        steps=self.rollout_validation_steps,
                         solver=self.rollout_solver,
                         source_noise=source_noise,
                     )
@@ -883,6 +1218,18 @@ class ContactWorldModelTrainer(BaseTrainer):
                 ):
                     accumulator["rollout_diverged_batches"] += 1
 
+                if (
+                    self.feedback_measurement_update_intervals
+                    and (
+                        not self.feedback_max_batches
+                        or batch_index < self.feedback_max_batches
+                    )
+                ):
+                    for interval in self.feedback_measurement_update_intervals:
+                        self._accumulate_feedback_interval(
+                            accumulator, batch, batch_index, interval
+                        )
+
                 if self.free_running_steps <= 0:
                     continue
                 if (
@@ -915,15 +1262,35 @@ class ContactWorldModelTrainer(BaseTrainer):
                     with self.autocast_context():
                         step_output = self.model.predict(
                             running_batch,
-                            steps=self.rollout_steps,
+                            steps=self.rollout_validation_steps,
                             solver=self.rollout_solver,
                             source_noise=step_noise,
                         )
                     for key in free_predictions:
                         first = step_output[f"{key}_pred"][:, :1]
                         free_predictions[key].append(first)
+                        # Only predicted streams that are also conditions can
+                        # be fed back into the next free-running window.
+                        if key in history:
+                            history[key] = torch.cat(
+                                (history[key][:, 1:], first), dim=1
+                            )
+                    # An input stream omitted from model.outputs is advanced
+                    # with its recorded future observation.  This keeps the
+                    # teacher validation well-defined without inventing a
+                    # prediction for that conditioning modality.
+                    for key in self.model.inputs:
+                        if key in self.model.predicted_state_streams:
+                            continue
+                        recorded = batch.get(f"{key}_future")
+                        if recorded is None or step >= recorded.shape[1]:
+                            raise ValueError(
+                                "free-running validation requires recorded future "
+                                f"values for unpredicted input stream {key!r}"
+                            )
                         history[key] = torch.cat(
-                            (history[key][:, 1:], first), dim=1
+                            (history[key][:, 1:], recorded[:, step : step + 1]),
+                            dim=1,
                         )
                     if step_output.get("contact_state_pred") is not None:
                         free_contacts.append(
@@ -1035,6 +1402,34 @@ class ContactWorldModelTrainer(BaseTrainer):
         metrics["free_running_diverged"] = float(
             metrics.get("free_running_diverged_batches", 0.0) > 0.0
         )
+        for interval in self.feedback_measurement_update_intervals:
+            prefix = f"feedback_u{interval}"
+            metrics[f"{prefix}_batches"] = int(
+                accumulator.get(f"{prefix}_batches", 0)
+            )
+            metrics[f"{prefix}_evaluated_samples"] = int(
+                accumulator.get(f"{prefix}_evaluated_samples", 0)
+            )
+            metrics[f"{prefix}_segments"] = int(
+                accumulator.get(f"{prefix}_segments", 0)
+            )
+            metrics[f"{prefix}_num_samples"] = self.feedback_num_samples
+            metrics[f"{prefix}_nonfinite_batches"] = int(
+                accumulator.get(f"{prefix}_nonfinite_batches", 0)
+            )
+            metrics[f"{prefix}_diverged_batches"] = int(
+                accumulator.get(f"{prefix}_diverged_batches", 0)
+            )
+            metrics[f"{prefix}_max_abs"] = float(
+                accumulator.get(f"{prefix}_max_abs", 0.0)
+            )
+            metrics[f"{prefix}_finite"] = float(
+                metrics[f"{prefix}_nonfinite_batches"] == 0
+            )
+            metrics[f"{prefix}_diverged"] = float(
+                metrics[f"{prefix}_diverged_batches"] > 0
+            )
+            metrics[f"{prefix}_epoch"] = int(epoch)
         metrics["rollout_epoch"] = int(epoch)
         if "rollout_mse_h32" in metrics:
             metrics["rollout_loss"] = metrics["rollout_mse_h32"]
@@ -1073,7 +1468,7 @@ class ContactWorldModelTrainer(BaseTrainer):
                     samples = self.model.sample(
                         batch,
                         num_samples=self.probabilistic_num_samples,
-                        steps=self.rollout_steps,
+                        steps=self.rollout_validation_steps,
                         solver=self.rollout_solver,
                         source_noise=source_noise,
                     )
@@ -1161,11 +1556,16 @@ class ContactWorldModelTrainer(BaseTrainer):
             rollout_metrics = self._run_rollout_validation(epoch)
             self.last_val_epoch_metrics.update(rollout_metrics)
             if self.rollout_replace_val_loss:
-                replacement = rollout_metrics.get("rollout_mse_h32")
+                replacement = rollout_metrics.get(
+                    self.rollout_replace_val_loss_metric
+                )
                 if replacement is None:
-                    replacement = rollout_metrics.get("rollout_mse_h1")
-                if replacement is not None:
-                    val_loss = float(replacement)
+                    raise ValueError(
+                        "rollout_validation.replace_val_loss_metric was not "
+                        "produced: "
+                        f"{self.rollout_replace_val_loss_metric!r}"
+                    )
+                val_loss = float(replacement)
         if (
             self.probabilistic_validation_enabled
             and self.val_loader is not None

@@ -96,11 +96,7 @@ class ContactWorldModel(nn.Module):
     SUPPORTED_STATE_STREAMS = SUPPORTED_STATE_STREAMS
     PREDICTED_STATE_STREAMS = PREDICTED_STATE_STREAMS
     CONDITION_KEYS = ("q", "dq", "delta_q", "tau", "action", "action_mask")
-    TARGET_KEYS = (
-        "q_future",
-        "dq_future",
-        "delta_q_future",
-        "tau_future",
+    TARGET_KEYS = tuple(f"{key}_future" for key in PREDICTED_STATE_STREAMS) + (
         "contact_future",
     )
     # The simplified token/memory architecture is not state-dict compatible
@@ -138,15 +134,30 @@ class ContactWorldModel(nn.Module):
             raise ValueError(f"model.inputs contains unsupported values {unknown}; choose from {list(SUPPORTED_STATE_STREAMS)}")
         if len(set(self.inputs)) != len(self.inputs):
             raise ValueError("model.inputs must not contain duplicates")
-        # The selected state streams are also the continuous prediction
-        # streams.  The module-level constant remains the complete dataset
-        # vocabulary for loaders and backwards-compatible callers.
-        self.predicted_state_streams = self.inputs
+        configured_outputs = model_config.get("outputs")
+        if configured_outputs is None:
+            configured_outputs = self.inputs
+        if isinstance(configured_outputs, str):
+            configured_outputs = [configured_outputs]
+        self.outputs = tuple(str(value).lower() for value in configured_outputs)
+        if not self.outputs:
+            raise ValueError("model.outputs must contain at least one state stream")
+        unknown = sorted(set(self.outputs) - set(SUPPORTED_STATE_STREAMS))
+        if unknown:
+            raise ValueError(
+                "model.outputs contains unsupported values "
+                f"{unknown}; choose from {list(SUPPORTED_STATE_STREAMS)}"
+            )
+        if len(set(self.outputs)) != len(self.outputs):
+            raise ValueError("model.outputs must not contain duplicates")
+        # Inputs condition the model; outputs are the continuous streams
+        # transported by the flow.  They intentionally need not be equal.
+        self.predicted_state_streams = self.outputs
         # Expose the selected contract on instances while retaining the
         # module-level vocabulary constants used by the dataset.
-        self.PREDICTED_STATE_STREAMS = self.inputs
+        self.PREDICTED_STATE_STREAMS = self.outputs
         self.CONDITION_KEYS = self.inputs + ("action", "action_mask")
-        self.TARGET_KEYS = tuple(f"{key}_future" for key in self.inputs) + (
+        self.TARGET_KEYS = tuple(f"{key}_future" for key in self.outputs) + (
             "contact_future",
         )
         self.contact_state_count = int(model_config.get("contact_state_count", 3))
