@@ -785,7 +785,7 @@ def save_plots(
 ) -> list[Path]:
     import matplotlib
 
-    matplotlib.use("Agg")
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -892,7 +892,7 @@ def save_rollout_plots(
 ) -> list[Path]:
     import matplotlib
 
-    matplotlib.use("Agg")
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     selection = _plot_indices(len(result["timestamp_s"]), max_plot_points)

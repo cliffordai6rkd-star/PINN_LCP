@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import matplotlib
 
-matplotlib.use("Agg")
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 import torch

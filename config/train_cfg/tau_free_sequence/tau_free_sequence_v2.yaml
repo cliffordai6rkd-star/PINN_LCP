@@ -122,7 +122,7 @@ train:
 
   wandb:
     enabled: true
-    project: lcp-pinn
+    project: carswm
     name: tau-free-lstm-h50-sample-peak-cvar
     mode: online
     log_every_steps: 10

@@ -35,12 +35,28 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_device(requested):
+    """Fail clearly when PyTorch reports CUDA but cannot use the device."""
+
+    device = torch.device(requested)
+    if device.type != "cuda":
+        return device
+    try:
+        torch.empty(1, device=device)
+        torch.cuda.synchronize(device)
+    except (RuntimeError, AssertionError) as exc:
+        raise RuntimeError(
+            f"requested benchmark device {device} is not usable; pass --device cpu "
+            "for a CPU-only structural benchmark"
+        ) from exc
+    return device
+
+
 def load_config(path):
     with path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
     config["model"]["dropout"] = 0.0
     config["model"]["runtime_checks"] = False
-    config["model"]["return_attention_weights"] = False
     config["model"]["emit_contact_probabilities"] = True
     config["dataloader"]["normalize_mode"] = None
     return config
@@ -106,7 +122,7 @@ def main():
     if args.batch_size < 1 or args.iterations < 1 or args.rollout_depth < 1:
         raise ValueError("batch-size, iterations, and rollout-depth must be positive")
     torch.manual_seed(42)
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(42)
         torch.cuda.reset_peak_memory_stats(device)
@@ -139,7 +155,7 @@ def main():
         args.warmup,
         args.iterations,
     )
-    stages["state_action_encoders"] = measure(
+    stages["condition_encoder"] = measure(
         lambda: teacher.encode_conditions(batch), device, args.warmup, args.iterations
     )
     stages["one_flow_velocity"] = measure(
@@ -255,7 +271,7 @@ def main():
         for key in (
             "dataloader",
             "normalizer_cpu_to_device",
-            "state_action_encoders",
+            "condition_encoder",
             "teacher_flow_integration",
             "student_flow_integration",
             "contact_head",

@@ -82,7 +82,7 @@ def test_step_training_retains_latest_topk_and_latest_file(tmp_path):
         weights_only=False,
     )
     assert latest["global_step"] == 5
-    assert summary["max_train_steps"] == 5
+    assert summary["max_optimizer_steps"] == 5
     assert summary["checkpoint_every_steps"] == 2
     assert [item["global_step"] for item in summary["best_checkpoints"]] == [4, 5]
     assert trainer.scheduler.last_epoch == 5

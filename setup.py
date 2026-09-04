@@ -2,7 +2,7 @@ from setuptools import find_namespace_packages, setup
 
 
 setup(
-    name="lcp-pinn",
+    name="carswm",
     version="0.1.0",
     description="Action-conditioned Contact World Model for Nero robot dynamics",
     long_description=open("README.md", encoding="utf-8").read(),
@@ -57,6 +57,14 @@ setup(
     },
     entry_points={
         "console_scripts": [
+            # Keep the historical pinn-* entry points usable for existing
+            # launch scripts while exposing the canonical carswm-* names.
+            "carswm-build-offline-labels=data_process.tool.build_offline_tau_labels:main",
+            "carswm-train-tau-other=train.trainer.tau_other_sequence_train:main",
+            "carswm-train-tau-free-v2=train.trainer.tau_free_sequence_train_v2:main",
+            "carswm-train-contact-wm=train.trainer.contact_world_model_train:main",
+            "carswm-train-contact-wm-opd=train.trainer.contact_world_model_opd_train:main",
+            "carswm-contact-wm-rollout=data_process.tool.contact_world_model_rollout_visualizer:main",
             "pinn-build-offline-labels=data_process.tool.build_offline_tau_labels:main",
             "pinn-train-tau-other=train.trainer.tau_other_sequence_train:main",
             "pinn-train-tau-free-v2=train.trainer.tau_free_sequence_train_v2:main",

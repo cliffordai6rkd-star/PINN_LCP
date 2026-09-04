@@ -1394,7 +1394,7 @@ class BaseTrainer:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         init_kwargs = {
-            "project": self.wandb_config.get("project", "lcp-pinn"),
+            "project": self.wandb_config.get("project", "carswm"),
             "name": self.wandb_config.get("name"),
             "entity": self.wandb_config.get("entity"),
             "group": self.wandb_config.get("group"),
@@ -1894,7 +1894,6 @@ class BaseTrainer:
             "early_stopping_monitor_key": self.early_stopping_monitor_key,
             "top_k": self.top_k,
             "best_checkpoints": self.best_checkpoints,
-            "max_train_steps": self.max_optimizer_steps,
             "max_optimizer_steps": self.max_optimizer_steps,
             "checkpoint_every_steps": self.checkpoint_every_steps,
             "checkpoint_every_epochs": self.checkpoint_every_epochs,
@@ -1943,7 +1942,7 @@ class BaseTrainer:
     
     def save_loss_plot(self):
         import matplotlib
-        matplotlib.use("Agg")
+        matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -2325,9 +2324,9 @@ class BaseTrainer:
         lines.append("Training finished")
         lines.append(f"num_epochs: {summary['num_epochs']}")
         lines.append(f"global_step: {summary['global_step']}")
-        if summary.get("max_train_steps") is not None:
+        if summary.get("max_optimizer_steps") is not None:
             lines.append(
-                f"max_train_steps: {summary['max_train_steps']}"
+                f"max_optimizer_steps: {summary['max_optimizer_steps']}"
             )
             lines.append(f"stopped_early: {summary['stopped_early']}")
         lines.append(f"last_loss: {summary['last_loss']}")

@@ -12,7 +12,7 @@ from train.contact_world_model_loss import ContactWorldModelLoss
 def config(inputs=None):
     return {
         "dataloader": {"state_history_horizon": 5, "prediction_horizon": 4, "action_condition_horizon": 3, "high_fps": 100, "normalize_mode": None},
-        "model": {"inputs": list(inputs or SUPPORTED_STATE_STREAMS), "joint_dim": 2, "action_dim": 2, "contact_state_count": 3, "hidden_dim": 8, "state_layers": 1, "action_layers": 1, "attention_heads": 2, "flow_layers": 1, "flow_attention_heads": 2, "flow_ffn_multiplier": 2, "flow_inference_steps": 2, "flow_solver": "heun", "flow_source_mode": "gaussian", "dropout": 0.0},
+        "model": {"inputs": list(inputs or SUPPORTED_STATE_STREAMS), "joint_dim": 2, "action_dim": 2, "contact_state_count": 3, "hidden_dim": 8, "state_layers": 1, "action_layers": 1, "flow_layers": 1, "flow_attention_heads": 2, "flow_ffn_multiplier": 2, "flow_inference_steps": 2, "flow_solver": "heun", "flow_source_mode": "gaussian", "dropout": 0.0},
         "loss": {"dt": 0.01, "kinematic_consistency_weight": 0.01, "ddq_smoothness_weight": 0.01},
     }
 
@@ -42,12 +42,51 @@ def test_independent_state_encoders_and_fused_shapes(inputs, count):
     first = {id(parameter) for parameter in model.state_encoders[inputs[0]].parameters()}
     assert first.isdisjoint(id(parameter) for parameter in model.state_encoders[inputs[-1]].parameters())
     output = model(batch(cfg), flow_time=0.5)
-    assert output["state_features"].shape == (2, count, 8)
     assert output["state_tokens"].shape == (2, count, 8)
     assert output["condition_memory"].shape == (2, count + 3, 8)
-    assert output["action_gates"].shape == (2, count, 1)
-    assert torch.all((output["action_gates"] >= 0) & (output["action_gates"] <= 1))
-    assert model.state_to_action_attention.embed_dim == 8
+    assert output["action_tokens"].shape == (2, 3, 8)
+    torch.testing.assert_close(
+        output["condition_memory"],
+        torch.cat((output["state_tokens"], output["action_tokens"]), dim=1),
+    )
+    assert not hasattr(model, "state_pool_attention")
+    assert not hasattr(model, "state_to_action_attention")
+    assert not hasattr(model, "action_gate")
+    assert not hasattr(model, "global_condition_projection")
+
+
+def test_flow_block_uses_self_attention_cross_attention_and_ffn():
+    cfg = config()
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    output = model(values, flow_time=0.5)
+    output["flow_velocity_pred"].square().mean().backward()
+    block = model.flow_blocks[0]
+    assert any(parameter.grad is not None for parameter in block.self_attention.parameters())
+    assert any(parameter.grad is not None for parameter in block.condition_attention.parameters())
+    assert any(parameter.grad is not None for parameter in block.ffn.parameters())
+    assert any(
+        parameter.grad is not None
+        for encoder in model.state_encoders.values()
+        for parameter in encoder.parameters()
+    )
+    assert any(parameter.grad is not None for parameter in model.action_encoder.parameters())
+
+
+def test_checkpoint_contract_identifies_simplified_token_architecture():
+    model = ContactWorldModel(config())
+    contract = model.checkpoint_contract()
+    assert model.MODEL_VERSION == "carswm_v2"
+    assert contract["schema_version"] == 2
+    assert contract["architecture"] == {
+        "condition_encoder": "modality_gru_action_gru_concat",
+        "state_token": "final_gru_hidden",
+        "flow_decoder": "self_attention_cross_attention_ffn",
+    }
+    incompatible = dict(contract)
+    incompatible["model_version"] = "carswm_v1"
+    with pytest.raises(ValueError, match="contract mismatch"):
+        model.validate_checkpoint_contract(incompatible)
 
 
 def test_flow_targets_and_contact_are_separate():
@@ -75,6 +114,28 @@ def test_contact_head_depends_on_its_generated_continuous_sample():
     model.contact_logits(continuous, encoded).square().mean().backward()
     assert continuous.grad is not None
     assert torch.any(continuous.grad != 0)
+
+
+def test_contact_head_uses_configured_phase_count():
+    cfg = config()
+    cfg["model"]["contact_state_count"] = 4
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    values["contact_future"] = torch.randint(0, 4, values["contact_future"].shape).float()
+    output = model(values, flow_time=0.5)
+    assert output["contact_logits"].shape == (2, 4, 4)
+    loss, _ = ContactWorldModelLoss(cfg)(output, values)
+    assert torch.isfinite(loss)
+
+
+def test_contact_target_outside_configured_phase_count_is_rejected():
+    cfg = config()
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    values["contact_future"][0, 0, 0] = 3.0
+    output = model(values, flow_time=0.5)
+    with pytest.raises(ValueError, match="outside model.contact_state_count"):
+        ContactWorldModelLoss(cfg)(output, values)
 
 
 def test_different_source_noise_generates_different_futures():

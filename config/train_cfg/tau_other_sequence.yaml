@@ -155,7 +155,7 @@ train:
 
   wandb:
     enabled: false
-    project: lcp-pinn
+    project: carswm
     name: tau-other-tcn-h50-sample-mse
     mode: online
     log_every_steps: 10

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -19,6 +21,7 @@ import yaml
 from data_process.contact_world_model_dataset import ContactWorldModelDataset
 from model.pinn_model.contact_world_model import ContactWorldModel, PREDICTED_STATE_STREAMS
 from train.base_trainer import BaseTrainer
+from train.carswm_checkpoint_viz import render_checkpoint_summary
 from train.carswm_metrics import distribution_metrics
 from train.contact_world_model_loss import ContactWorldModelLoss
 
@@ -140,12 +143,82 @@ class ContactWorldModelTrainer(BaseTrainer):
             raise ValueError(
                 "probabilistic_validation max_batches/every must be non-negative/positive"
             )
+        viz_config = self.train_config.get("checkpoint_visualization") or {}
+        self.checkpoint_visualization_enabled = bool(
+            viz_config.get("enabled", False)
+        )
+        self.checkpoint_visualization_every_saved = bool(
+            viz_config.get("every_saved_checkpoint", True)
+        )
+        self.checkpoint_visualization_indices = dict(
+            viz_config.get("fixed_validation_indices") or {}
+        )
+        self.checkpoint_visualization_paired_indices = dict(
+            viz_config.get("paired_validation_indices") or {}
+        )
+        self.checkpoint_visualization_num_samples = int(
+            viz_config.get("num_samples", 32)
+        )
+        self.checkpoint_visualization_seed = int(viz_config.get("seed", 2027))
+        self.checkpoint_visualization_use_ema = bool(viz_config.get("use_ema", True))
+        self.checkpoint_visualization_denormalize = bool(
+            viz_config.get("denormalize_for_plot", True)
+        )
+        self.checkpoint_visualization_wrist_joint = int(
+            viz_config.get("wrist_joint_index", 5)
+        )
+        self.checkpoint_visualization_flow_steps = int(
+            viz_config.get(
+                "flow_steps",
+                (config.get("model") or {}).get("flow_inference_steps", 8),
+            )
+        )
+        self.checkpoint_visualization_flow_solver = str(
+            viz_config.get(
+                "flow_solver",
+                (config.get("model") or {}).get("flow_solver", "heun"),
+            )
+        ).lower()
+        plot_ranges = viz_config.get("plot_ranges") or {}
+        self.checkpoint_visualization_plot_ranges = {
+            key: tuple(float(value) for value in plot_ranges[key])
+            for key in ("q", "tau")
+            if key in plot_ranges and plot_ranges[key] is not None
+        }
+        self._checkpoint_visualization_records = []
+        self._checkpoint_visualization_noise = {}
+        if self.checkpoint_visualization_enabled:
+            if self.checkpoint_visualization_num_samples < 2:
+                raise ValueError("checkpoint_visualization.num_samples must be at least 2")
+            if not 0 <= self.checkpoint_visualization_wrist_joint < self.loss_calculator.joint_dim:
+                raise ValueError("checkpoint_visualization.wrist_joint_index is out of range")
+            if self.checkpoint_visualization_flow_steps < 1:
+                raise ValueError("checkpoint_visualization.flow_steps must be positive")
+            if self.checkpoint_visualization_flow_solver not in {"euler", "heun"}:
+                raise ValueError(
+                    "checkpoint_visualization.flow_solver must be euler or heun"
+                )
+            configured_streams = set(self.loss_calculator.predicted_state_streams)
+            if not {"q", "tau"}.issubset(configured_streams):
+                raise ValueError(
+                    "six-panel checkpoint visualization requires q and tau in "
+                    "model.inputs; disable it for other valid M stream selections"
+                )
+            for key, limits in self.checkpoint_visualization_plot_ranges.items():
+                if len(limits) != 2 or not limits[0] < limits[1]:
+                    raise ValueError(
+                        f"checkpoint_visualization.plot_ranges.{key} must be [min, max]"
+                    )
 
     def build_dataset(self):
         return ContactWorldModelDataset(self.config, compute_normalizer=False)
 
     def build_model(self):
         return ContactWorldModel(self.config)
+
+    def setup(self):
+        super().setup()
+        self._prepare_checkpoint_visualization()
 
     @staticmethod
     def _sample_indices(dataset):
@@ -195,7 +268,6 @@ class ContactWorldModelTrainer(BaseTrainer):
 
         A fixed ``max`` aggregation over the existing future phase sequence
         assigns each window to one of the model's configured contact states.
-        No time-to-contact variable is derived or added to the sample schema.
         """
         sampling = self.train_config.get("contact_sampling") or {}
         self.dataset.importance_weight_by_sample_index = {}
@@ -240,6 +312,10 @@ class ContactWorldModelTrainer(BaseTrainer):
                 "model.contact_state_count and contain non-negative values"
             )
         labels = sampling_phases()
+        if torch.any(labels < 0) or torch.any(labels >= class_count):
+            raise ValueError(
+                "contact sampling phase lies outside model.contact_state_count"
+            )
         weights = torch.as_tensor(phase_weights, dtype=torch.double).index_select(0, labels)
         if torch.any(weights <= 0):
             raise ValueError(
@@ -279,6 +355,259 @@ class ContactWorldModelTrainer(BaseTrainer):
         loss, loss_dict = self.loss_calculator(out, batch)
         out["loss_dict"] = loss_dict
         return loss, out
+
+    @staticmethod
+    def _phase_names(class_count):
+        if int(class_count) == 3:
+            return ("free", "pre_contact", "contact")
+        return tuple(f"phase_{index}" for index in range(int(class_count)))
+
+    def _validation_base_indices(self):
+        if self.val_loader is None:
+            return []
+        dataset = self.val_loader.dataset
+        if isinstance(dataset, torch.utils.data.Subset):
+            return [int(value) for value in dataset.indices]
+        return list(range(len(dataset)))
+
+    def _prepare_checkpoint_visualization(self):
+        if not self.checkpoint_visualization_enabled:
+            return
+        base_indices = self._validation_base_indices()
+        if not base_indices:
+            raise ValueError(
+                "checkpoint_visualization requires a non-empty validation split"
+            )
+        phase_names = self._phase_names(self.loss_calculator.contact_state_count)
+        selected = {
+            str(name): int(index)
+            for name, index in self.checkpoint_visualization_indices.items()
+        }
+        if not selected:
+            for index in base_indices:
+                high_idx = self.dataset.valid_indices[index]
+                phase = int(self.dataset.future_contact_phase(high_idx, reduction="max"))
+                if 0 <= phase < len(phase_names) and phase_names[phase] not in selected:
+                    selected[phase_names[phase]] = index
+                if len(selected) == len(phase_names):
+                    break
+        selected.update(
+            {
+                str(name): int(index)
+                for name, index in self.checkpoint_visualization_paired_indices.items()
+            }
+        )
+        invalid = {
+            name: index for name, index in selected.items() if index not in base_indices
+        }
+        if invalid:
+            raise ValueError(
+                "checkpoint_visualization indices must be base dataset indices "
+                f"inside the fixed validation split: {invalid}"
+            )
+        if not selected:
+            raise ValueError("checkpoint_visualization could not select an existing phase")
+
+        # Cache exact inputs once. Dataset augmentation, when enabled, can no
+        # longer change a visualized anchor across checkpoints.
+        from torch.utils.data._utils.collate import default_collate
+
+        devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(self.checkpoint_visualization_seed)
+            records = []
+            for name, index in selected.items():
+                sample = self.dataset[index]
+                records.append(
+                    {
+                        "name": name,
+                        "index": index,
+                        "raw_index": int(self.dataset.valid_indices[index]),
+                        "batch": default_collate([sample]),
+                    }
+                )
+        self._checkpoint_visualization_records = records
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.checkpoint_visualization_seed)
+        for record in records:
+            self._checkpoint_visualization_noise[record["name"]] = torch.randn(
+                1,
+                self.checkpoint_visualization_num_samples,
+                self.model.future_horizon,
+                self.model.flow_dim,
+                generator=generator,
+                dtype=torch.float32,
+            )
+        viz_dir = self.output_dir / "checkpoint_viz"
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "phase_aggregation": "max_existing_future_contact_phase",
+            "fixed_validation_indices": {
+                record["name"]: record["index"] for record in records
+            },
+            "raw_anchor_indices": {
+                record["name"]: record["raw_index"] for record in records
+            },
+            "num_samples": self.checkpoint_visualization_num_samples,
+            "seed": self.checkpoint_visualization_seed,
+        }
+        (viz_dir / "fixed_samples.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+        )
+
+    def _checkpoint_visualization_physical(self, key, value):
+        if not self.checkpoint_visualization_denormalize:
+            return value.float()
+        physical = self._denormalize(key, value)
+        return value.float() if physical is None else physical.float()
+
+    @staticmethod
+    def _mean_metric_dict(values):
+        return {
+            key: float(torch.cat(items).mean().item())
+            for key, items in values.items()
+            if items
+        }
+
+    @staticmethod
+    def _plot_limits(values):
+        array = torch.cat([value.reshape(-1).float().cpu() for value in values])
+        minimum = float(array.min().item())
+        maximum = float(array.max().item())
+        width = max(maximum - minimum, 1.0e-3)
+        return [minimum - 0.05 * width, maximum + 0.05 * width]
+
+    @torch.no_grad()
+    def _save_checkpoint_visualization(self, epoch, checkpoint_path):
+        if not self._checkpoint_visualization_records:
+            return
+        visualization_model = (
+            self.ema.model
+            if self.checkpoint_visualization_use_ema and self.ema is not None
+            else self.model
+        )
+        was_training = visualization_model.training
+        visualization_model.eval()
+        plot_records = []
+        metric_values = defaultdict(list)
+        scale_values = {"q": [], "tau": []}
+        try:
+            for record in self._checkpoint_visualization_records:
+                batch = self.batch_to_device(record["batch"])
+                reference = batch[visualization_model.inputs[0]]
+                source_noise = self._checkpoint_visualization_noise[record["name"]].to(
+                    device=reference.device, dtype=reference.dtype
+                )
+                samples = visualization_model.sample(
+                    batch,
+                    num_samples=self.checkpoint_visualization_num_samples,
+                    steps=self.checkpoint_visualization_flow_steps,
+                    solver=self.checkpoint_visualization_flow_solver,
+                    source_noise=source_noise,
+                )
+                normalized_samples = {
+                    key: samples[f"{key}_pred"].float()
+                    for key in visualization_model.predicted_state_streams
+                }
+                normalized_targets = {
+                    key: batch[f"{key}_future"].float()
+                    for key in visualization_model.predicted_state_streams
+                }
+                metrics = distribution_metrics(
+                    normalized_samples,
+                    normalized_targets,
+                    samples.get("contact_probability"),
+                    batch.get("contact_future"),
+                )
+                for key, value in metrics.items():
+                    metric_values[key].append(value.detach().float().reshape(-1).cpu())
+                physical_samples = {
+                    key: self._checkpoint_visualization_physical(key, value)[0].cpu()
+                    for key, value in normalized_samples.items()
+                }
+                physical_targets = {
+                    key: self._checkpoint_visualization_physical(key, value)[0].cpu()
+                    for key, value in normalized_targets.items()
+                }
+                if "q" not in physical_samples or "tau" not in physical_samples:
+                    raise ValueError(
+                        "checkpoint visualization panels require q and tau in model.inputs"
+                    )
+                scale_values["q"].extend((physical_samples["q"], physical_targets["q"]))
+                scale_values["tau"].extend((physical_samples["tau"], physical_targets["tau"]))
+                plot_records.append(
+                    {
+                        "name": record["name"],
+                        "samples": {
+                            key: value.numpy() for key, value in physical_samples.items()
+                        },
+                        "targets": {
+                            key: value.numpy() for key, value in physical_targets.items()
+                        },
+                        "contact_probability": samples["contact_probability"][0].float().cpu().numpy(),
+                        "contact_target": batch["contact_future"][0].float().cpu().numpy(),
+                    }
+                )
+        finally:
+            visualization_model.train(was_training)
+
+        metrics = self._mean_metric_dict(metric_values)
+        metrics.update(
+            {
+                "step": int(self.global_step),
+                "epoch": int(epoch),
+                "checkpoint": Path(checkpoint_path).name,
+                "model_version": getattr(self.model, "MODEL_VERSION", None),
+                "num_samples": self.checkpoint_visualization_num_samples,
+                "visualization_seed": self.checkpoint_visualization_seed,
+                "flow_steps": self.checkpoint_visualization_flow_steps,
+                "nfe": self.checkpoint_visualization_flow_steps
+                * (2 if self.checkpoint_visualization_flow_solver == "heun" else 1),
+                "phase_aggregation": "max_existing_future_contact_phase",
+            }
+        )
+        viz_dir = self.output_dir / "checkpoint_viz"
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        scale_path = viz_dir / "plot_scales.json"
+        if scale_path.exists():
+            scales = json.loads(scale_path.read_text(encoding="utf-8"))
+        else:
+            scales = dict(self.checkpoint_visualization_plot_ranges)
+            for key in ("q", "tau"):
+                scales.setdefault(key, self._plot_limits(scale_values[key]))
+            scale_path.write_text(
+                json.dumps(scales, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        existing_metrics = []
+        for path in sorted(viz_dir.glob("step_*_metrics.json")):
+            if path.name != f"step_{self.global_step:08d}_metrics.json":
+                existing_metrics.append(json.loads(path.read_text(encoding="utf-8")))
+        image_path = viz_dir / f"step_{self.global_step:08d}_summary.png"
+        render_checkpoint_summary(
+            image_path,
+            plot_records,
+            existing_metrics,
+            metrics,
+            scales,
+            wrist_joint_index=self.checkpoint_visualization_wrist_joint,
+            contact_names=self._phase_names(self.loss_calculator.contact_state_count),
+        )
+        metrics_path = viz_dir / f"step_{self.global_step:08d}_metrics.json"
+        metrics_path.write_text(
+            json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        shutil.copyfile(image_path, viz_dir / "latest_summary.png")
+
+    def save_step_checkpoint(self, epoch, metrics):
+        super().save_step_checkpoint(epoch, metrics)
+        if (
+            self.checkpoint_visualization_enabled
+            and self.checkpoint_visualization_every_saved
+            and self._last_step_checkpoint == self.global_step
+        ):
+            self._save_checkpoint_visualization(
+                epoch, self.ckpt_dir / f"step_{self.global_step:08d}.pt"
+            )
 
     @staticmethod
     def _metric_add(accumulator, name, value, count):
@@ -727,12 +1056,26 @@ class ContactWorldModelTrainer(BaseTrainer):
                 if self.probabilistic_max_batches and batch_index >= self.probabilistic_max_batches:
                     break
                 batch = self.batch_to_device(raw_batch)
+                reference = batch[self.model.inputs[0]]
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(
+                    self.rollout_source_seed + int(batch_index) * 1009
+                )
+                source_noise = torch.randn(
+                    reference.shape[0],
+                    self.probabilistic_num_samples,
+                    self.model.future_horizon,
+                    self.model.flow_dim,
+                    generator=generator,
+                    dtype=torch.float32,
+                ).to(device=reference.device, dtype=reference.dtype)
                 with self.autocast_context():
                     samples = self.model.sample(
                         batch,
                         num_samples=self.probabilistic_num_samples,
                         steps=self.rollout_steps,
                         solver=self.rollout_solver,
+                        source_noise=source_noise,
                     )
                 sample_streams = {
                     key: samples[f"{key}_pred"].float()

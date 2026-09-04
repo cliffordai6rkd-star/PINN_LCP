@@ -1,6 +1,5 @@
 import argparse, os, yaml
 import numpy as np
-import matplotlib.pyplot as plt
 
 from img_randomer import transforms
 from img_randomer import Image_randomer
@@ -11,7 +10,7 @@ class Image_loader:
         self._config = config
         self.path = config.get("datapath","data/pnp_30_ep/pick_and_place")
         self.randomer = Image_randomer(config)
-  
+
         
     def get_episode_path(self):
         dataset_path = Path(self.path)
@@ -79,7 +78,6 @@ class Image_loader:
         pil_image = tensor_to_pil(image_tensor)  
         # pil_image.show()
         pil_image.save("debug_augmented.jpg")
-        plt.show()
         return pil_image
 
 
@@ -103,6 +101,3 @@ if __name__ == "__main__":
     # print(img_dict)
     image = image_loader.load_image()
     image_loader.show_tensor_image(image)
-    
-
-  

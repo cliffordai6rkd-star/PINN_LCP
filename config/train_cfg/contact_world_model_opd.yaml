@@ -1,6 +1,6 @@
 # Contact WM OPD Student configuration.
 # Train the Teacher first with contact_world_model.yaml, then point
-# distillation.teacher_checkpoint_path to a Contact World Model v2 checkpoint.
+# distillation.teacher_checkpoint_path to a compatible CARS-WM v2 checkpoint.
 
 wm_v3_only: true
 
@@ -93,8 +93,6 @@ model:
   hidden_dim: 64
   state_layers: 1
   action_layers: 1
-  attention_heads: 4
-  state_pooling: attention
   dropout: 0.01
   flow_layers: 2
   flow_attention_heads: 4
@@ -105,11 +103,7 @@ model:
   flow_source_mode: gaussian
   action_time_alignment: zoh
   contact_head_hidden_dim: 32
-  contact_logit_scale: 4.0
-  # Direct action chunks are complete. These diagnostics do not participate in
-  # the OPD objective and otherwise repeat work across every Student call.
   runtime_checks: false
-  return_attention_weights: false
   use_action_padding_mask: false
   emit_contact_probabilities: false
 
@@ -231,6 +225,17 @@ train:
     max_batches: 8
     every: 1
     replace_val_loss: true
+  checkpoint_visualization:
+    enabled: true
+    every_saved_checkpoint: true
+    fixed_validation_indices: {}
+    paired_validation_indices: {}
+    num_samples: 32
+    seed: 2027
+    use_ema: true
+    denormalize_for_plot: true
+    wrist_joint_index: 5
+    plot_ranges: {}
   output_dir: outputs/contact_world_model_opd_11
   monitor_key: val_loss
   top_k: 2

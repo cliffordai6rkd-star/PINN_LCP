@@ -39,22 +39,25 @@ def sample_spread(samples):
 
 def marginal_coverage(samples, target):
     _validate(samples, target)
-    lower = samples.min(dim=1).values
-    upper = samples.max(dim=1).values
+    lower = torch.quantile(samples.float(), 0.05, dim=1)
+    upper = torch.quantile(samples.float(), 0.95, dim=1)
     return ((target >= lower) & (target <= upper)).float().mean(dim=(1, 2))
 
 
 def contact_metrics(probability_samples, target):
-    if probability_samples.ndim != 4 or probability_samples.shape[-1] != 3:
-        raise ValueError("contact probabilities must have shape [B,K,H,3]")
+    if probability_samples.ndim != 4 or probability_samples.shape[-1] < 2:
+        raise ValueError("contact probabilities must have shape [B,K,H,C], C >= 2")
+    class_count = probability_samples.shape[-1]
     labels = target.squeeze(-1).round().long()
+    if torch.any(labels < 0) or torch.any(labels >= class_count):
+        raise ValueError("contact target contains a phase outside [0, C)")
     probability = probability_samples.mean(dim=1).clamp_min(1.0e-8)
     nll = -probability.gather(-1, labels[..., None]).squeeze(-1).mean(dim=1)
-    one_hot = F.one_hot(labels, num_classes=3).to(probability.dtype)
+    one_hot = F.one_hot(labels, num_classes=class_count).to(probability.dtype)
     brier = (probability - one_hot).square().sum(dim=-1).mean(dim=1)
     prediction = probability.argmax(dim=-1)
     f1_values = []
-    for phase in range(3):
+    for phase in range(class_count):
         true_positive = ((prediction == phase) & (labels == phase)).sum(dim=1).float()
         predicted = (prediction == phase).sum(dim=1).float()
         support = (labels == phase).sum(dim=1).float()
@@ -64,7 +67,7 @@ def contact_metrics(probability_samples, target):
     macro_f1 = torch.stack(f1_values, dim=1).mean(dim=1)
 
     def onset(value):
-        contact = value == 2
+        contact = value == class_count - 1
         indices = torch.arange(value.shape[1], device=value.device)[None].expand_as(value)
         sentinel = torch.full_like(indices, value.shape[1])
         return torch.where(contact, indices, sentinel).min(dim=1).values
@@ -92,9 +95,13 @@ def distribution_metrics(samples_by_stream, targets_by_stream, contact_probabili
         "min_ade": ade,
         "min_fde": fde,
         "sample_spread": sample_spread(sample_state),
+        "coverage_90": marginal_coverage(sample_state, target_state),
     }
     for key, samples in samples_by_stream.items():
-        result[f"{key}_mode_coverage"] = marginal_coverage(
+        result[f"{key}_energy_score"] = energy_score(
+            samples, targets_by_stream[key]
+        )
+        result[f"{key}_coverage_90"] = marginal_coverage(
             samples, targets_by_stream[key]
         )
     if contact_probability is not None and contact_target is not None:

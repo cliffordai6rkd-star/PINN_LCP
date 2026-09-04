@@ -89,8 +89,6 @@ model:
   hidden_dim: 128
   state_layers: 2
   action_layers: 2
-  attention_heads: 4
-  state_pooling: attention
   dropout: 0.01
 
   flow_layers: 4
@@ -101,11 +99,7 @@ model:
   flow_source_mode: gaussian
   action_time_alignment: zoh
   contact_head_hidden_dim: 64
-  contact_logit_scale: 4.0
-  # Fast-path settings: direct action chunks are complete, and these values
-  # are not needed by the training objective.
   runtime_checks: false
-  return_attention_weights: false
   use_action_padding_mask: false
   emit_contact_probabilities: false
 
@@ -151,9 +145,9 @@ train:
   val_persistent_workers: false
   # Optimizer updates are the authoritative training budget. Epoch remains a
   # data-pass/logging counter and does not terminate this run.
-  max_optimizer_steps: 50000
+  max_optimizer_steps: 200000
   num_epochs: 1000000
-  checkpoint_every_steps: 10000
+  checkpoint_every_steps: 100000
   val_ratio: 0.1
   # Match DP-style validation cadence; epoch 0 is included.
   val_every: 5  # val_episode_indices: [15, 50, 90]
@@ -204,6 +198,19 @@ train:
     max_batches: 8
     every: 1
     replace_val_loss: true
+  checkpoint_visualization:
+    enabled: true
+    every_saved_checkpoint: true
+    # Empty means: deterministically choose the first validation anchor for
+    # each existing contact phase and persist the exact indices in a manifest.
+    fixed_validation_indices: {}
+    paired_validation_indices: {}
+    num_samples: 32
+    seed: 2027
+    use_ema: true
+    denormalize_for_plot: true
+    wrist_joint_index: 5
+    plot_ranges: {}
   output_dir: outputs/contact_world_model_ep4
   monitor_key: val_loss
   top_k: 5

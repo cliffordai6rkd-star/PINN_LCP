@@ -31,8 +31,8 @@ class ContactWorldModelLoss:
             configured_inputs = [configured_inputs]
         self.predicted_state_streams = tuple(str(value).lower() for value in configured_inputs)
         self.contact_state_count = int(model_config.get("contact_state_count", 3))
-        if self.contact_state_count != 3:
-            raise ValueError("model.contact_state_count must be exactly 3")
+        if self.contact_state_count < 2:
+            raise ValueError("model.contact_state_count must be at least 2")
         self.normalize_mode = data_config.get("normalize_mode")
         self.flow_weight = float(loss_config.get("flow_weight", 1.0))
         self.flow_q_weight = float(loss_config.get("flow_q_weight", 1.0))
@@ -281,7 +281,11 @@ class ContactWorldModelLoss:
         if "contact_logits" not in out:
             return reference.new_zeros(reference.shape[0])
         target = self._required(batch, "contact_future").to(device=reference.device)
-        labels = target.squeeze(-1).round().long().clamp(0, self.contact_state_count - 1)
+        labels = target.squeeze(-1).round().long()
+        if torch.any(labels < 0) or torch.any(labels >= self.contact_state_count):
+            raise ValueError(
+                "contact_future contains a phase outside model.contact_state_count"
+            )
         logits = out["contact_logits"]
         if logits.shape[:2] != labels.shape:
             raise ValueError("contact logits and labels have incompatible shapes")

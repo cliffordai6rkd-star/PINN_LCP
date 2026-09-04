@@ -33,7 +33,7 @@ def to_numpy(value: Any):
 def plot_channels(time, values, title: str, ylabel: str, output_path: Path) -> None:
     import matplotlib
 
-    matplotlib.use("Agg")
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     fig, axis = plt.subplots(figsize=(12, 5))
