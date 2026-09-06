@@ -19,8 +19,10 @@ sampling uses a fixed `max` aggregation of the contact-phase labels already in
 each future window, with importance correction for the original empirical
 risk.
 
-The Teacher encodes each selected state stream with an independent GRU, encodes
-the action chunk with a separate GRU plus elapsed physical-time embeddings, and
+The Teacher encodes each selected state stream with an independent GRU and a
+configurable state-token pool (the training config uses learned-query attention
+pooling over the full history, while legacy v3 checkpoints retain final-hidden
+pooling), encodes the action chunk with a separate GRU plus elapsed physical-time embeddings, and
 uses state-to-action cross-attention (state queries, action keys/values) before
 forming the condition memory as action-aware state tokens plus the raw action
 tokens. Future Flow tokens likewise receive elapsed physical-time embeddings.

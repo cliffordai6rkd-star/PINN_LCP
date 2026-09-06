@@ -98,6 +98,9 @@ model:
   hidden_dim: 128
   state_layers: 2
   action_layers: 2
+  # Learned query pooling lets each modality select transient events from
+  # the complete 50-frame history instead of relying only on final hidden.
+  state_pooling: attention
   dropout: 0.01
 
   flow_layers: 4
@@ -145,7 +148,7 @@ loss:
 
 train:
   device: cuda:0
-  batch_size: 128
+  batch_size: 256
   # Keep host-memo2y pressure bounded on the 15 GiB training workstation.
   # Validation runs in the main process by default (see val_num_workers).
   num_workers: 2
@@ -155,7 +158,7 @@ train:
   val_persistent_workers: false
   # Optimizer updates are the authoritative training budget. Epoch remains a
   # data-pass/logging counter and does not terminate this run.
-  max_optimizer_steps: 250000
+  max_optimizer_steps: 500000
   num_epochs: 1000000
   checkpoint_every_steps: 50000
   val_ratio: 0.1
@@ -232,7 +235,7 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir: outputs/contact_world_model_ep5
+  output_dir: outputs/contact_world_model_final
   monitor_key: val_loss
   top_k: 5
   save_latest_checkpoint: true

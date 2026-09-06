@@ -80,6 +80,28 @@ def test_flow_block_uses_self_attention_cross_attention_and_ffn():
     assert any(parameter.grad is not None for parameter in model.action_encoder.parameters())
 
 
+def test_attention_state_pooling_reads_full_history():
+    cfg = config()
+    cfg["model"]["state_pooling"] = "attention"
+    model = ContactWorldModel(cfg)
+    values = batch(cfg)
+    output = model(values, flow_time=0.5)
+
+    assert model.state_pooling == "attention"
+    assert hasattr(model, "state_pool_attention")
+    assert tuple(model.state_pool_queries) == tuple(cfg["model"]["inputs"])
+    assert output["state_tokens"].shape == (2, 4, 8)
+
+    output["flow_velocity_pred"].square().mean().backward()
+    assert any(
+        parameter.grad is not None
+        for parameter in model.state_pool_attention.parameters()
+    )
+    assert model.checkpoint_contract()["architecture"]["state_token"] == (
+        "attention_pooling"
+    )
+
+
 def test_checkpoint_contract_identifies_simplified_token_architecture():
     model = ContactWorldModel(config())
     contract = model.checkpoint_contract()

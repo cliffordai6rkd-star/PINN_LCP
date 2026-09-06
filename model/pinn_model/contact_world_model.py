@@ -238,6 +238,9 @@ class ContactWorldModel(nn.Module):
         self.flow_inference_steps = int(model_config.get("flow_inference_steps", 8))
         self.flow_solver = str(model_config.get("flow_solver", "heun")).lower()
         self.flow_source_mode = str(model_config.get("flow_source_mode", "gaussian")).lower()
+        # Keep early v3 checkpoints on their final-hidden path. New training
+        # configs can opt into learned-query attention pooling.
+        self.state_pooling = str(model_config.get("state_pooling", "last")).lower()
         self.dropout = float(model_config.get("dropout", 0.1))
         self.runtime_checks = bool(model_config.get("runtime_checks", True))
         self.use_action_padding_mask = bool(
@@ -264,10 +267,23 @@ class ContactWorldModel(nn.Module):
         # modal token.  Distinct embeddings preserve the stream identity even
         # when two modalities have similar numerical ranges.
         self.modality_embeddings = nn.ParameterDict()
+        if self.state_pooling == "attention":
+            self.state_pool_queries = nn.ParameterDict()
         for key in self.inputs:
             embedding = nn.Parameter(torch.empty(self.hidden_dim))
             nn.init.normal_(embedding, mean=0.0, std=0.02)
             self.modality_embeddings[key] = embedding
+            if self.state_pooling == "attention":
+                query = nn.Parameter(torch.empty(1, 1, self.hidden_dim))
+                nn.init.normal_(query, mean=0.0, std=0.02)
+                self.state_pool_queries[key] = query
+        if self.state_pooling == "attention":
+            self.state_pool_attention = nn.MultiheadAttention(
+                self.hidden_dim,
+                self.flow_attention_heads,
+                dropout=self.dropout,
+                batch_first=True,
+            )
         self.action_encoder = nn.GRU(
             self.action_dim, self.hidden_dim, self.action_layers,
             dropout=action_dropout, batch_first=True
@@ -356,6 +372,8 @@ class ContactWorldModel(nn.Module):
                 "model.flow_source_mode must be 'gaussian'; state-to-state "
                 "sources are no longer supported"
             )
+        if self.state_pooling not in {"last", "attention"}:
+            raise ValueError("model.state_pooling must be 'last' or 'attention'")
         if not math.isfinite(self.state_rate_hz) or self.state_rate_hz <= 0.0:
             raise ValueError("dataloader.high_fps must be positive")
         if not math.isfinite(self.action_rate_hz) or self.action_rate_hz <= 0.0:
@@ -380,7 +398,11 @@ class ContactWorldModel(nn.Module):
                 "condition_encoder": (
                     "modality_gru_action_gru_state_to_action_cross_attention"
                 ),
-                "state_token": "final_gru_hidden",
+                "state_token": (
+                    "attention_pooling"
+                    if self.state_pooling == "attention"
+                    else "final_gru_hidden"
+                ),
                 "flow_decoder": "self_attention_cross_attention_ffn",
                 "condition_memory": "state_action_aware_state_plus_raw_action",
                 "action_time_encoding": "physical_seconds_fourier_mlp",
@@ -617,10 +639,23 @@ class ContactWorldModel(nn.Module):
         )
         state_token_features = []
         for key in self.inputs:
-            _, hidden = self.state_encoders[key](states[key])
-            # The final GRU hidden state is the token for this modality; the
-            # explicit state-to-action block below performs the only fusion.
-            token = hidden[-1] + self.modality_embeddings[key]
+            encoded, hidden = self.state_encoders[key](states[key])
+            if self.state_pooling == "last":
+                token = hidden[-1]
+            else:
+                # A learned query can assign high weight to a short impact,
+                # reversal, or pre-contact transient anywhere in history.
+                query = self.state_pool_queries[key].expand(
+                    encoded.shape[0], -1, -1
+                )
+                pooled, _ = self.state_pool_attention(
+                    query=query,
+                    key=encoded,
+                    value=encoded,
+                    need_weights=False,
+                )
+                token = pooled[:, 0]
+            token = token + self.modality_embeddings[key]
             state_token_features.append(token)
         # [B, M, d], where M=len(model.inputs).  Keeping M dynamic enables
         # input-stream ablations without changing the prediction head.
