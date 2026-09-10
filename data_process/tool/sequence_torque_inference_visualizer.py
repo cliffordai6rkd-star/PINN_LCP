@@ -534,27 +534,42 @@ def add_external_wrench_rollout(
             if target_generation is not None
             else normalize_tau_other_target_generation(config)
         )
-        gravity_contract = bool(
-            target_generation.get("enabled", False)
-            and target_generation.get("method") == "causal_gravity_residual_v1"
-        )
-        if not gravity_contract:
+        target_method = str(target_generation.get("method", "")).lower()
+        if not target_generation.get("enabled", False) or target_method not in {
+            "causal_rnea_residual_v1",
+            "causal_gravity_residual_v1",
+        }:
             raise RuntimeError(
-                "tau_other rollout requires causal_gravity_residual_v1"
+                "tau_other rollout requires a supported causal residual contract"
             )
         required = {"tau", "timestamp"}
         missing = sorted(required - set(columns))
         if missing:
             raise KeyError(f"tau_other rollout is missing episode columns: {missing}")
-        tau_g = dynamics.gravity_torque(q).cpu().numpy()
+        if "_tau_id" in columns:
+            tau_id = columns["_tau_id"].detach().cpu().numpy()
+        elif target_method == "causal_gravity_residual_v1":
+            tau_id = dynamics.gravity_torque(q).cpu().numpy()
+        else:
+            source_keys = target_generation["source_keys"]
+            derived = build_causal_tau_other_target(
+                timestamps_s=columns["timestamp"].detach().cpu().numpy(),
+                q=columns[source_keys["q"]],
+                dq=columns[source_keys["dq"]],
+                tau_measured=columns[source_keys["tau"]],
+                episodes=[{"dataset_from_index": 0, "dataset_to_index": len(q)}],
+                target_config=target_generation,
+                dynamics=dynamics,
+            )
+            tau_id = derived.tau_id.cpu().numpy()
         rollout_config = config.get("rollout") or {}
         tau_measured = columns["tau"].detach().cpu().numpy().astype(np.float64)
         tau_ext_nm = (
             tau_measured[positions]
-            - tau_g[positions]
+            - tau_id[positions]
             - np.asarray(result["prediction_nm"], dtype=np.float64)
         )
-        result["tau_g_nm"] = tau_g[positions]
+        result["tau_id_nm"] = tau_id[positions]
         result["tau_measured_nm"] = tau_measured[positions]
 
     tau_ext_raw_nm = np.asarray(tau_ext_nm, dtype=np.float64)
@@ -1276,6 +1291,7 @@ def run_visualization(task: TorqueVisualizationTask, args: argparse.Namespace) -
             )
             columns[source_keys["dq"]] = derived.dq
             columns[task.target_key] = derived.tau_other
+            columns["_tau_id"] = derived.tau_id
         target_filter = torque_target_filter_config(config)
         if (
             task.rollout_mode == "tau_free"

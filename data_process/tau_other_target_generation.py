@@ -8,6 +8,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
+from data_process.offline_tau_labels import (
+    KalmanRTSConfig,
+    estimate_joint_states_causal,
+)
+
 _TIMESTAMP_SCALES = {
     "s": 1.0,
     "ms": 1.0e-3,
@@ -21,7 +26,12 @@ class TauOtherTargetBuildResult:
     tau_other: torch.Tensor
     dq: torch.Tensor
     ddq: torch.Tensor
-    tau_g: torch.Tensor
+    tau_id: torch.Tensor
+
+    @property
+    def tau_g(self) -> torch.Tensor:
+        """Backward-compatible alias for gravity-only target consumers."""
+        return self.tau_id
 
 
 def normalize_tau_other_target_generation(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -43,15 +53,16 @@ def normalize_tau_other_target_generation(config: Mapping[str, Any]) -> dict[str
         "source_keys",
         "dq_sign",
         "torque_filter_key",
+        "state_estimator",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(f"Unknown target_generation options: {unknown}")
 
-    method = str(raw.get("method", "causal_gravity_residual_v1")).lower()
-    if method != "causal_gravity_residual_v1":
+    method = str(raw.get("method", "causal_rnea_residual_v1")).lower()
+    if method not in {"causal_rnea_residual_v1", "causal_gravity_residual_v1"}:
         raise ValueError(
-            "target_generation.method must be 'causal_gravity_residual_v1'"
+            "target_generation.method must be 'causal_rnea_residual_v1'"
         )
 
     source_keys = raw.get("source_keys") or {"q": "q", "dq": "dq", "tau": "tau"}
@@ -81,6 +92,32 @@ def normalize_tau_other_target_generation(config: Mapping[str, Any]) -> dict[str
         if not dq_sign or any(value not in {-1.0, 1.0} for value in dq_sign):
             raise ValueError("target_generation.dq_sign must contain only -1 or 1")
 
+    estimator_values = raw.get("state_estimator") or {}
+    if not isinstance(estimator_values, Mapping):
+        raise ValueError("target_generation.state_estimator must be a mapping")
+    estimator_fields = (
+        "position_std",
+        "velocity_std",
+        "jerk_std",
+        "initial_position_std",
+        "initial_velocity_std",
+        "initial_acceleration_std",
+        "max_gap_s",
+    )
+    estimator_unknown = sorted(set(estimator_values) - set(estimator_fields))
+    if estimator_unknown:
+        raise ValueError(
+            "Unknown target_generation.state_estimator options: "
+            f"{estimator_unknown}"
+        )
+    # Construct once here so invalid estimator parameters fail during config
+    # loading rather than after the dataset has been decoded.
+    estimator_config = KalmanRTSConfig(**estimator_values)
+    state_estimator = {
+        name: getattr(estimator_config, name)
+        for name in estimator_fields
+    }
+
     return {
         "enabled": True,
         "method": method,
@@ -90,6 +127,7 @@ def normalize_tau_other_target_generation(config: Mapping[str, Any]) -> dict[str
         "source_keys": normalized_sources,
         "dq_sign": dq_sign,
         "torque_filter_key": str(raw.get("torque_filter_key", "tau")),
+        "state_estimator": state_estimator,
     }
 
 
@@ -111,7 +149,7 @@ def resolve_tau_other_target_generation(
     )
     if bool(filter_spec.get("enabled", False)) and operations:
         raise ValueError(
-            "gravity tau_other target generation requires measured "
+            "tau_other target generation requires measured "
             "observation.torque without a dataloader torque filter"
         )
     physics = config.get("physics") or {}
@@ -131,8 +169,26 @@ def resolve_tau_other_target_generation(
         "torque_filter_operations": operations,
         "pinocchio": dict(pinocchio),
         "measured_tau_source": measured_tau_source,
-        "ddq_source": "unused",
-        "residual_formula": "tau_other=tau_measured-tau_g",
+        "state_estimator_contract": (
+            "causal_q_dq_kalman_forward_filter"
+            if normalized.get("method") == "causal_rnea_residual_v1"
+            else "not_used"
+        ),
+        "ddq_source": (
+            "causal_state_estimator(q,dq)"
+            if normalized.get("method") == "causal_rnea_residual_v1"
+            else "unused"
+        ),
+        "inverse_dynamics": (
+            "RNEA(q,dq,ddq;urdf)"
+            if normalized.get("method") == "causal_rnea_residual_v1"
+            else "gravity_torque(q)"
+        ),
+        "residual_formula": (
+            "tau_other=tau_measured-tau_id"
+            if normalized.get("method") == "causal_rnea_residual_v1"
+            else "tau_other=tau_measured-tau_g"
+        ),
     }
 
 
@@ -154,7 +210,7 @@ def build_causal_tau_other_target(
     target_config: Mapping[str, Any],
     dynamics: Any,
 ) -> TauOtherTargetBuildResult:
-    """Derive episode-local residual labels from measured torque and dynamics."""
+    """Build causal RNEA residual labels independently inside each episode."""
 
     q_np = torch.as_tensor(q).detach().cpu().to(torch.float64).numpy()
     dq_np = torch.as_tensor(dq).detach().cpu().to(torch.float64).numpy()
@@ -183,7 +239,10 @@ def build_causal_tau_other_target(
     dq_corrected = dq_np * dq_sign[None, :]
     tau_other = np.empty_like(tau_np)
     ddq = np.zeros_like(q_np)
-    tau_g_all = np.empty_like(tau_np)
+    tau_id_all = np.empty_like(tau_np)
+    dq_output = dq_corrected.copy()
+    use_causal_rnea = target_config.get("method") == "causal_rnea_residual_v1"
+    estimator_config = KalmanRTSConfig(**target_config["state_estimator"])
 
     covered = np.zeros(len(q_np), dtype=bool)
     for episode in episodes:
@@ -196,17 +255,26 @@ def build_causal_tau_other_target(
             )
         if covered[start:stop].any():
             raise ValueError("episode metadata overlaps during target generation")
-        tau_g = (
-            dynamics.gravity_torque(
-                torch.as_tensor(q_np[start:stop], dtype=torch.float64)
+        if use_causal_rnea:
+            estimate = estimate_joint_states_causal(
+                timestamps_s[start:stop],
+                q_np[start:stop],
+                dq_corrected[start:stop],
+                estimator_config,
             )
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float64)
-        )
-        tau_other[start:stop] = tau_np[start:stop] - tau_g
-        tau_g_all[start:stop] = tau_g
+            ddq[start:stop] = estimate.ddq_filtered
+            dq_output[start:stop] = estimate.dq_filtered
+            tau_id = dynamics.inverse_dynamics(
+                torch.as_tensor(q_np[start:stop], dtype=torch.float64),
+                torch.as_tensor(estimate.dq_filtered, dtype=torch.float64),
+                torch.as_tensor(estimate.ddq_filtered, dtype=torch.float64),
+            ).detach().cpu().numpy().astype(np.float64)
+        else:
+            tau_id = dynamics.gravity_torque(
+                torch.as_tensor(q_np[start:stop], dtype=torch.float64)
+            ).detach().cpu().numpy().astype(np.float64)
+        tau_other[start:stop] = tau_np[start:stop] - tau_id
+        tau_id_all[start:stop] = tau_id
         covered[start:stop] = True
 
     if not covered.all():
@@ -214,7 +282,7 @@ def build_causal_tau_other_target(
         raise ValueError(f"episode metadata leaves {missing} frames uncovered")
     return TauOtherTargetBuildResult(
         tau_other=torch.as_tensor(tau_other, dtype=torch.float32),
-        dq=torch.as_tensor(dq_corrected, dtype=torch.float32),
+        dq=torch.as_tensor(dq_output, dtype=torch.float32),
         ddq=torch.as_tensor(ddq, dtype=torch.float32),
-        tau_g=torch.as_tensor(tau_g_all, dtype=torch.float32),
+        tau_id=torch.as_tensor(tau_id_all, dtype=torch.float32),
     )

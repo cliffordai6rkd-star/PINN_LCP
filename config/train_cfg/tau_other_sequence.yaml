@@ -1,3 +1,39 @@
+deployment_contract:
+  version: tau_other_online_v1
+
+  controller:
+    firmware: V120
+    follower_kp: [4.0, 5.0, 2.0, 3.5, 2.0, 2.0, 3.0]
+    follower_kd: [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]
+
+  source_preprocessing:
+    source_sample_rate_hz: 100.0
+
+    filter:
+      contract: causal_variable_dt_butterworth_lowpass_v1
+      enabled: true
+      keys: [q, dq, tau, q_cmd]
+      cutoff_hz: 15.0
+      order: 2
+      discretization: trapezoidal_tustin
+      initialization: steady_first_sample
+
+    downsample:
+      mode: index_stride
+      stride: 2
+      phase: 0
+      output_sample_rate_hz: 50.0
+
+    derived_features:
+      delta_q: filtered_q_cmd-filtered_q
+
+  model:
+    horizon: 50
+    inputs: [q, dq, delta_q]
+    target: tau_other
+    target_formula: tau_other=tau_filtered-tau_id
+
+
 dataloader:
   repo_id: bg_data_filted_a_lbv3
   root: data/train_episode/bg_data_filted_a_lbv3
@@ -22,8 +58,7 @@ dataloader:
     - q
     - dq
     - delta_q
-    # - tau_id
-    # - tau
+    - tau
     - tau_other
 
   # tau is observation.torque; tau_other uses it directly on the dataset's
@@ -46,13 +81,23 @@ dataloader:
 # mini-batch sampling. This resolved contract is also stored in every checkpoint.
 target_generation:
   enabled: true
-  method: causal_gravity_residual_v1
+  method: causal_rnea_residual_v1
   target_key: tau_other
   timestamp_key: timestamp
   timestamp_unit: s
   source_keys: {q: q, dq: dq, tau: tau}
   dq_sign: [1, 1, 1, 1, 1, 1, 1]
   torque_filter_key: tau
+  # Forward-only q/dq state estimator. Its causal ddq estimate is passed to
+  # Pinocchio RNEA; no future frames or RTS backward smoothing are used.
+  state_estimator:
+    position_std: 5.0e-4
+    velocity_std: 3.0e-2
+    jerk_std: 2.0
+    initial_position_std: 1.0e-2
+    initial_velocity_std: 2.0e-1
+    initial_acceleration_std: 5.0
+    max_gap_s: 0.1
 
 model:
   # Every sample is an independent 50-frame q/dq/delta_q window.
@@ -66,16 +111,18 @@ model:
     - q
     - dq
     - delta_q
+    - tau
 
 
   input_dims:
     q: 7
-    dq: 7
+    dq: 7 
+    tau: 7
     delta_q: 7
 
   output_dim: 7
   target_key: tau_other
-  target_contract: causal_gravity_residual_v1
+  target_contract: causal_rnea_residual_v1
 
 
   hidden_dim: 128
@@ -94,7 +141,7 @@ loss:
   # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
   joint_weights: [1, 1, 1, 1, 1, 1, 1]
 
-# Offline visualization replays observation.torque-tau_g before mapping tau_ext
+# Offline visualization replays observation.torque-tau_id before mapping tau_ext
 # to the gripper-frame wrench.
 rollout:
   measured_tau_already_filtered: true
@@ -142,7 +189,7 @@ train:
     warmup_epochs: 10
     min_delta: 1.0e-5
 
-  output_dir: outputs/tau_other_sequence/ep2_h50
+  output_dir: outputs/tau_other_sequence/ep4
   monitor_key: val_loss
   top_k: 5
 

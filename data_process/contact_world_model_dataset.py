@@ -330,6 +330,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         self.raw_idx_to_episode = {}
         self._build_valid_indices()
         self.importance_weight_by_sample_index = {}
+        self._materialized_samples = None
 
         self.normalize_mode = self.data_config.get("normalize_mode", "gaussian")
         self.normalize_lowdim_keys = list(
@@ -342,6 +343,83 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         self.is_normalize = normalizer is not None
         if compute_normalizer:
             self.fit_normalizer(range(len(self.valid_indices)))
+
+    def to_device(self, device):
+        """Move the decoded dataset tensors to ``device``.
+
+        This is intended for single-process GPU-resident training.  Metadata
+        (episode dictionaries and sample-index lists) remains on the CPU,
+        while all tensors used to construct a sample are moved together.
+        """
+        device = torch.device(device)
+        self.high_tensors = {
+            key: value.to(device=device, non_blocking=False)
+            for key, value in self.high_tensors.items()
+        }
+        for name in (
+            "high_timestamps",
+            "anchor_timestamps",
+            "action_indices",
+            "action_anchor_timestamps",
+            "contact",
+        ):
+            value = getattr(self, name, None)
+            if torch.is_tensor(value):
+                setattr(self, name, value.to(device=device, non_blocking=False))
+        for table in getattr(self, "_action_tables", {}).values():
+            for key, value in tuple(table.items()):
+                if torch.is_tensor(value):
+                    table[key] = value.to(device=device, non_blocking=False)
+        # LeRobot's Arrow-backed source dataset is only needed while decoding
+        # the columns.  Drop those references after materialization so the
+        # host-side cache can be reclaimed instead of remaining alongside the
+        # GPU copy.
+        if self.backend == "lerobot":
+            self.source_datasets = []
+            self.source_dataset = SimpleNamespace(
+                meta=SimpleNamespace(episodes=self.episodes)
+            )
+            self.stats_dataset = None
+            import gc
+
+            gc.collect()
+        self._device = device
+        return self
+
+    def materialize_samples_on_device(self):
+        """Pre-build every sample once, then serve cheap tensor slices.
+
+        GPU-resident raw tensors combined with a normal DataLoader still call
+        ``__getitem__`` once per sample.  That path contains many tiny GPU
+        indexing kernels and scalar synchronizations.  For the small WM
+        datasets this cache trades some VRAM for much higher throughput.
+        Random action augmentation is intentionally excluded because it must
+        be regenerated on every access.
+        """
+        if self._materialized_samples is not None:
+            return self
+        if not hasattr(self, "_device") or self._device.type != "cuda":
+            raise RuntimeError("sample materialization requires a GPU-resident dataset")
+        if self.action_augmentation_enabled:
+            raise RuntimeError(
+                "cannot materialize samples while action augmentation is enabled"
+            )
+        samples = [self._build_sample(high_idx) for high_idx in self.valid_indices]
+        if not samples:
+            raise ValueError("cannot materialize an empty dataset")
+        keys = tuple(samples[0])
+        self._materialized_samples = {
+            key: torch.stack([sample[key] for sample in samples], dim=0)
+            for key in keys
+        }
+        return self
+
+    @staticmethod
+    def batch_collate(data):
+        """Collate function for ``__getitems__``'s already-batched mapping."""
+        if isinstance(data, dict):
+            return data
+        return torch.utils.data.default_collate(data)
 
     def _validate_config(self):
         positive = {
@@ -903,6 +981,11 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             columns["__h5_timestamp_ns"], dtype=torch.int64
         ).reshape(-1).contiguous()
 
+        # ``columns`` is also held by DirectH5EpisodeDataset.hf_dataset.
+        # The training dataset uses the materialized tensors above directly,
+        # so release that duplicate owner before optionally moving them to GPU.
+        direct.hf_dataset = None
+
         h5py = load_h5py()
         anchor_scale_to_ns = timestamp_scale_to_seconds(
             anchor_timestamp_unit
@@ -965,7 +1048,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         self.action_indices = None
         self.action_anchor_timestamps = None
         self.source_dataset = direct
-        self.stats_dataset = direct.hf_dataset
+        self.stats_dataset = None
         return high_tensors, high_ts, anchor_ts, episodes
 
     def _build_virtual_episodes(self):
@@ -1048,7 +1131,12 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             return None
         current_index = int(self.action_indices[int(high_idx)])
         positions = torch.searchsorted(
-            table["indices"], torch.tensor(current_index, dtype=torch.long)
+            table["indices"],
+            torch.tensor(
+                current_index,
+                dtype=torch.long,
+                device=table["indices"].device,
+            ),
         )
         if int(positions) >= table["indices"].numel() or int(table["indices"][positions]) != current_index:
             raise IndexError("state row refers to an unknown action index")
@@ -1060,7 +1148,13 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             desired_time = int(table["times"][start_position]) + self.inference_delay_ns
             start_position = int(
                 torch.searchsorted(
-                    table["times"], torch.tensor(desired_time, dtype=torch.int64), right=False
+                    table["times"],
+                    torch.tensor(
+                        desired_time,
+                        dtype=torch.int64,
+                        device=table["times"].device,
+                    ),
+                    right=False,
                 )
             )
         end_position = start_position + self.action_condition_horizon
@@ -1076,7 +1170,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             "condition_abs": chunk,
             "condition": chunk.clone(),
             "condition_mask": torch.ones(
-                self.action_condition_horizon, dtype=torch.float32
+                self.action_condition_horizon,
+                dtype=torch.float32,
+                device=self.high_tensors["action"].device,
             ),
             "action_index": table["indices"][start_position:end_position],
         }
@@ -1096,7 +1192,10 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
 
         end = int(episode["dataset_to_index"])
         state_indices = torch.arange(
-            int(high_idx), int(high_idx) + horizon, dtype=torch.long
+            int(high_idx),
+            int(high_idx) + horizon,
+            dtype=torch.long,
+            device=self.high_timestamps.device,
         )
         if int(state_indices[-1]) >= end:
             raise IndexError("action rollout crosses the episode boundary")
@@ -1128,7 +1227,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 raise IndexError("future action chunk crosses the available action table")
 
         token_offsets = torch.arange(
-            self.action_condition_horizon, dtype=torch.long
+            self.action_condition_horizon,
+            dtype=torch.long,
+            device=table["indices"].device,
         )
         chunk_positions = starts[:, None] + token_offsets[None, :]
         if torch.any(chunk_positions >= table["indices"].numel()):
@@ -1146,7 +1247,10 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             return None
         end = int(episode["dataset_to_index"])
         state_indices = torch.arange(
-            int(high_idx), int(high_idx) + horizon, dtype=torch.long
+            int(high_idx),
+            int(high_idx) + horizon,
+            dtype=torch.long,
+            device=self.high_timestamps.device,
         )
         if int(state_indices[-1]) >= end:
             raise IndexError("action rollout crosses the episode boundary")
@@ -1180,7 +1284,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                         "future action chunk crosses the available action table"
                     )
             token_offsets = torch.arange(
-                self.action_condition_horizon, dtype=torch.long
+                self.action_condition_horizon,
+                dtype=torch.long,
+                device=table["indices"].device,
             )
             chunk_positions = starts[:, None] + token_offsets[None, :]
             if torch.any(chunk_positions >= table["indices"].numel()):
@@ -1262,7 +1368,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         start = int(episode["dataset_from_index"])
         end = int(episode["dataset_to_index"])
         source_times = self.high_timestamps[start:end]
-        times = torch.as_tensor(times, dtype=torch.int64)
+        times = torch.as_tensor(
+            times, dtype=torch.int64, device=source_times.device
+        )
         right = torch.searchsorted(source_times, times, right=False)
         right = right.clamp(0, source_times.numel() - 1)
         left = (right - 1).clamp(0, source_times.numel() - 1)
@@ -1321,7 +1429,11 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 current_position = int(
                     torch.searchsorted(
                         anchors,
-                        torch.tensor(desired_time, dtype=torch.int64),
+                        torch.tensor(
+                            desired_time,
+                            dtype=torch.int64,
+                            device=anchors.device,
+                        ),
                         right=False,
                     )
                 )
@@ -1337,17 +1449,24 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 "condition_abs": action_chunk,
                 "condition": action_chunk.clone(),
                 "condition_mask": torch.ones(
-                    self.action_condition_horizon, dtype=torch.float32
+                    self.action_condition_horizon,
+                    dtype=torch.float32,
+                    device=self.high_tensors["action"].device,
                 ),
                 "action_index": torch.arange(
                     current_position,
                     end_position,
                     dtype=torch.long,
+                    device=anchors.device,
                 ),
             }
 
         refresh_time = self._refresh_time(high_idx, episode)
-        target_times = torch.arange(self.action_condition_horizon, dtype=torch.int64)
+        target_times = torch.arange(
+            self.action_condition_horizon,
+            dtype=torch.int64,
+            device=self.high_timestamps.device,
+        )
         target_times = (
             refresh_time
             + self.inference_delay_ns
@@ -1358,7 +1477,11 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         action_chunk = self._sample_action_values(target_times, episode)
         condition_abs = action_chunk
         condition = action_chunk.clone()
-        mask = torch.ones(self.action_condition_horizon, dtype=torch.bool)
+        mask = torch.ones(
+            self.action_condition_horizon,
+            dtype=torch.bool,
+            device=self.high_timestamps.device,
+        )
         return {
             "refresh_time": target_times[0],
             "target_times": target_times,
@@ -1367,7 +1490,10 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             "condition": condition,
             "condition_mask": mask.to(dtype=torch.float32),
             "action_index": torch.full(
-                (self.action_condition_horizon,), -1, dtype=torch.long
+                (self.action_condition_horizon,),
+                -1,
+                dtype=torch.long,
+                device=self.high_timestamps.device,
             ),
         }
 
@@ -1458,7 +1584,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             raise ValueError("cannot fit normalizer with no samples")
         stats = {}
         covered = torch.as_tensor(
-            self.covered_raw_indices(sample_indices), dtype=torch.long
+            self.covered_raw_indices(sample_indices),
+            dtype=torch.long,
+            device=next(iter(self.high_tensors.values())).device,
         )
         for key in self.normalize_lowdim_keys:
             if key == "action":
@@ -1508,10 +1636,16 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         start = int(episode["dataset_from_index"])
         end = int(episode["dataset_to_index"])
         history = torch.arange(
-            high_idx - self.history_horizon + 1, high_idx + 1, dtype=torch.long
+            high_idx - self.history_horizon + 1,
+            high_idx + 1,
+            dtype=torch.long,
+            device=self.high_timestamps.device,
         ).clamp_min(start)
         future = torch.arange(
-            high_idx + 1, high_idx + self.future_horizon + 1, dtype=torch.long
+            high_idx + 1,
+            high_idx + self.future_horizon + 1,
+            dtype=torch.long,
+            device=self.high_timestamps.device,
         )
         if self.pad_future:
             future = future.clamp_max(end - 1)
@@ -1519,10 +1653,13 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             raise IndexError("future window crosses episode boundary")
 
         action = self._action_for_anchor(high_idx, episode)
+        sample_device = self.high_timestamps.device
         sample = {
-            "sample_idx": torch.tensor(high_idx, dtype=torch.long),
+            "sample_idx": torch.tensor(high_idx, dtype=torch.long, device=sample_device),
             "task_index": torch.tensor(
-                int(episode.get("source_index", 0)), dtype=torch.long
+                int(episode.get("source_index", 0)),
+                dtype=torch.long,
+                device=sample_device,
             ),
             "history_indices": history,
             "future_indices": future,
@@ -1553,6 +1690,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 self.action_rollout_horizon,
                 self.configured_action_condition_horizon,
                 dtype=torch.float32,
+                device=sample_device,
             )
         for key, values in self.high_tensors.items():
             if key in {"action", "tau_ext"}:
@@ -1563,13 +1701,16 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         sample["contact_future"] = self.contact.index_select(0, future)
         sample["contact"] = self.contact.index_select(0, history)
         sample["future_phase"] = torch.tensor(
-            self.future_contact_phase(high_idx), dtype=torch.long
+            self.future_contact_phase(high_idx),
+            dtype=torch.long,
+            device=sample_device,
         )
         sample["importance_weight"] = torch.tensor(
             self.importance_weight_by_sample_index.get(
                 high_idx, 1.0
             ),
             dtype=torch.float32,
+            device=sample_device,
         )
         for key in self.normalize_lowdim_keys:
             source_key = (
@@ -1593,7 +1734,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                         (),
                     ).item()
                 )
-                indices = torch.arange(action_value.shape[0]) + shift
+                indices = torch.arange(
+                    action_value.shape[0], device=action_value.device
+                ) + shift
                 indices = indices.clamp(0, action_value.shape[0] - 1)
                 action_value = action_value.index_select(0, indices)
             if self.action_gaussian_std:
@@ -1602,5 +1745,25 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         return sample
 
     def __getitem__(self, index):
+        if self._materialized_samples is not None:
+            position = int(index)
+            return {
+                key: values[position]
+                for key, values in self._materialized_samples.items()
+            }
         high_idx = self.valid_indices[int(index)]
         return self._build_sample(high_idx)
+
+    def __getitems__(self, indices):
+        """Fetch a whole DataLoader batch with one indexing operation per key."""
+        if self._materialized_samples is None:
+            return [self[index] for index in indices]
+        positions = torch.as_tensor(
+            indices,
+            dtype=torch.long,
+            device=next(iter(self._materialized_samples.values())).device,
+        )
+        return {
+            key: values.index_select(0, positions)
+            for key, values in self._materialized_samples.items()
+        }

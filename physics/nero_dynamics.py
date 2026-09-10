@@ -735,9 +735,9 @@ def load_tau_other_predictor(
         target_generation = config.get("target_generation") or {}
     target_generation_method = None
     if bool(target_generation.get("enabled", False)):
-        target_generation_method = str(
-            target_generation.get("method", "causal_gravity_residual_v1")
-        ).lower()
+            target_generation_method = str(
+                target_generation.get("method", "causal_rnea_residual_v1")
+            ).lower()
     predictor = FrozenTauOtherPredictor(
         model,
         normalizer_payload=normalizer_payload,

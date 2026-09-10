@@ -152,6 +152,12 @@ class BaseTrainer:
         self.current_split_metadata = None
 
         self.batch_size = int(self.train_config.get("batch_size", 64))
+        # Keep the decoded dataset tensors on the training device.  CUDA
+        # tensors cannot be safely produced by multiprocessing DataLoader
+        # workers, so setup() forces a single-process loader when enabled.
+        self.dataset_on_device = bool(
+            self.train_config.get("dataset_on_device", False)
+        )
         self.num_workers = int(self.train_config.get("num_workers", 4))
         if self.num_workers < 0:
             raise ValueError("train.num_workers must be non-negative")
@@ -1295,6 +1301,25 @@ class BaseTrainer:
         self.set_seed()
         self.dataset = self.build_dataset()
 
+        if self.dataset_on_device:
+            if torch.device(self.device).type != "cuda":
+                raise ValueError("train.dataset_on_device requires a CUDA device")
+            if not hasattr(self.dataset, "to_device"):
+                raise TypeError(
+                    "train.dataset_on_device is enabled but the dataset does not "
+                    "implement to_device()"
+                )
+            log.info("moving decoded dataset tensors to %s", self.device)
+            self.dataset.to_device(self.device)
+            # CUDA tensors must stay in the main process.  Disable pinned
+            # memory and worker prefetching because samples are already on GPU.
+            self.num_workers = 0
+            self.val_num_workers = 0
+            self.pin_memory = False
+            self.val_pin_memory = False
+            self.persistent_workers = False
+            self.val_persistent_workers = False
+
         if (
             self.val_ratio > 0
             or self.split_mode == "purged_kfold"
@@ -1331,22 +1356,30 @@ class BaseTrainer:
         self.fit_dataset_normalizer(train_dataset)
 
         train_sampler = self.build_train_sampler(train_dataset)
+        if self.dataset_on_device and hasattr(self.dataset, "materialize_samples_on_device"):
+            log.info("materializing %d GPU training samples", len(self.dataset))
+            self.dataset.materialize_samples_on_device()
         train_loader_kwargs = self._dataloader_kwargs(shuffle=train_sampler is None)
+        if self.dataset_on_device and hasattr(self.dataset, "batch_collate"):
+            train_loader_kwargs["collate_fn"] = self.dataset.batch_collate
         if train_sampler is not None:
             train_loader_kwargs.pop("shuffle", None)
             train_loader_kwargs["sampler"] = train_sampler
         self.loader = torch.utils.data.DataLoader(train_dataset, **train_loader_kwargs)
 
         if val_dataset is not None:
+            val_loader_kwargs = self._dataloader_kwargs(
+                shuffle=False,
+                num_workers=self.val_num_workers,
+                prefetch_factor=self.val_prefetch_factor,
+                pin_memory=self.val_pin_memory,
+                persistent_workers=self.val_persistent_workers,
+            )
+            if self.dataset_on_device and hasattr(self.dataset, "batch_collate"):
+                val_loader_kwargs["collate_fn"] = self.dataset.batch_collate
             self.val_loader = torch.utils.data.DataLoader(
                 val_dataset,
-                **self._dataloader_kwargs(
-                    shuffle=False,
-                    num_workers=self.val_num_workers,
-                    prefetch_factor=self.val_prefetch_factor,
-                    pin_memory=self.val_pin_memory,
-                    persistent_workers=self.val_persistent_workers,
-                ),
+                **val_loader_kwargs,
             )
 
         if self.step_based_training:

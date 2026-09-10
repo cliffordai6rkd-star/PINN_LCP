@@ -130,6 +130,40 @@ def test_gravity_target_generation_uses_rnea_g_of_q_only():
     assert resolved["residual_formula"] == "tau_other=tau_measured-tau_g"
 
 
+def test_causal_rnea_target_uses_estimated_dq_ddq_and_full_inverse_dynamics():
+    config = target_generation_config()
+    config["target_generation"]["method"] = "causal_rnea_residual_v1"
+    config["target_generation"]["dq_sign"] = [1, 1]
+    resolved = resolve_tau_other_target_generation(config, {})
+    timestamps = np.arange(20, dtype=np.float64) * 0.02
+    q = torch.stack(
+        (torch.linspace(0.0, 1.0, 20) ** 2, torch.linspace(0.0, 0.5, 20)),
+        dim=-1,
+    )
+    dq = torch.stack(
+        (torch.linspace(0.0, 2.0, 20), torch.full((20,), 0.5)),
+        dim=-1,
+    )
+    tau = torch.full_like(q, 20.0)
+
+    result = build_causal_tau_other_target(
+        timestamps_s=timestamps,
+        q=q,
+        dq=dq,
+        tau_measured=tau,
+        episodes=[{"dataset_from_index": 0, "dataset_to_index": 20}],
+        target_config=resolved,
+        dynamics=FakeDynamics(),
+    )
+
+    expected_tau_id = q + 2.0 * result.dq + 3.0 * result.ddq
+    torch.testing.assert_close(result.tau_id, expected_tau_id)
+    torch.testing.assert_close(result.tau_other, tau - expected_tau_id)
+    assert torch.count_nonzero(result.ddq).item() > 0
+    assert resolved["ddq_source"] == "causal_state_estimator(q,dq)"
+    assert resolved["residual_formula"] == "tau_other=tau_measured-tau_id"
+
+
 def test_timestamp_units_and_tau_input_leakage_contract():
     normalized = normalize_tau_other_target_generation(target_generation_config())
     timestamps = timestamps_to_seconds(torch.tensor([0, 10_000, 20_000]), "us")

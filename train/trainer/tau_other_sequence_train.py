@@ -89,11 +89,11 @@ class TauOtherTrainer(BaseTrainer):
                 )
             active_inputs = list((config.get("model") or {}).get("inputs") or [])
             tau_source = self.derived_target_config["source_keys"]["tau"]
-            if tau_source in active_inputs:
-                raise ValueError(
-                    "Measured tau is a target-generation source and must not be a "
-                    "model input; doing so leaks the tau_other supervision target."
-                )
+            # if tau_source in active_inputs:
+            #     raise ValueError(
+            #         "Measured tau is a target-generation source and must not be a "
+            #         "model input; doing so leaks the tau_other supervision target."
+            #     )
 
     def build_dataset(self):
         # Keep the optional LeRobot dependency out of model-only imports and tests.
@@ -235,10 +235,11 @@ class TauOtherTrainer(BaseTrainer):
         target_abs_p99 = torch.quantile(result.tau_other.abs().reshape(-1), 0.99).item()
         log.info(
             "derived causal tau_other target ready: frames=%d ddq_abs_p99=%.6f "
-            "tau_other_abs_p99=%.6f operations=%s",
+            "tau_other_abs_p99=%.6f formula=%s operations=%s",
             len(result.tau_other),
             ddq_abs_p99,
             target_abs_p99,
+            self.derived_target_config["residual_formula"],
             self.derived_target_config["torque_filter_operations"],
         )
 

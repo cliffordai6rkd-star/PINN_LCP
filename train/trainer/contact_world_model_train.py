@@ -316,7 +316,12 @@ class ContactWorldModelTrainer(BaseTrainer):
         if self.loss_calculator.contact_class_weights_is_auto:
             frame_indices = self.dataset.covered_raw_indices(sample_indices)
             labels = self.dataset.contact.index_select(
-                0, torch.as_tensor(frame_indices, dtype=torch.long)
+                0,
+                torch.as_tensor(
+                    frame_indices,
+                    dtype=torch.long,
+                    device=self.dataset.contact.device,
+                ),
             ).reshape(-1).round().to(dtype=torch.long)
             class_count = self.loss_calculator.contact_state_count
             counts = torch.bincount(labels, minlength=class_count).to(dtype=torch.float64)
