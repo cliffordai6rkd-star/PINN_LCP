@@ -1,0 +1,36 @@
+# Configuration overlay for the standalone CaRS-WM Flow distillation trainer.
+#
+# The launcher renders this overlay on top of the ``config`` mapping embedded
+# in the selected Teacher checkpoint.  Keeping data/model/filter fields in the
+# checkpoint is intentional: a Student must use the exact Teacher contract.
+
+distillation:
+  enabled: true
+  teacher_checkpoint_path: ""
+  teacher_steps: 32
+  # Set to 8 for S8, then 4 for S4 (S4 is still supervised by the T32 Teacher).
+  student_steps: 8
+  local_weight: 1.0
+  terminal_weight: 1.0
+  # Probability of selecting a Student intermediate as the local-supervision
+  # start point.  It is linearly increased from 0 to this value over the first
+  # 5000 optimizer updates.
+  student_start_probability_max: 0.5
+  student_start_probability_warmup_steps: 5000
+  # Contact labels remain available for sampling and grouped validation, but no
+  # contact KL term is added to the distillation objective.
+  contact_distill_weight: 0.0
+
+train:
+  # Distillation uses the same optimizer/EMA implementation as Teacher runs.
+  lr: 0.00003
+  ema:
+    enabled: true
+    decay: 0.999
+    update_after_step: 0
+    update_every: 1
+    use_for_validation: true
+  max_optimizer_steps: 100000
+  checkpoint_every_steps: 10000
+  output_dir: outputs/contact_world_model_distill
+
