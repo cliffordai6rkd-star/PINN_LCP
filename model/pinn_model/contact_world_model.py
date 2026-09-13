@@ -13,6 +13,16 @@ SUPPORTED_STATE_STREAMS = ("q", "dq", "delta_q", "tau")
 PREDICTED_STATE_STREAMS = SUPPORTED_STATE_STREAMS
 
 
+def _npu_legacy_attention(device: torch.device) -> bool:
+    """Use the non-SDPA attention path on Ascend NPU.
+
+    Current torch_npu releases can fail when fused SDPA receives tensors with
+    different internal formats (``can not cast format when output is input``).
+    Requesting attention weights forces PyTorch's compatible bmm/softmax path.
+    """
+    return torch.device(device).type == "npu"
+
+
 class PhysicalTimeEmbedding(nn.Module):
     """Embed elapsed physical seconds instead of a token index."""
 
@@ -103,15 +113,18 @@ class FlowDecoderBlock(nn.Module):
     def forward(self, trajectory, memory, memory_padding_mask=None):
         normalized = self.self_norm(trajectory)
         attended, _ = self.self_attention(
-            query=normalized, key=normalized, value=normalized, need_weights=False
+            query=normalized.contiguous(),
+            key=normalized.contiguous(),
+            value=normalized.contiguous(),
+            need_weights=_npu_legacy_attention(normalized.device),
         )
         trajectory = trajectory + self.dropout(attended)
         attended, _ = self.condition_attention(
-            query=self.condition_norm(trajectory),
-            key=memory,
-            value=memory,
+            query=self.condition_norm(trajectory).contiguous(),
+            key=memory.contiguous(),
+            value=memory.contiguous(),
             key_padding_mask=memory_padding_mask,
-            need_weights=False,
+            need_weights=_npu_legacy_attention(trajectory.device),
         )
         trajectory = trajectory + self.dropout(attended)
         return trajectory + self.dropout(self.ffn(self.ffn_norm(trajectory)))
@@ -140,11 +153,11 @@ class StateToActionBlock(nn.Module):
         if action_valid is not None:
             key_padding_mask = ~action_valid
         attended, _ = self.cross_attention(
-            query=self.query_norm(state_tokens),
-            key=action_tokens,
-            value=action_tokens,
+            query=self.query_norm(state_tokens).contiguous(),
+            key=action_tokens.contiguous(),
+            value=action_tokens.contiguous(),
             key_padding_mask=key_padding_mask,
-            need_weights=False,
+            need_weights=_npu_legacy_attention(state_tokens.device),
         )
         fused = state_tokens + self.dropout(attended)
         return fused + self.dropout(self.ffn(self.ffn_norm(fused)))
@@ -699,10 +712,10 @@ class ContactWorldModel(nn.Module):
                     encoded.shape[0], -1, -1
                 )
                 pooled, _ = self.state_pool_attention(
-                    query=query,
-                    key=encoded,
-                    value=encoded,
-                    need_weights=False,
+                    query=query.contiguous(),
+                    key=encoded.contiguous(),
+                    value=encoded.contiguous(),
+                    need_weights=_npu_legacy_attention(encoded.device),
                 )
                 token = pooled[:, 0]
             token = token + self.modality_embeddings[key]
@@ -716,7 +729,9 @@ class ContactWorldModel(nn.Module):
         state_tokens = self.state_token_norm(state_features)
         action_tokens = self.action_token_norm(action_features)
         state_action_tokens = self.state_to_action_attention(
-            state_tokens, action_tokens, valid_action
+            state_tokens,
+            action_tokens,
+            valid_action if self.use_action_padding_mask else None,
         )
         condition_memory = torch.cat((state_action_tokens, action_tokens), dim=1)
         memory_padding_mask = None
