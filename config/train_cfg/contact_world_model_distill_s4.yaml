@@ -1,0 +1,18 @@
+# S4 is initialized from a completed S8 EMA run, while supervision remains
+# the original T32 teacher.  Set teacher_checkpoint_path to the S8 EMA file.
+distillation:
+  teacher_checkpoint_path: outputs/contact_world_model/checkpoints/epoch_032.pt
+  student_init_checkpoint_path: outputs/contact_world_model_distill_s8/checkpoints/epoch_020.pt
+  teacher_steps: 32
+  student_steps: 4
+train:
+  device: cuda:0
+  output_dir: outputs/contact_world_model_distill_s4
+  lr: 3.0e-5
+  num_epochs: 20
+  batch_size: 64
+  val_ratio: 0.1
+  ema:
+    enabled: true
+    decay: 0.999
+  monitor_key: val_loss

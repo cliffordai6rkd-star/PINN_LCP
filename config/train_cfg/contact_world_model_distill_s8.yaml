@@ -1,0 +1,17 @@
+# Independent T32 -> S8 distillation.  The teacher checkpoint supplies the
+# model/data/action/normalizer contract; only optimization settings live here.
+distillation:
+  teacher_checkpoint_path: outputs/contact_world_model/checkpoints/epoch_032.pt
+  teacher_steps: 32
+  student_steps: 8
+train:
+  device: cuda:0
+  output_dir: outputs/contact_world_model_distill_s8
+  lr: 3.0e-5
+  num_epochs: 20
+  batch_size: 64
+  val_ratio: 0.1
+  ema:
+    enabled: true
+    decay: 0.999
+  monitor_key: val_loss
