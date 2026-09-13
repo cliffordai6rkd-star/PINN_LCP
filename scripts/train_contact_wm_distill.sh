@@ -15,6 +15,7 @@ STUDENT_STEPS="${STUDENT_STEPS:-8}"
 STUDENT_OUTPUT_DIR="${STUDENT_OUTPUT_DIR:-outputs/contact_world_model_distill_s${STUDENT_STEPS}}"
 DISTILL_TEMPLATE="${DISTILL_TEMPLATE:-config/train_cfg/contact_world_model_distill.yaml}"
 MAX_STEPS="${MAX_STEPS:-}"
+STUDENT_INIT_CHECKPOINT_PATH="${STUDENT_INIT_CHECKPOINT_PATH:-}"
 
 if [[ -z "$TEACHER_CHECKPOINT_PATH" ]]; then
   echo "Set TEACHER_CHECKPOINT_PATH=/path/to/teacher.pt" >&2
@@ -33,11 +34,11 @@ mkdir -p "$STUDENT_OUTPUT_DIR"
 RENDERED_CONFIG="$STUDENT_OUTPUT_DIR/config.yaml"
 
 "$PYTHON_BIN" - "$TEACHER_CHECKPOINT_PATH" "$DISTILL_TEMPLATE" \
-  "$RENDERED_CONFIG" "$STUDENT_OUTPUT_DIR" "$STUDENT_STEPS" "$MAX_STEPS" <<'PY'
+  "$RENDERED_CONFIG" "$STUDENT_OUTPUT_DIR" "$STUDENT_STEPS" "$MAX_STEPS" "$STUDENT_INIT_CHECKPOINT_PATH" <<'PY'
 from pathlib import Path
 import copy, sys, torch, yaml
 
-checkpoint_path, template_path, output_path, output_dir, student_steps, max_steps = sys.argv[1:]
+checkpoint_path, template_path, output_path, output_dir, student_steps, max_steps, student_init = sys.argv[1:]
 checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 teacher_config = checkpoint.get("config")
 if not isinstance(teacher_config, dict):
@@ -61,6 +62,8 @@ distill["enabled"] = True
 distill["teacher_checkpoint_path"] = str(Path(checkpoint_path).expanduser().resolve())
 distill["teacher_steps"] = int(distill.get("teacher_steps", 32))
 distill["student_steps"] = int(student_steps)
+if student_init:
+    distill["student_init_checkpoint_path"] = str(Path(student_init).expanduser().resolve())
 train = config.setdefault("train", {})
 train["output_dir"] = str(Path(output_dir).expanduser().resolve())
 if max_steps:
@@ -70,4 +73,3 @@ PY
 
 PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" train/trainer/contact_world_model_distill_train.py \
   --config "$RENDERED_CONFIG"
-
