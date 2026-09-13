@@ -21,6 +21,7 @@ class ContactWorldModelLoss:
     """Combine flow matching, direct state MSE and contact CE."""
 
     FLOW_STREAM_WEIGHTS = {"q": 1.0, "dq": 1.0, "delta_q": 1.0, "tau": 1.0}
+    CONTACT_LOSS_WEIGHT = 0.1
 
     def __init__(self, config: Mapping):
         self.config = config
@@ -49,7 +50,7 @@ class ContactWorldModelLoss:
         if self.contact_state_count < 2:
             raise ValueError("model.contact_state_count must be at least 2")
         self.normalize_mode = data_config.get("normalize_mode")
-        self.flow_weight = float(loss_config.get("flow_weight", 1.0))
+        self.flow_weight = 1.0
         # Stream weights are part of the fixed objective, not experiment YAML.
         self.flow_q_weight = self.FLOW_STREAM_WEIGHTS["q"]
         self.flow_dq_weight = self.FLOW_STREAM_WEIGHTS["dq"]
@@ -62,7 +63,7 @@ class ContactWorldModelLoss:
         self.dq_weight = float(loss_config.get("dq_weight", 1.0))
         self.delta_q_weight = float(loss_config.get("delta_q_weight", 1.0))
         self.tau_weight = float(loss_config.get("tau_weight", 1.0))
-        self.contact_weight = float(loss_config.get("contact_weight", 1.0))
+        self.contact_weight = self.CONTACT_LOSS_WEIGHT
         endpoint_config = loss_config.get("endpoint_loss") or {}
         self.endpoint_enabled = bool(endpoint_config.get("enabled", True))
         self.endpoint_initial_weight = float(
@@ -467,6 +468,7 @@ class ContactWorldModelLoss:
         return loss.mean(dim=1)
 
     def __call__(self, out, batch):
+        batch = out.get("_prepared_batch", batch)
         flow_prediction = out.get("flow_velocity_pred")
         flow_target = out.get("flow_velocity_target")
         if flow_prediction is None or flow_target is None:
@@ -489,7 +491,8 @@ class ContactWorldModelLoss:
         flow_loss = self._weighted_mean(flow_loss_ps, importance_weight)
         # Flow matching is the sole optimization objective.  Other losses
         # remain available as legacy helpers but are intentionally excluded.
-        total = self.flow_weight * flow_loss
+        contact_loss = self._weighted_mean(contact_loss_ps, importance_weight)
+        total = self.flow_weight * flow_loss + self.contact_weight * contact_loss
         loss_dict = {
             "total_loss": total.detach(),
             "flow_loss": flow_loss.detach(),
@@ -512,7 +515,8 @@ class ContactWorldModelLoss:
             ),
             "tau_free_fraction": free_mask.mean().detach(),
             **{f"{key}_loss": self._weighted_mean(value, importance_weight).detach() for key, value in direct.items()},
-            "contact_loss": contact_loss_ps.mean().detach(),
+            "contact_loss": contact_loss.detach(),
+            "contact_contribution": (self.contact_weight * contact_loss).detach(),
             "importance_weight_mean": (
                 flow_loss.new_tensor(1.0)
                 if importance_weight is None

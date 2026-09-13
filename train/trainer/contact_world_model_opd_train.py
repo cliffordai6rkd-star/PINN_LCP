@@ -386,6 +386,11 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         self.teacher.requires_grad_(False)
         if self.teacher.flow_dim != self.model.flow_dim:
             raise ValueError("Teacher and Student output contracts differ")
+        if self.teacher.future_horizon != self.model.future_horizon:
+            raise ValueError(
+                "Teacher and Student internal prediction horizons differ; "
+                "distillation requires the same downsample setting and physical horizon"
+            )
         log.info(
             "loaded frozen Teacher=%s (%d steps), Student=%d steps",
             checkpoint_path,
@@ -447,6 +452,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             "model.flow_source_mode": (teacher_model.get("flow_source_mode", "gaussian"), student_model.get("flow_source_mode", "gaussian")),
             "dataloader.action_key": (teacher_data.get("action_key"), student_data.get("action_key")),
             "dataloader.action_condition_horizon": (teacher_data.get("action_condition_horizon"), student_data.get("action_condition_horizon")),
+            "train.downsample": ((teacher_config.get("train") or {}).get("downsample", False), (self.config.get("train") or {}).get("downsample", False)),
             # The offset is part of the temporal action contract: changing it
             # from 0 to 1 shifts every condition window by one expert token.
             "dataloader.action_start_offset": (teacher_data.get("action_start_offset", 1), student_data.get("action_start_offset", 1)),
@@ -678,7 +684,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         )
         with context:
             with torch.no_grad():
-                return self.teacher.predict(
+                return self.teacher.predict_differentiable(
                     batch,
                     steps=self.teacher_steps,
                     solver=self.teacher.flow_solver,
@@ -744,8 +750,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             reduction="batchmean",
         ) * (temperature * temperature) / student_logits.shape[1]
         hard_ce = reference.new_zeros(())
-        if "contact_future" in student_batch:
-            labels = student_batch["contact_future"].squeeze(-1).round().long()
+        train_batch = student_out.get("_prepared_batch", student_batch)
+        if "contact_future" in train_batch:
+            labels = train_batch["contact_future"].squeeze(-1).round().long()
             hard_ce = torch.nn.functional.cross_entropy(
                 student_logits.reshape(-1, student_logits.shape[-1]),
                 labels.reshape(-1),

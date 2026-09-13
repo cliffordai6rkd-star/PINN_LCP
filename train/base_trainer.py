@@ -14,6 +14,16 @@ import torch.nn.functional as F
 import yaml
 
 from tqdm.auto import tqdm
+from train.device_backend import (
+    autocast as backend_autocast,
+    device_count as backend_device_count,
+    ensure_npu,
+    get_rng_state_all,
+    is_npu_device,
+    manual_seed_all,
+    set_rng_state_all,
+    grad_scaler,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -72,15 +82,18 @@ class BaseTrainer:
 
         default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.device = self.train_config.get("device", default_device)
-        if str(self.device).startswith("cuda") and not torch.cuda.is_available():
+        device_type = str(self.device).split(":", 1)[0].lower()
+        if device_type == "npu":
+            ensure_npu()
+        if device_type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(
                 "A CUDA device was configured, but torch.cuda.is_available() "
                 "returned False. Check the NVIDIA driver or set train.device=cpu "
                 "for a smoke test."
             )
-        if not (str(self.device).startswith("cuda") or str(self.device) == "cpu"):
+        if device_type not in {"cuda", "npu", "cpu"}:
             raise ValueError(
-                f"train.device must be a CUDA device or cpu, got {self.device!r}."
+                f"train.device must be cuda:*, npu:*, or cpu, got {self.device!r}."
             )
 
         self.val_ratio = float(self.train_config.get("val_ratio", 0.1))
@@ -378,11 +391,11 @@ class BaseTrainer:
                 "train.amp.dtype must be bfloat16/bf16 or float16/fp16"
             )
         self.amp_dtype = amp_dtypes[amp_dtype]
-        if self.amp_enabled and not str(self.device).startswith("cuda"):
-            raise ValueError("train.amp.enabled requires a CUDA device")
+        if self.amp_enabled and device_type not in {"cuda", "npu"}:
+            raise ValueError("train.amp.enabled requires a CUDA or NPU device")
         self.amp_scaler = None
         if self.amp_enabled and self.amp_dtype == torch.float16:
-            self.amp_scaler = torch.amp.GradScaler("cuda")
+            self.amp_scaler = grad_scaler(torch.device(self.device), enabled=True)
 
     def set_seed(self):
         import random
@@ -392,15 +405,15 @@ class BaseTrainer:
         random.seed(self.seed)
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.seed)
+        manual_seed_all(self.seed, str(self.device).split(":", 1)[0].lower())
 
         torch.backends.cudnn.benchmark = self.cudnn_benchmark
         torch.backends.cudnn.deterministic = self.deterministic
         # Match the mixed-precision fast path used by the LeRobot trainer
         # without changing the default behavior of existing configurations.
-        torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
-        torch.backends.cudnn.allow_tf32 = self.allow_tf32
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
+            torch.backends.cudnn.allow_tf32 = self.allow_tf32
         torch.set_float32_matmul_precision("high" if self.allow_tf32 else "highest")
 
     def batch_to_device(self, batch):
@@ -427,10 +440,7 @@ class BaseTrainer:
 
         if enabled is False or not self.amp_enabled:
             return nullcontext()
-        return torch.autocast(
-            device_type="cuda",
-            dtype=self.amp_dtype,
-        )
+        return backend_autocast(torch.device(self.device), True, self.amp_dtype)
 
     def _dataloader_kwargs(
         self,
@@ -696,8 +706,7 @@ class BaseTrainer:
             return latest[0].resolve()
         return max(checkpoint_files, key=filename_key).resolve()
 
-    @staticmethod
-    def _capture_rng_state():
+    def _capture_rng_state(self):
         """Capture process RNG state so a resumed run is reproducible."""
 
         state = {
@@ -710,8 +719,10 @@ class BaseTrainer:
             state["numpy"] = np.random.get_state()
         except ImportError:
             pass
-        if torch.cuda.is_available():
-            state["cuda"] = torch.cuda.get_rng_state_all()
+        device_type = str(self.device).split(":", 1)[0].lower()
+        backend_state = get_rng_state_all(device_type)
+        if backend_state is not None:
+            state[device_type] = backend_state
         return state
 
     @staticmethod
@@ -729,6 +740,8 @@ class BaseTrainer:
                 np.random.set_state(state["numpy"])
             if state.get("cuda") is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(state["cuda"])
+            if state.get("npu") is not None:
+                set_rng_state_all(state["npu"], "npu")
         except (RuntimeError, TypeError, ValueError) as exc:
             log.warning("could not restore checkpoint RNG state: %s", exc)
 
@@ -1305,8 +1318,8 @@ class BaseTrainer:
         self.dataset = self.build_dataset()
 
         if self.dataset_on_device:
-            if torch.device(self.device).type != "cuda":
-                raise ValueError("train.dataset_on_device requires a CUDA device")
+            if torch.device(self.device).type not in {"cuda", "npu"}:
+                raise ValueError("train.dataset_on_device requires a CUDA or NPU device")
             if not hasattr(self.dataset, "to_device"):
                 raise TypeError(
                     "train.dataset_on_device is enabled but the dataset does not "
@@ -1314,7 +1327,7 @@ class BaseTrainer:
                 )
             log.info("moving decoded dataset tensors to %s", self.device)
             self.dataset.to_device(self.device)
-            # CUDA tensors must stay in the main process.  Disable pinned
+            # Accelerator tensors must stay in the main process.  Disable pinned
             # memory and worker prefetching because samples are already on GPU.
             self.num_workers = 0
             self.val_num_workers = 0

@@ -12,12 +12,12 @@ train_data:
     - name: insert_usb
       repo_id: insert_usb_lerobot_v3
       root: ../nero_ws/runs/swm/insert_usb_lerobot_v3
-    - name: push_button
-      repo_id: push_button_lerobot_v3
-      root: ../nero_ws/runs/swm/push_button_lerobot_v3
-    - name: cuccumber_peeling
-      repo_id: cucumber_peeling_lerobot_v3
-      root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
+    # - name: push_button
+    #   repo_id: push_button_lerobot_v3
+    #   root: ../nero_ws/runs/swm/push_button_lerobot_v3
+    # - name: cuccumber_peeling
+    #   repo_id: cucumber_peeling_lerobot_v3
+    #   root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
 
 action_contract:
   semantic: expert_policy_action_target
@@ -216,7 +216,7 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir: outputs/contact_world_model_final_3
+  output_dir: outputs/cwm_insert_usb_50hz
   monitor_key: val_loss
   top_k: 5
   save_latest_checkpoint: true

@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch
+from train.device_backend import device_count as backend_device_count
 import yaml
 
 from data_process.contact_world_model_dataset import ContactWorldModelDataset
@@ -664,7 +665,10 @@ class ContactWorldModelTrainer(BaseTrainer):
         # longer change a visualized anchor across checkpoints.
         from torch.utils.data._utils.collate import default_collate
 
-        devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        device_type = str(self.device).split(":", 1)[0].lower()
+        # torch.random.fork_rng accepts CUDA device indices; NPU RNG is
+        # handled by BaseTrainer checkpoint helpers instead.
+        devices = list(range(backend_device_count(device_type))) if device_type == "cuda" else []
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(self.checkpoint_visualization_seed)
             records = []

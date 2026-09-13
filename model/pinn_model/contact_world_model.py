@@ -173,13 +173,27 @@ class ContactWorldModel(nn.Module):
         self._config = config
         data_config = config.get("dataloader") or {}
         model_config = config.get("model") or {}
-        self.history_horizon = int(data_config.get("state_history_horizon", 50))
-        self.future_horizon = int(data_config.get("prediction_horizon", 40))
-        self.action_condition_horizon = int(data_config.get("action_condition_horizon", 8))
+        train_config = config.get("train") or {}
+        downsample = train_config.get("downsample", False)
+        self.temporal_stride = (2 if downsample is True else 1) if isinstance(downsample, bool) else int(downsample)
+        if self.temporal_stride < 1:
+            raise ValueError("train.downsample must be false/true or a positive integer")
+        self.temporal_downsample = self.temporal_stride > 1
+        self.external_history_horizon = int(data_config.get("state_history_horizon", 50))
+        self.external_future_horizon = int(data_config.get("prediction_horizon", 40))
+        self.external_action_condition_horizon = int(data_config.get("action_condition_horizon", 8))
+        for name, value in (("history", self.external_history_horizon), ("future", self.external_future_horizon), ("action", self.external_action_condition_horizon)):
+            if value % self.temporal_stride:
+                raise ValueError(f"{name} horizon {value} must be divisible by temporal stride {self.temporal_stride}")
+        self.history_horizon = self.external_history_horizon // self.temporal_stride
+        self.future_horizon = self.external_future_horizon // self.temporal_stride
+        self.action_condition_horizon = self.external_action_condition_horizon // self.temporal_stride
         self.joint_dim = int(model_config.get("joint_dim", 7))
         self.action_dim = int(model_config.get("action_dim", 7))
-        self.state_rate_hz = float(data_config.get("high_fps", 100.0))
-        self.action_rate_hz = float(data_config.get("expert_fps", 25.0))
+        self.external_state_rate_hz = float(data_config.get("high_fps", 100.0))
+        self.external_action_rate_hz = float(data_config.get("expert_fps", 25.0))
+        self.state_rate_hz = self.external_state_rate_hz / self.temporal_stride
+        self.action_rate_hz = self.external_action_rate_hz / self.temporal_stride
         self.action_start_offset = int(data_config.get("action_start_offset", 1))
         self.action_time_alignment = str(
             model_config.get("action_time_alignment", "zoh")
@@ -391,7 +405,7 @@ class ContactWorldModel(nn.Module):
             str(contact_config.get("metric", "tau_ext_l1")).lower(), {}
         )
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "model_version": self.MODEL_VERSION,
             "state_contract": "robot_state_streams_v1",
             "architecture": {
@@ -414,6 +428,13 @@ class ContactWorldModel(nn.Module):
             "history_horizon": self.history_horizon,
             "future_horizon": self.future_horizon,
             "action_horizon": self.action_condition_horizon,
+            "external_history_horizon": self.external_history_horizon,
+            "external_future_horizon": self.external_future_horizon,
+            "external_action_horizon": self.external_action_condition_horizon,
+            "temporal_downsample": self.temporal_downsample,
+            "temporal_stride": self.temporal_stride,
+            "external_state_rate_hz": self.external_state_rate_hz,
+            "internal_state_rate_hz": self.state_rate_hz,
             "state_rate_hz": self.state_rate_hz,
             "action_rate_hz": self.action_rate_hz,
             "time": {
@@ -520,6 +541,30 @@ class ContactWorldModel(nn.Module):
         return self._require_sequence(
             batch, key, horizon=self.history_horizon, feature_dim=self.joint_dim
         )
+
+    def prepare_batch(self, batch: Mapping[str, torch.Tensor]):
+        """Adapt public-rate windows to this checkpoint's internal rate."""
+        if self.temporal_stride == 1:
+            return batch
+        result = dict(batch)
+        for key, value in batch.items():
+            if not torch.is_tensor(value) or value.ndim < 2:
+                continue
+            if key in self.inputs:
+                expected = self.external_history_horizon
+            elif key == "action" or key == "action_mask" or key == "action_time":
+                expected = self.external_action_condition_horizon
+            elif key.endswith("_future") or key.endswith("_future_raw") or key in {"future_time", "future_timestamp_ns", "future_indices"}:
+                expected = self.external_future_horizon
+            elif key in {"history_timestamp_ns", "history_indices"}:
+                expected = self.external_history_horizon
+            else:
+                continue
+            if value.shape[1] == expected:
+                result[key] = value[:, :: self.temporal_stride, ...]
+            elif value.shape[1] != expected // self.temporal_stride:
+                raise ValueError(f"{key} has temporal length {value.shape[1]}, expected {expected} or {expected // self.temporal_stride}")
+        return result
 
     def _action_inputs(self, batch):
         action = batch.get("action")
@@ -631,6 +676,7 @@ class ContactWorldModel(nn.Module):
         return values[None].expand(reference.shape[0], -1) / float(rate_hz)
 
     def encode_conditions(self, batch: Mapping[str, torch.Tensor]):
+        batch = self.prepare_batch(batch)
         states, action, valid_action = self._condition_inputs(batch)
         reference = states[self.inputs[0]]
         action_time = self._uniform_relative_time_values(
@@ -847,7 +893,20 @@ class ContactWorldModel(nn.Module):
             )
         return result
 
+    def _expand_external_outputs(self, result):
+        if self.temporal_stride == 1:
+            return result
+        expanded = dict(result)
+        keys = [f"{key}_pred" for key in self.predicted_state_streams]
+        keys.extend(("flow_state_pred", "contact_logits", "contact_probability", "contact_state_pred"))
+        for key in keys:
+            value = expanded.get(key)
+            if torch.is_tensor(value) and value.ndim >= 2 and value.shape[1] == self.future_horizon:
+                expanded[key] = value.repeat_interleave(self.temporal_stride, dim=1)
+        return expanded
+
     def forward(self, batch, *, flow_time=None, source_noise=None):
+        batch = self.prepare_batch(batch)
         encoded = self.encode_conditions(batch)
         reference = batch[self.inputs[0]]
         target_state = self._target_flow_state(batch, reference)
@@ -870,6 +929,7 @@ class ContactWorldModel(nn.Module):
             "velocity_pred": velocity_pred,
             "velocity_target": velocity_target,
             "flow_features": flow_features,
+            "_prepared_batch": batch,
         }
         result.update(self._decoded_output(endpoint, encoded))
         return result
@@ -897,6 +957,7 @@ class ContactWorldModel(nn.Module):
 
     @torch.no_grad()
     def predict(self, batch, *, steps=None, solver=None, source_noise=None):
+        batch = self.prepare_batch(batch)
         encoded = self.encode_conditions(batch)
         reference = batch[self.inputs[0]]
         source = self._gaussian_flow_source(reference, source_noise)
@@ -907,7 +968,7 @@ class ContactWorldModel(nn.Module):
             "flow_source_noise": source,
         }
         result.update(self._decoded_output(generated, encoded))
-        return result
+        return self._expand_external_outputs(result)
 
     @torch.no_grad()
     def sample(self, batch, *, num_samples=1, steps=None, solver=None, source_noise=None):
@@ -944,6 +1005,7 @@ class ContactWorldModel(nn.Module):
         }
 
     def predict_differentiable(self, batch, *, steps=None, solver=None, source_noise=None):
+        batch = self.prepare_batch(batch)
         encoded = self.encode_conditions(batch)
         reference = batch[self.inputs[0]]
         source = self._gaussian_flow_source(reference, source_noise)
@@ -954,4 +1016,5 @@ class ContactWorldModel(nn.Module):
             "flow_source_noise": source,
         }
         result.update(self._decoded_output(generated, encoded))
+        result["_prepared_batch"] = batch
         return result
