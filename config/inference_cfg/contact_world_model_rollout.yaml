@@ -17,7 +17,7 @@ inference:
   batch_size: 8
   num_workers: 0
   # ODE integration parameters. Heun evaluates the Flow decoder twice per step.
-  flow_steps: 2
+  flow_steps: 32
   flow_solver: heun
 
 selection:

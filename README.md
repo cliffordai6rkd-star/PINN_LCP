@@ -31,12 +31,11 @@ that condition memory, and an FFN before predicting the conditional velocity
 field. Teacher and Student differ only in configured capacity and Flow
 integration steps.
 
-The WM action export uses the same expert action fields and causal snapshot
-rule as `VA_h5_v3`: a configurable recorded camera timeline is sampled at the
-nominal 25 Hz rate, the latest expert label at or before each camera timestamp
-is selected, and that label is held on the raw 100 Hz state rows by ZOH. The
-resulting timestamps are retained so the model can align action and future
-tokens in physical seconds.
+The WM action export stores one executed action for every recorded 100 Hz
+state row. Training slices future action chunks directly from this high-rate
+sequence; no camera-rate ZOH window is materialized. Token positions use the
+nominal uniform 100 Hz grid, while recorded timestamps remain available as
+metadata.
 
 ## Training
 

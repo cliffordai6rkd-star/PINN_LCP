@@ -10,11 +10,11 @@ task: cucumber_peeling
 fps: 100
 
 timeline:
-  mode: raw_lowdim_action_hold
+  mode: raw_lowdim_action_highrate
   state_timestamp_path: teleop/timestamp_us
-  # Must match the master camera timeline used by the high-level expert data.
-  action_anchor_timestamp_path: cameras/wrist/timestamp_us
-  action_fps: 25
+  # Use the raw 100 Hz state/action timeline; no camera-rate hold.
+  action_anchor_timestamp_path: teleop/timestamp_us
+  action_fps: 100
   max_action_gap_s: 0.015
 
 features:

@@ -20,11 +20,14 @@ from model.pinn_model.contact_world_model import PREDICTED_STATE_STREAMS
 class ContactWorldModelLoss:
     """Combine flow matching, direct state MSE and contact CE."""
 
+    FLOW_STREAM_WEIGHTS = {"q": 1.0, "dq": 1.0, "delta_q": 1.0, "tau": 1.0}
+
     def __init__(self, config: Mapping):
         self.config = config
         data_config = config.get("dataloader") or {}
         model_config = config.get("model") or {}
         loss_config = config.get("loss") or {}
+        train_config = config.get("train") or {}
         self.joint_dim = int(model_config.get("joint_dim", 7))
         configured_inputs = model_config.get("inputs", PREDICTED_STATE_STREAMS)
         if isinstance(configured_inputs, str):
@@ -47,10 +50,14 @@ class ContactWorldModelLoss:
             raise ValueError("model.contact_state_count must be at least 2")
         self.normalize_mode = data_config.get("normalize_mode")
         self.flow_weight = float(loss_config.get("flow_weight", 1.0))
-        self.flow_q_weight = float(loss_config.get("flow_q_weight", 1.0))
-        self.flow_dq_weight = float(loss_config.get("flow_dq_weight", 1.0))
-        self.flow_delta_q_weight = float(loss_config.get("flow_delta_q_weight", 1.0))
-        self.flow_tau_weight = float(loss_config.get("flow_tau_weight", 1.0))
+        # Stream weights are part of the fixed objective, not experiment YAML.
+        self.flow_q_weight = self.FLOW_STREAM_WEIGHTS["q"]
+        self.flow_dq_weight = self.FLOW_STREAM_WEIGHTS["dq"]
+        self.flow_delta_q_weight = self.FLOW_STREAM_WEIGHTS["delta_q"]
+        self.flow_tau_weight = self.FLOW_STREAM_WEIGHTS["tau"]
+        self.tau_free_warmup_steps = int(train_config.get("tau_free_warmup_steps", 10000))
+        if self.tau_free_warmup_steps < 0:
+            raise ValueError("train.tau_free_warmup_steps must be non-negative")
         self.q_weight = float(loss_config.get("q_weight", 1.0))
         self.dq_weight = float(loss_config.get("dq_weight", 1.0))
         self.delta_q_weight = float(loss_config.get("delta_q_weight", 1.0))
@@ -279,6 +286,29 @@ class ContactWorldModelLoss:
         metric_losses = tuple(losses.get(key, zero) for key in PREDICTED_STATE_STREAMS)
         return total, *metric_losses
 
+    def _tau_free_gate(self, batch, reference):
+        """Return per-sample tau loss multipliers for free-phase windows."""
+        if "tau" not in self.predicted_state_streams:
+            return reference.new_ones(reference.shape[0]), reference.new_zeros(reference.shape[0])
+        free = None
+        phase = batch.get("future_phase")
+        if phase is not None:
+            phase = torch.as_tensor(phase, device=reference.device).reshape(-1)
+            if phase.shape[0] != reference.shape[0]:
+                raise ValueError("future_phase must have one label per sample")
+            free = phase.round().long() == 0
+        elif "contact_future" in batch:
+            labels = torch.as_tensor(batch["contact_future"], device=reference.device).reshape(reference.shape[0], -1)
+            free = labels.max(dim=1).values.round().long() == 0
+        if free is None:
+            return reference.new_ones(reference.shape[0]), reference.new_zeros(reference.shape[0])
+        if self.tau_free_warmup_steps == 0:
+            open_factor = 1.0
+        else:
+            open_factor = min(1.0, self._global_step / float(self.tau_free_warmup_steps))
+        gate = torch.where(free, reference.new_tensor(open_factor), reference.new_ones(reference.shape[0]))
+        return gate, free.to(dtype=reference.dtype)
+
     def _direct_losses(self, out, batch):
         result = {}
         for key in self.predicted_state_streams:
@@ -442,46 +472,24 @@ class ContactWorldModelLoss:
         if flow_prediction is None or flow_target is None:
             raise KeyError("model output must contain flow velocity prediction and target")
         flow_loss_ps, flow_q_ps, flow_dq_ps, flow_delta_q_ps, flow_tau_ps = self.flow_loss_components(flow_prediction, flow_target)
-        direct = self._direct_losses(out, batch)
-        contact_loss_ps = self._contact_loss(
-            out,
-            batch,
-            out[f"{self.predicted_state_streams[0]}_pred"],
+        tau_gate, free_mask = self._tau_free_gate(batch, flow_loss_ps)
+        flow_tau_unmasked_ps = flow_tau_ps
+        flow_tau_ps = flow_tau_ps * tau_gate
+        flow_loss_ps = (
+            self.flow_q_weight * flow_q_ps
+            + self.flow_dq_weight * flow_dq_ps
+            + self.flow_delta_q_weight * flow_delta_q_ps
+            + self.flow_tau_weight * flow_tau_ps
         )
-        kinematic_ps = self._kinematic_consistency(out, batch)
-        smoothness_ps = self._ddq_smoothness(out)
-        delta_consistency_ps = self._delta_q_consistency(out, batch)
-        torque_contact_ps = self._torque_contact_consistency(out, batch)
+        # Evaluate auxiliary targets for diagnostics/validation, but do not
+        # include any of them in the optimization objective.
+        direct = self._direct_losses(out, batch)
+        contact_loss_ps = self._contact_loss(out, batch, out[f"{self.predicted_state_streams[0]}_pred"])
         importance_weight = batch.get("importance_weight")
         flow_loss = self._weighted_mean(flow_loss_ps, importance_weight)
-        direct_loss = sum(
-            (
-                {"q": self.q_weight, "dq": self.dq_weight,
-                 "delta_q": self.delta_q_weight, "tau": self.tau_weight}[key]
-                * direct[key]
-                for key in self.predicted_state_streams
-            ),
-            flow_loss_ps.new_zeros(flow_loss_ps.shape),
-        )
-        endpoint_loss = self._weighted_mean(direct_loss, importance_weight)
-        contact_loss = contact_loss_ps.mean()
-        kinematic_loss = self._weighted_mean(kinematic_ps, importance_weight)
-        smoothness_loss = self._weighted_mean(smoothness_ps, importance_weight)
-        delta_consistency_loss = self._weighted_mean(
-            delta_consistency_ps, importance_weight
-        )
-        torque_contact_loss = self._weighted_mean(
-            torque_contact_ps, importance_weight
-        )
-        total = (
-            self.flow_weight * flow_loss
-            + self.endpoint_weight * endpoint_loss
-            + self.contact_weight * contact_loss
-            + self.kinematic_consistency_weight * kinematic_loss
-            + self.ddq_smoothness_weight * self._ddq_smoothness_factor * smoothness_loss
-            + self.delta_q_consistency_weight * delta_consistency_loss
-            + self.torque_contact_weight * torque_contact_loss
-        )
+        # Flow matching is the sole optimization objective.  Other losses
+        # remain available as legacy helpers but are intentionally excluded.
+        total = self.flow_weight * flow_loss
         loss_dict = {
             "total_loss": total.detach(),
             "flow_loss": flow_loss.detach(),
@@ -489,20 +497,22 @@ class ContactWorldModelLoss:
             "flow_dq_loss": self._weighted_mean(flow_dq_ps, importance_weight).detach(),
             "flow_delta_q_loss": self._weighted_mean(flow_delta_q_ps, importance_weight).detach(),
             "flow_tau_loss": self._weighted_mean(flow_tau_ps, importance_weight).detach(),
-            **{
-                f"{key}_loss": self._weighted_mean(
-                    direct[key], importance_weight
-                ).detach()
-                for key in self.predicted_state_streams
-            },
-            "endpoint_loss": endpoint_loss.detach(),
-            "endpoint_weight": flow_loss.new_tensor(self.endpoint_weight),
-            "contact_loss": contact_loss.detach(),
-            "kinematic_consistency_loss": kinematic_loss.detach(),
-            "ddq_smoothness_loss": smoothness_loss.detach(),
-            "ddq_smoothness_factor": flow_loss.new_tensor(self._ddq_smoothness_factor),
-            "delta_q_consistency_loss": delta_consistency_loss.detach(),
-            "torque_contact_loss": torque_contact_loss.detach(),
+            # Unweighted per-stream means make scale imbalance explicit:
+            # compare these values before changing the fixed stream weights.
+            "flow_q_raw": self._weighted_mean(flow_q_ps, importance_weight).detach(),
+            "flow_dq_raw": self._weighted_mean(flow_dq_ps, importance_weight).detach(),
+            "flow_delta_q_raw": self._weighted_mean(flow_delta_q_ps, importance_weight).detach(),
+            "flow_tau_raw": self._weighted_mean(flow_tau_unmasked_ps, importance_weight).detach(),
+            "flow_q_contribution": (self.flow_q_weight * self._weighted_mean(flow_q_ps, importance_weight)).detach(),
+            "flow_dq_contribution": (self.flow_dq_weight * self._weighted_mean(flow_dq_ps, importance_weight)).detach(),
+            "flow_delta_q_contribution": (self.flow_delta_q_weight * self._weighted_mean(flow_delta_q_ps, importance_weight)).detach(),
+            "flow_tau_contribution": (self.flow_tau_weight * self._weighted_mean(flow_tau_ps, importance_weight)).detach(),
+            "tau_free_open_factor": flow_loss.new_tensor(
+                1.0 if self.tau_free_warmup_steps == 0 else min(1.0, self._global_step / float(self.tau_free_warmup_steps))
+            ),
+            "tau_free_fraction": free_mask.mean().detach(),
+            **{f"{key}_loss": self._weighted_mean(value, importance_weight).detach() for key, value in direct.items()},
+            "contact_loss": contact_loss_ps.mean().detach(),
             "importance_weight_mean": (
                 flow_loss.new_tensor(1.0)
                 if importance_weight is None

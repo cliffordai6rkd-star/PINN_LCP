@@ -41,13 +41,12 @@ def _load_lerobot_dataset_class():
 
 
 class ContactWorldModelDataset(torch.utils.data.Dataset):
-    """Build causal high-rate samples with a held low-rate action plan.
+    """Build causal high-rate samples with direct future action chunks.
 
-    A sample is anchored at the latest valid high-rate state timestamp ``t``.
-    Its state history ends at ``t`` while a direct action chunk is sampled at
-    25 Hz from the configured token offset after the latest expert refresh
-    (offset 1 by default). State windows remain on the configured high-rate
-    timeline (normally 100 Hz).
+    A sample is anchored at a 100 Hz state row ``t``. Its history ends at
+    ``t``; the action chunk is sliced from consecutive recorded high-rate
+    command rows after the configured causal offset, and the future state
+    window remains on the same high-rate timeline.
     """
 
     DEFAULT_HIGH_KEYS = {
@@ -192,7 +191,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         self.history_horizon = int(self.data_config.get("state_history_horizon", 50))
         self.future_horizon = int(self.data_config.get("prediction_horizon", 40))
         self.high_fps = int(self.data_config.get("high_fps", 80))
-        self.expert_fps = float(self.data_config.get("expert_fps", 4.0))
+        self.expert_fps = float(self.data_config.get("expert_fps", 100.0))
         self.configured_action_condition_horizon = int(self.data_config.get("action_condition_horizon", 8))
         # Optional per-rollout action plans for OPD.  Entry zero is the
         # ordinary action chunk at the sampled state; later entries are
@@ -237,10 +236,8 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 "anchor_timestamp_key", "timing.anchor_timestamp_ns"
             )
         )
-        # h5_v3_wm stores the held action's *compressed* 25 Hz index on every
-        # 100 Hz state row.  Consuming that index is important: reconstructing
-        # a chunk from ``state_time + n * 40 ms`` can select the wrong command
-        # when camera and teleop clocks are not perfectly aligned.
+        # h5_v3_wm stores the action row index on every 100 Hz state row.
+        # Consuming that index preserves the exact recorded command sequence.
         self.action_index_key = str(
             self.data_config.get("action_index_key", "timing.action_index")
         )
@@ -1472,8 +1469,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             + self.inference_delay_ns
             + (target_times + self.action_start_offset) * self.action_period_ns
         )
-        # The action horizon is 8 tokens at 25 Hz while state history and
-        # prediction windows remain on the 100 Hz timeline.
+        # Actions are sampled directly on the native 100 Hz timeline.
         action_chunk = self._sample_action_values(target_times, episode)
         condition_abs = action_chunk
         condition = action_chunk.clone()

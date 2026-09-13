@@ -248,6 +248,9 @@ class BaseTrainer:
         self.gradient_clip_norm = (
             float(gradient_clip_norm) if gradient_clip_norm is not None else None
         )
+        self.gradient_every = int(self.train_config.get("gradient_every", 1))
+        if self.gradient_every < 1:
+            raise ValueError("train.gradient_every must be a positive integer")
         self.monitor_key = self.train_config.get("monitor_key", "val_loss")
         self.scheduler_monitor_key = self.train_config.get(
             "scheduler_monitor_key",
@@ -1356,9 +1359,12 @@ class BaseTrainer:
         self.fit_dataset_normalizer(train_dataset)
 
         train_sampler = self.build_train_sampler(train_dataset)
-        if self.dataset_on_device and hasattr(self.dataset, "materialize_samples_on_device"):
-            log.info("materializing %d GPU training samples", len(self.dataset))
-            self.dataset.materialize_samples_on_device()
+        # Do not pre-materialize every window on GPU.  That path duplicates
+        # the raw columns and all derived sample fields (history/future
+        # indices, timestamps, masks), often exhausting both host and device
+        # memory.  GPU-resident training now indexes raw columns per batch;
+        # callers can still invoke materialize_samples_on_device() explicitly
+        # for a deliberately small dataset.
         train_loader_kwargs = self._dataloader_kwargs(shuffle=train_sampler is None)
         if self.dataset_on_device and hasattr(self.dataset, "batch_collate"):
             train_loader_kwargs["collate_fn"] = self.dataset.batch_collate
@@ -1520,6 +1526,8 @@ class BaseTrainer:
             unit="batch",
             leave=False,
         )
+        self.optimizer.zero_grad(set_to_none=True)
+        micro_batches = 0
         for step, batch in enumerate(pbar):
             if (
                 self.step_based_training
@@ -1533,40 +1541,42 @@ class BaseTrainer:
                 loss, out = self.compute_loss(batch)
             batch_size = self._batch_size(batch)
 
-            self.optimizer.zero_grad(set_to_none=True)
+            micro_batches += 1
+            scaled_loss = loss / float(self.gradient_every)
             if self.amp_scaler is not None:
-                self.amp_scaler.scale(loss).backward()
-                self.amp_scaler.unscale_(self.optimizer)
+                self.amp_scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
-            if self.gradient_clip_norm is not None and self.gradient_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.gradient_clip_norm,
-                )
-            if self.amp_scaler is not None:
-                self.amp_scaler.step(self.optimizer)
-                self.amp_scaler.update()
-            else:
-                self.optimizer.step()
-            self.global_step += 1
-            if self.ema is not None:
-                self.ema.update(self.model, self.global_step)
-            if (
-                self.scheduler is not None
-                and (
-                    self.step_based_training
-                    or self.scheduler_step_per_optimizer_step
-                )
-                and self.scheduler_config.get("name", "none")
-                != "reduce_on_plateau"
-            ):
-                self.scheduler.step()
+                scaled_loss.backward()
+            should_step = micro_batches % self.gradient_every == 0 or step + 1 == len(self.loader)
+            if should_step:
+                remainder = micro_batches % self.gradient_every
+                if remainder:
+                    correction = float(self.gradient_every) / float(remainder)
+                    for parameter in self.model.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(correction)
+                if self.amp_scaler is not None:
+                    self.amp_scaler.unscale_(self.optimizer)
+                if self.gradient_clip_norm is not None and self.gradient_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip_norm)
+                if self.amp_scaler is not None:
+                    self.amp_scaler.step(self.optimizer)
+                    self.amp_scaler.update()
+                else:
+                    self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.global_step += 1
+                if self.ema is not None:
+                    self.ema.update(self.model, self.global_step)
+                if (self.scheduler is not None and (self.step_based_training or self.scheduler_step_per_optimizer_step)
+                    and self.scheduler_config.get("name", "none") != "reduce_on_plateau"):
+                    self.scheduler.step()
 
             # Step-budgeted runs checkpoint on the exact optimizer update,
             # independent of DataLoader/epoch boundaries.
             if (
-                self.step_based_training
+                should_step
+                and self.step_based_training
                 and self.checkpoint_every_steps > 0
                 and self.global_step % self.checkpoint_every_steps == 0
             ):

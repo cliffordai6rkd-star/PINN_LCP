@@ -405,8 +405,8 @@ class ContactWorldModel(nn.Module):
                 ),
                 "flow_decoder": "self_attention_cross_attention_ffn",
                 "condition_memory": "state_action_aware_state_plus_raw_action",
-                "action_time_encoding": "physical_seconds_fourier_mlp",
-                "future_time_encoding": "physical_seconds_fourier_mlp",
+                "action_time_encoding": "uniform_nominal_rate_grid_fourier_mlp",
+                "future_time_encoding": "uniform_nominal_rate_grid_fourier_mlp",
             },
             "input_state_streams": list(self.inputs),
             "predicted_continuous_streams": list(self.predicted_state_streams),
@@ -422,7 +422,7 @@ class ContactWorldModel(nn.Module):
                 "action_start_offset": self.action_start_offset,
                 "action_time_key": "action_time",
                 "future_time_key": "future_time",
-                "fallback": "regular_elapsed_seconds",
+                "fallback": "uniform_nominal_rate_seconds",
             },
             "action": {
                 "semantic": str(
@@ -616,26 +616,30 @@ class ContactWorldModel(nn.Module):
         ) + float(default_offset)
         return offsets[None].expand(reference.shape[0], -1) / float(rate_hz)
 
+    def _uniform_relative_time_values(
+        self, *, length: int, reference: torch.Tensor, rate_hz: float, offset: int = 0
+    ) -> torch.Tensor:
+        """Return a deterministic nominal-rate grid for token positions.
+
+        Recorded timestamps can contain acquisition jitter.  Positional
+        conditioning uses the nominal sample index instead, while raw
+        timestamps remain available for diagnostics and alignment metadata.
+        """
+        values = torch.arange(
+            length, device=reference.device, dtype=reference.dtype
+        ) + float(offset)
+        return values[None].expand(reference.shape[0], -1) / float(rate_hz)
+
     def encode_conditions(self, batch: Mapping[str, torch.Tensor]):
         states, action, valid_action = self._condition_inputs(batch)
         reference = states[self.inputs[0]]
-        action_time = self._relative_time_values(
-            batch,
-            value_key="action_time",
-            timestamp_key="action_chunk_timestamp_ns",
-            length=action.shape[1],
-            reference=reference,
-            rate_hz=self.action_rate_hz,
-            default_offset=self.action_start_offset,
+        action_time = self._uniform_relative_time_values(
+            length=action.shape[1], reference=reference,
+            rate_hz=self.action_rate_hz, offset=self.action_start_offset,
         )
-        future_time = self._relative_time_values(
-            batch,
-            value_key="future_time",
-            timestamp_key="future_timestamp_ns",
-            length=self.future_horizon,
-            reference=reference,
-            rate_hz=self.state_rate_hz,
-            default_offset=1,
+        future_time = self._uniform_relative_time_values(
+            length=self.future_horizon, reference=reference,
+            rate_hz=self.state_rate_hz, offset=1,
         )
         state_token_features = []
         for key in self.inputs:

@@ -1,18 +1,9 @@
-"""Build a LeRobot v3 world-model dataset on the raw lowdim rows.
+"""Build a LeRobot v3 world-model dataset on raw high-rate rows.
 
-State features are copied by raw index from ``teleop/timestamp_us``; this
-converter never creates a new high-rate grid. Actions intentionally match the
-high-level expert conversion contract:
-
-1. every timestamp on the configured nominally 25 Hz camera timeline is an
-   action anchor (no synthetic grid);
-2. every anchor selects the latest teleop action label at or before it
-   (``previous``), exactly as ``VA_h5_v3.py`` does;
-3. that expert action label is held on 100 Hz state rows until the next camera
-   anchor (ZOH).
-
-Raw state rows without a valid camera-anchor ``previous`` action are omitted.
-Retained rows keep their original indices and timestamps.
+State and action features share the recorded 100 Hz teleoperation timeline.
+Each output row stores one action sample; no camera-rate action hold or action
+window is materialized.  The training dataset later slices future action
+chunks from these per-row values.
 """
 
 from __future__ import annotations
@@ -42,7 +33,7 @@ from data_process.tool.h5_2_lerobotev3 import (
 )
 
 
-WM_TIMELINE_MODE = "raw_lowdim_action_hold"
+WM_TIMELINE_MODE = "raw_lowdim_action_highrate"
 WM_MANIFEST_NAME = "world_model_timeline.json"
 ACTION_PERIOD_RELATIVE_TOLERANCE = 0.10
 GENERATED_TIMING_FEATURES = {
@@ -58,8 +49,7 @@ GENERATED_TIMING_FEATURES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Copy raw lowdim H5 rows to LeRobot v3 and ZOH-hold causal "
-            "camera-rate expert actions on those rows."
+            "Copy raw lowdim H5 rows and causal 100 Hz actions to LeRobot v3."
         )
     )
     parser.add_argument("--config", "-c", type=Path, required=True)
@@ -499,11 +489,11 @@ def write_wm_manifest(output_path: Path, spec: Mapping[str, Any]) -> Path:
             "action_anchor_timestamp_path"
         ],
         "action_fps": timeline["action_fps"],
-        "action_fps_validation": "median_camera_period_within_10_percent",
-        "action_anchor_grid": "configured_recorded_camera_rows",
-        "action_sampling": "previous_expert_label",
-        "action_upsampling": "zoh_previous_camera_anchor",
-        "action_contract": "high_level_expert_camera_snapshot_v1",
+        "action_fps_validation": "median_state_period_within_10_percent",
+        "action_anchor_grid": "raw_state_timestamp_rows",
+        "action_sampling": "previous_on_shared_100hz_timeline",
+        "action_upsampling": "none",
+        "action_contract": "high_rate_executed_action_v1",
         "unlabeled_state_rows": "drop",
         "action_update_key": "timing.action_update",
         "feature_filters": {
