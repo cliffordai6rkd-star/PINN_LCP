@@ -11,13 +11,13 @@ train_data:
   sources:
     - name: insert_usb
       repo_id: insert_usb_lerobot_v3
-      root: ../nero_ws/runs/swm/insert_usb_lerobot_v3
+      root: ../../data/swm/insert_usb_lerobot_v3
     - name: push_button
       repo_id: push_button_lerobot_v3
-      root: ../nero_ws/runs/swm/push_button_lerobot_v3
+      root: ../../data/swm/push_button_lerobot_v3
     - name: cuccumber_peeling
       repo_id: cucumber_peeling_lerobot_v3
-      root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
+      root: ../../data/swm/cucumber_peeling_lerobot_v3
 
 action_contract:
   semantic: expert_policy_action_target
