@@ -130,8 +130,8 @@ class ContactWorldModel(nn.Module):
     TARGET_KEYS = tuple(f"{key}_future" for key in PREDICTED_STATE_STREAMS) + (
         "contact_future",
     )
-    # Independent condition branches are incompatible with single-memory checkpoints.
-    MODEL_VERSION = "carswm_v6"
+    # Shared learned history recency positions change the checkpoint contract.
+    MODEL_VERSION = "carswm_v7"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -275,6 +275,7 @@ class ContactWorldModel(nn.Module):
             self.action_condition_horizon, self.hidden_dim
         )
         self.future_pos_embedding = nn.Embedding(self.future_horizon, self.hidden_dim)
+        self.history_pos_embedding = nn.Embedding(self.history_horizon, self.hidden_dim)
         self.state_token_norm = nn.LayerNorm(self.hidden_dim)
         self.action_token_norm = nn.LayerNorm(self.hidden_dim)
         self.flow_input_projection = nn.Sequential(
@@ -352,7 +353,7 @@ class ContactWorldModel(nn.Module):
             str(contact_config.get("metric", "tau_ext_l1")).lower(), {}
         )
         return {
-            "schema_version": 7,
+            "schema_version": 8,
             "model_version": self.MODEL_VERSION,
             "state_contract": "robot_state_streams_v1",
             "architecture": {
@@ -360,6 +361,7 @@ class ContactWorldModel(nn.Module):
                     "modality_gru_action_gru"
                 ),
                 "state_token": "all_gru_temporal_outputs_modality_major",
+                "history_position_encoding": "shared_learned_recency_index_newest_zero",
                 "flow_decoder": "self_attention_parallel_dual_cross_attention_residual_sum_ffn",
                 "condition_memories": "independent_history_and_action",
                 "action_position_encoding": "learned_sequence_index",
@@ -599,7 +601,12 @@ class ContactWorldModel(nn.Module):
         state_token_features = []
         for key in self.inputs:
             sequence, _ = _run_gru_compat(self.state_encoders[key], states[key])
-            state_token_features.append(sequence + self.modality_embeddings[key])
+            # GRU outputs remain oldest-to-newest; recency zero is current.
+            positions = torch.arange(sequence.shape[1] - 1, -1, -1, device=sequence.device)
+            history_position = self.history_pos_embedding(positions)[None].to(sequence.dtype)
+            state_token_features.append(
+                sequence + self.modality_embeddings[key] + history_position
+            )
         # [B, M*T, D]: modality-major concatenation preserves each stream's
         # chronological order; T is the actual internal history length.
         state_features = torch.cat(state_token_features, dim=1)

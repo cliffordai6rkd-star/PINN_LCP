@@ -106,7 +106,8 @@ def test_all_temporal_gru_outputs_and_modality_embeddings_reach_loss(inputs, his
     for i, key in enumerate(inputs):
         assert sequences[key].shape == (2, length, model.hidden_dim)
         actual = before_norm[0][:, i*length:(i+1)*length]
-        expected = sequences[key] + model.modality_embeddings[key][None, None, :]
+        expected = (sequences[key] + model.modality_embeddings[key][None, None, :]
+                    + model.history_pos_embedding(torch.arange(length-1, -1, -1))[None])
         torch.testing.assert_close(actual, expected)
     assert output['state_tokens'].shape == (2, len(inputs)*length, model.hidden_dim)
     assert output['action_tokens'].shape == (2, 8, model.hidden_dim)
@@ -164,11 +165,12 @@ def test_training_configs_temporal_history_tokens(name, history_tokens):
 def test_checkpoint_contract_identifies_simplified_token_architecture():
     model = ContactWorldModel(config())
     contract = model.checkpoint_contract()
-    assert model.MODEL_VERSION == "carswm_v6"
-    assert contract["schema_version"] == 7
+    assert model.MODEL_VERSION == "carswm_v7"
+    assert contract["schema_version"] == 8
     assert contract["architecture"] == {
         "condition_encoder": "modality_gru_action_gru",
         "state_token": "all_gru_temporal_outputs_modality_major",
+        "history_position_encoding": "shared_learned_recency_index_newest_zero",
         "flow_decoder": "self_attention_parallel_dual_cross_attention_residual_sum_ffn",
         "condition_memories": "independent_history_and_action",
         "action_position_encoding": "learned_sequence_index",
@@ -176,7 +178,7 @@ def test_checkpoint_contract_identifies_simplified_token_architecture():
     }
     assert contract["action"]["dataset_alignment"] == "previous"
     incompatible = dict(contract)
-    incompatible["model_version"] = "carswm_v5"
+    incompatible["model_version"] = "carswm_v6"
     with pytest.raises(ValueError, match="contract mismatch"):
         model.validate_checkpoint_contract(incompatible)
 
@@ -608,3 +610,33 @@ def test_state_to_action_module_and_config_are_removed():
     cfg['model']['state_to_action_attention_heads'] = 2
     with pytest.raises(ValueError, match='state_to_action_attention_heads was removed'):
         ContactWorldModel(cfg)
+
+
+@pytest.mark.parametrize('history,stride', [(1, False), (7, False), (50, True)])
+def test_shared_history_recency_positions_and_flow_loss_gradients(history, stride):
+    cfg = config()
+    cfg['dataloader'].update(state_history_horizon=history, action_condition_horizon=8)
+    cfg['train'] = {'downsample': stride}
+    model = ContactWorldModel(cfg).eval()
+    seen = []
+    def capture(module, args, output):
+        seen.append((module, args[0].clone(), output.detach().clone()))
+    handle = model.history_pos_embedding.register_forward_hook(capture)
+    output = model(batch(cfg), flow_time=0.5)
+    handle.remove()
+    length = model.history_horizon
+    assert model.history_pos_embedding.num_embeddings == length
+    assert len(seen) == len(model.inputs)
+    for module, positions, embedding in seen:
+        assert module is model.history_pos_embedding
+        torch.testing.assert_close(positions, torch.arange(length-1, -1, -1))
+        assert positions[-1] == 0
+        assert positions[0] == length-1
+        torch.testing.assert_close(embedding, seen[0][2])
+    assert output['state_tokens'].shape == (2, len(model.inputs)*length, model.hidden_dim)
+    flow_loss = ContactWorldModelLoss(cfg).flow_loss_components(
+        output['flow_velocity_pred'], output['flow_velocity_target'])[0].mean()
+    flow_loss.backward()
+    gradient = model.history_pos_embedding.weight.grad
+    assert gradient is not None
+    assert torch.all(gradient.abs().sum(dim=-1) > 0)
