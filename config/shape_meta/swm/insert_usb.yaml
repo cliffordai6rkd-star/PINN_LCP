@@ -10,11 +10,11 @@ task: insert_usb
 fps: 100
 
 timeline:
-  mode: raw_lowdim_action_highrate
+  mode: raw_lowdim_action_hold
   state_timestamp_path: teleop/timestamp_us
-  # Use the raw 100 Hz state/action timeline; no camera-rate hold.
-  action_anchor_timestamp_path: teleop/timestamp_us
-  action_fps: 100
+  # Match VA v3: previous expert snapshot at each recorded wrist-camera anchor.
+  action_anchor_timestamp_path: cameras/wrist/timestamp_us
+  action_fps: 25
   max_action_gap_s: 0.015
 
 # This is a low-dimensional WM v3 export. All state rows stay on the raw

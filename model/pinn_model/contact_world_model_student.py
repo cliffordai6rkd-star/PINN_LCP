@@ -112,13 +112,16 @@ class ContactWorldModelStudent(ContactWorldModel):
             self.flow_input_projection(trajectory_state)
             + self.flow_time_embedding(flow_time)[:, None, :]
             + self.flow_delta_embedding(delta_s)[:, None, :]
-            + self.future_time_embedding(encoded["future_time"])
+            + self.future_pos_embedding(
+                torch.arange(trajectory_state.shape[1], device=trajectory_state.device)
+            )[None].to(trajectory_state.dtype)
         )
         for block in self.flow_blocks:
             features = block(
                 features,
-                encoded["condition_memory"],
-                encoded.get("condition_memory_padding_mask"),
+                encoded["state_tokens"],
+                encoded["action_tokens"],
+                encoded["action_padding_mask"],
             )
         velocity = self.flow_output(features) + self.student_flow_output(features)
         return velocity, features

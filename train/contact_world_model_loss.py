@@ -56,9 +56,17 @@ class ContactWorldModelLoss:
         self.flow_dq_weight = self.FLOW_STREAM_WEIGHTS["dq"]
         self.flow_delta_q_weight = self.FLOW_STREAM_WEIGHTS["delta_q"]
         self.flow_tau_weight = self.FLOW_STREAM_WEIGHTS["tau"]
-        self.tau_free_warmup_steps = int(train_config.get("tau_free_warmup_steps", 10000))
-        if self.tau_free_warmup_steps < 0:
-            raise ValueError("train.tau_free_warmup_steps must be non-negative")
+        # Kept as a read-only compatibility value for old configs.  Torque
+        # flow supervision is never gated; the curriculum now masks only the
+        # historical tau condition in the model encoder.
+        self.tau_history_mask_warmup_steps = int(
+            train_config.get(
+                "tau_history_mask_warmup_steps",
+                train_config.get("tau_free_warmup_steps", 0),
+            )
+        )
+        if self.tau_history_mask_warmup_steps < 0:
+            raise ValueError("train.tau_history_mask_warmup_steps must be non-negative")
         self.q_weight = float(loss_config.get("q_weight", 1.0))
         self.dq_weight = float(loss_config.get("dq_weight", 1.0))
         self.delta_q_weight = float(loss_config.get("delta_q_weight", 1.0))
@@ -287,29 +295,6 @@ class ContactWorldModelLoss:
         metric_losses = tuple(losses.get(key, zero) for key in PREDICTED_STATE_STREAMS)
         return total, *metric_losses
 
-    def _tau_free_gate(self, batch, reference):
-        """Return per-sample tau loss multipliers for free-phase windows."""
-        if "tau" not in self.predicted_state_streams:
-            return reference.new_ones(reference.shape[0]), reference.new_zeros(reference.shape[0])
-        free = None
-        phase = batch.get("future_phase")
-        if phase is not None:
-            phase = torch.as_tensor(phase, device=reference.device).reshape(-1)
-            if phase.shape[0] != reference.shape[0]:
-                raise ValueError("future_phase must have one label per sample")
-            free = phase.round().long() == 0
-        elif "contact_future" in batch:
-            labels = torch.as_tensor(batch["contact_future"], device=reference.device).reshape(reference.shape[0], -1)
-            free = labels.max(dim=1).values.round().long() == 0
-        if free is None:
-            return reference.new_ones(reference.shape[0]), reference.new_zeros(reference.shape[0])
-        if self.tau_free_warmup_steps == 0:
-            open_factor = 1.0
-        else:
-            open_factor = min(1.0, self._global_step / float(self.tau_free_warmup_steps))
-        gate = torch.where(free, reference.new_tensor(open_factor), reference.new_ones(reference.shape[0]))
-        return gate, free.to(dtype=reference.dtype)
-
     def _direct_losses(self, out, batch):
         result = {}
         for key in self.predicted_state_streams:
@@ -474,9 +459,9 @@ class ContactWorldModelLoss:
         if flow_prediction is None or flow_target is None:
             raise KeyError("model output must contain flow velocity prediction and target")
         flow_loss_ps, flow_q_ps, flow_dq_ps, flow_delta_q_ps, flow_tau_ps = self.flow_loss_components(flow_prediction, flow_target)
-        tau_gate, free_mask = self._tau_free_gate(batch, flow_loss_ps)
+        # Future tau supervision is always active, including free-motion
+        # windows. Historical tau masking is applied only in the encoder.
         flow_tau_unmasked_ps = flow_tau_ps
-        flow_tau_ps = flow_tau_ps * tau_gate
         flow_loss_ps = (
             self.flow_q_weight * flow_q_ps
             + self.flow_dq_weight * flow_dq_ps
@@ -489,8 +474,9 @@ class ContactWorldModelLoss:
         contact_loss_ps = self._contact_loss(out, batch, out[f"{self.predicted_state_streams[0]}_pred"])
         importance_weight = batch.get("importance_weight")
         flow_loss = self._weighted_mean(flow_loss_ps, importance_weight)
-        # Flow matching is the sole optimization objective.  Other losses
-        # remain available as legacy helpers but are intentionally excluded.
+        # Continuous streams use flow matching; the categorical contact head
+        # is trained jointly with its fixed CE term. Other state losses remain
+        # diagnostics only.
         contact_loss = self._weighted_mean(contact_loss_ps, importance_weight)
         total = self.flow_weight * flow_loss + self.contact_weight * contact_loss
         loss_dict = {
@@ -510,10 +496,15 @@ class ContactWorldModelLoss:
             "flow_dq_contribution": (self.flow_dq_weight * self._weighted_mean(flow_dq_ps, importance_weight)).detach(),
             "flow_delta_q_contribution": (self.flow_delta_q_weight * self._weighted_mean(flow_delta_q_ps, importance_weight)).detach(),
             "flow_tau_contribution": (self.flow_tau_weight * self._weighted_mean(flow_tau_ps, importance_weight)).detach(),
-            "tau_free_open_factor": flow_loss.new_tensor(
-                1.0 if self.tau_free_warmup_steps == 0 else min(1.0, self._global_step / float(self.tau_free_warmup_steps))
-            ),
-            "tau_free_fraction": free_mask.mean().detach(),
+            "tau_history_mask_probability": out.get(
+                "tau_history_mask_probability", flow_loss.new_zeros(())
+            ).detach(),
+            "tau_history_mask_fraction": out.get(
+                "tau_history_mask_fraction", flow_loss.new_zeros(())
+            ).detach(),
+            "tau_history_free_fraction": out.get(
+                "tau_history_free_fraction", flow_loss.new_zeros(())
+            ).detach(),
             **{f"{key}_loss": self._weighted_mean(value, importance_weight).detach() for key, value in direct.items()},
             "contact_loss": contact_loss.detach(),
             "contact_contribution": (self.contact_weight * contact_loss).detach(),

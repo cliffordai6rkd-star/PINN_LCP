@@ -44,9 +44,10 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
     """Build causal high-rate samples with direct future action chunks.
 
     A sample is anchored at a 100 Hz state row ``t``. Its history ends at
-    ``t``; the action chunk is sliced from consecutive recorded high-rate
-    command rows after the configured causal offset, and the future state
-    window remains on the same high-rate timeline.
+    ``t`` and future states use consecutive 100 Hz rows. V3 action chunks
+    use consecutive unique recorded action indices (nominally 25 Hz), starting
+    at the held index plus action_start_offset. State downsampling belongs
+    to the model and never changes this action sequence.
     """
 
     DEFAULT_HIGH_KEYS = {
@@ -190,8 +191,8 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
 
         self.history_horizon = int(self.data_config.get("state_history_horizon", 50))
         self.future_horizon = int(self.data_config.get("prediction_horizon", 40))
-        self.high_fps = int(self.data_config.get("high_fps", 80))
-        self.expert_fps = float(self.data_config.get("expert_fps", 100.0))
+        self.high_fps = int(self.data_config.get("high_fps", 100))
+        self.expert_fps = float(self.data_config.get("expert_fps", 25.0))
         self.configured_action_condition_horizon = int(self.data_config.get("action_condition_horizon", 8))
         # Optional per-rollout action plans for OPD.  Entry zero is the
         # ordinary action chunk at the sampled state; later entries are
@@ -1114,6 +1115,18 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 times = self.action_anchor_timestamps.index_select(0, rows)
             else:
                 times = self.high_timestamps.index_select(0, rows)
+            if self.v3_only and times.numel() > 1:
+                periods = torch.diff(times)
+                if torch.any(periods <= 0):
+                    raise ValueError("V3 action anchors must increase between unique action indices")
+                observed_period = float(periods.to(torch.float64).median())
+                expected_period = 1.0e9 / self.expert_fps
+                if abs(observed_period - expected_period) > expected_period * 0.10:
+                    raise ValueError(
+                        "V3 action-anchor cadence does not match expert_fps; "
+                        "reconvert with recorded low-frequency action anchors "
+                        "instead of 100 Hz state-row action indices"
+                    )
             self._action_tables[id(episode)] = {
                 "indices": unique.to(dtype=torch.long),
                 "rows": rows,

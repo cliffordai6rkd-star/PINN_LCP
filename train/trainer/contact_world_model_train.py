@@ -434,6 +434,10 @@ class ContactWorldModelTrainer(BaseTrainer):
         if total_steps is None and self.loader is not None:
             total_steps = self.num_epochs * len(self.loader)
         self.loss_calculator.set_global_step(self.global_step, total_steps)
+        # Keep model-side training curricula (e.g. historical tau masking)
+        # synchronized with optimizer updates.
+        if hasattr(self.model, "set_global_step"):
+            self.model.set_global_step(self.global_step)
         flow_time = None if self.model.training else self.validation_flow_time
         out = self.model(batch, flow_time=flow_time)
         loss, loss_dict = self.loss_calculator(out, batch)
@@ -1224,14 +1228,6 @@ class ContactWorldModelTrainer(BaseTrainer):
         condition = {key: history[key] for key in self.model.inputs}
         condition["action"] = action_rollout[:, int(anchor)]
         condition["action_mask"] = action_rollout_mask[:, int(anchor)]
-        action_rollout_time = batch.get("action_rollout_time")
-        if action_rollout_time is not None:
-            if action_rollout_time.ndim != 3 or int(anchor) >= action_rollout_time.shape[1]:
-                raise ValueError(
-                    "action_rollout_time must have shape [B, R, A] and cover "
-                    "the feedback anchor"
-                )
-            condition["action_time"] = action_rollout_time[:, int(anchor)]
         return condition
 
     def _append_feedback_measurements(self, history, batch, start, stop):
@@ -1586,19 +1582,6 @@ class ContactWorldModelTrainer(BaseTrainer):
                             running_batch["action_mask"] = batch[
                                 "action_rollout_mask"
                             ][:, step]
-                        if "action_rollout_time" in batch:
-                            running_batch["action_time"] = batch[
-                                "action_rollout_time"
-                            ][:, step]
-                    # Future timestamps in ``running_batch`` belong to the
-                    # previous query anchor. Remove them before each
-                    # recursive query so the model uses a fresh local
-                    # physical-time origin; action_rollout_time, when
-                    # available, is already relative to this step's anchor.
-                    running_batch.pop("future_time", None)
-                    running_batch.pop("future_timestamp_ns", None)
-                    if "action_rollout" not in batch:
-                        running_batch.pop("action_time", None)
                     step_noise = self._fixed_source_noise(
                         running_batch, batch_index, step=step + 1
                     )

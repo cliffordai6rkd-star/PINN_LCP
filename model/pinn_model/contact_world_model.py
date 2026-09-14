@@ -42,46 +42,6 @@ def _run_gru_compat(gru: nn.GRU, value: torch.Tensor):
     return encoded, hidden
 
 
-class PhysicalTimeEmbedding(nn.Module):
-    """Embed elapsed physical seconds instead of a token index."""
-
-    def __init__(self, hidden_dim: int, frequencies=(1.0, 10.0, 25.0)):
-        super().__init__()
-        self.register_buffer(
-            "frequencies",
-            torch.as_tensor(frequencies, dtype=torch.float32),
-            persistent=False,
-        )
-        self.projection = nn.Sequential(
-            nn.Linear(2 + 2 * len(frequencies), hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def forward(self, elapsed_seconds: torch.Tensor) -> torch.Tensor:
-        value = torch.as_tensor(elapsed_seconds)
-        if value.ndim == 2:
-            value = value[..., None]
-        if value.ndim != 3 or value.shape[-1] != 1:
-            raise ValueError(
-                "physical time must have shape [B,T] or [B,T,1], got "
-                f"{tuple(value.shape)}"
-            )
-        output_dtype = value.dtype
-        value = value.to(dtype=self.projection[0].weight.dtype)
-        frequencies = self.frequencies.to(device=value.device, dtype=value.dtype)
-        phase = 2.0 * math.pi * value * frequencies
-        features = [value, value.square()]
-        for index in range(frequencies.numel()):
-            features.extend(
-                [
-                    torch.sin(phase[..., index:index + 1]),
-                    torch.cos(phase[..., index:index + 1]),
-                ]
-            )
-        return self.projection(torch.cat(features, dim=-1)).to(dtype=output_dtype)
-
-
 class FlowTimeEmbedding(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -108,7 +68,7 @@ class FlowTimeEmbedding(nn.Module):
 
 
 class FlowDecoderBlock(nn.Module):
-    """One conditional flow block: self-attention, cross-attention, then FFN."""
+    """Future self-attention, parallel history/action cross-attention, then FFN."""
 
     def __init__(self, hidden_dim, attention_heads, ffn_multiplier, dropout):
         super().__init__()
@@ -116,8 +76,12 @@ class FlowDecoderBlock(nn.Module):
         self.self_attention = nn.MultiheadAttention(
             hidden_dim, attention_heads, dropout=dropout, batch_first=True
         )
-        self.condition_norm = nn.LayerNorm(hidden_dim)
-        self.condition_attention = nn.MultiheadAttention(
+        self.history_norm = nn.LayerNorm(hidden_dim)
+        self.action_norm = nn.LayerNorm(hidden_dim)
+        self.history_cross_attn = nn.MultiheadAttention(
+            hidden_dim, attention_heads, dropout=dropout, batch_first=True
+        )
+        self.action_cross_attn = nn.MultiheadAttention(
             hidden_dim, attention_heads, dropout=dropout, batch_first=True
         )
         self.ffn_norm = nn.LayerNorm(hidden_dim)
@@ -129,7 +93,7 @@ class FlowDecoderBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, trajectory, memory, memory_padding_mask=None):
+    def forward(self, trajectory, history, action, action_padding_mask=None):
         normalized = self.self_norm(trajectory)
         attended, _ = self.self_attention(
             query=normalized.contiguous(),
@@ -138,48 +102,21 @@ class FlowDecoderBlock(nn.Module):
             need_weights=_npu_legacy_attention(normalized.device),
         )
         trajectory = trajectory + self.dropout(attended)
-        attended, _ = self.condition_attention(
-            query=self.condition_norm(trajectory).contiguous(),
-            key=memory.contiguous(),
-            value=memory.contiguous(),
-            key_padding_mask=memory_padding_mask,
+        history_attended, _ = self.history_cross_attn(
+            query=self.history_norm(trajectory).contiguous(),
+            key=history.contiguous(),
+            value=history.contiguous(),
             need_weights=_npu_legacy_attention(trajectory.device),
         )
-        trajectory = trajectory + self.dropout(attended)
+        action_attended, _ = self.action_cross_attn(
+            query=self.action_norm(trajectory).contiguous(),
+            key=action.contiguous(),
+            value=action.contiguous(),
+            key_padding_mask=action_padding_mask,
+            need_weights=_npu_legacy_attention(trajectory.device),
+        )
+        trajectory = trajectory + self.dropout(history_attended) + self.dropout(action_attended)
         return trajectory + self.dropout(self.ffn(self.ffn_norm(trajectory)))
-
-
-class StateToActionBlock(nn.Module):
-    """Make state modality tokens action-aware before memory concatenation."""
-
-    def __init__(self, hidden_dim, attention_heads, ffn_multiplier, dropout):
-        super().__init__()
-        self.query_norm = nn.LayerNorm(hidden_dim)
-        self.cross_attention = nn.MultiheadAttention(
-            hidden_dim, attention_heads, dropout=dropout, batch_first=True
-        )
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, ffn_multiplier * hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_multiplier * hidden_dim, hidden_dim),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, state_tokens, action_tokens, action_valid=None):
-        key_padding_mask = None
-        if action_valid is not None:
-            key_padding_mask = ~action_valid
-        attended, _ = self.cross_attention(
-            query=self.query_norm(state_tokens).contiguous(),
-            key=action_tokens.contiguous(),
-            value=action_tokens.contiguous(),
-            key_padding_mask=key_padding_mask,
-            need_weights=_npu_legacy_attention(state_tokens.device),
-        )
-        fused = state_tokens + self.dropout(attended)
-        return fused + self.dropout(self.ffn(self.ffn_norm(fused)))
 
 
 class ContactWorldModel(nn.Module):
@@ -189,14 +126,12 @@ class ContactWorldModel(nn.Module):
     PREDICTED_STATE_STREAMS = PREDICTED_STATE_STREAMS
     CONDITION_KEYS = (
         "q", "dq", "delta_q", "tau", "action", "action_mask",
-        "action_time", "future_time",
     )
     TARGET_KEYS = tuple(f"{key}_future" for key in PREDICTED_STATE_STREAMS) + (
         "contact_future",
     )
-    # The simplified token/memory architecture is not state-dict compatible
-    # with the earlier CARS-WM implementation.
-    MODEL_VERSION = "carswm_v3"
+    # Independent condition branches are incompatible with single-memory checkpoints.
+    MODEL_VERSION = "carswm_v6"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -205,6 +140,8 @@ class ContactWorldModel(nn.Module):
         self._config = config
         data_config = config.get("dataloader") or {}
         model_config = config.get("model") or {}
+        if "state_to_action_attention_heads" in model_config:
+            raise ValueError("model.state_to_action_attention_heads was removed")
         train_config = config.get("train") or {}
         downsample = train_config.get("downsample", False)
         self.temporal_stride = (2 if downsample is True else 1) if isinstance(downsample, bool) else int(downsample)
@@ -214,22 +151,38 @@ class ContactWorldModel(nn.Module):
         self.external_history_horizon = int(data_config.get("state_history_horizon", 50))
         self.external_future_horizon = int(data_config.get("prediction_horizon", 40))
         self.external_action_condition_horizon = int(data_config.get("action_condition_horizon", 8))
-        for name, value in (("history", self.external_history_horizon), ("future", self.external_future_horizon), ("action", self.external_action_condition_horizon)):
+        for name, value in (("history", self.external_history_horizon), ("future", self.external_future_horizon)):
             if value % self.temporal_stride:
                 raise ValueError(f"{name} horizon {value} must be divisible by temporal stride {self.temporal_stride}")
         self.history_horizon = self.external_history_horizon // self.temporal_stride
         self.future_horizon = self.external_future_horizon // self.temporal_stride
-        self.action_condition_horizon = self.external_action_condition_horizon // self.temporal_stride
+        self.action_condition_horizon = self.external_action_condition_horizon
         self.joint_dim = int(model_config.get("joint_dim", 7))
         self.action_dim = int(model_config.get("action_dim", 7))
         self.external_state_rate_hz = float(data_config.get("high_fps", 100.0))
         self.external_action_rate_hz = float(data_config.get("expert_fps", 25.0))
         self.state_rate_hz = self.external_state_rate_hz / self.temporal_stride
-        self.action_rate_hz = self.external_action_rate_hz / self.temporal_stride
+        self.action_rate_hz = self.external_action_rate_hz
         self.action_start_offset = int(data_config.get("action_start_offset", 1))
-        self.action_time_alignment = str(
-            model_config.get("action_time_alignment", "zoh")
-        ).lower()
+        removed = {
+            "action_time_alignment", "use_physical_time",
+            "action_time_encoding", "future_time_encoding",
+        } & model_config.keys()
+        if removed:
+            raise ValueError(f"Removed model time-encoding options: {sorted(removed)}")
+        # During training, complete free-motion windows can optionally hide
+        # their historical measured torque.  The future torque target remains
+        # untouched; this augmentation only reduces shortcut dependence on
+        # tau history.  Keep the legacy key as a compatibility alias.
+        self.tau_history_mask_warmup_steps = int(
+            train_config.get(
+                "tau_history_mask_warmup_steps",
+                train_config.get("tau_free_warmup_steps", 0),
+            )
+        )
+        if self.tau_history_mask_warmup_steps < 0:
+            raise ValueError("train.tau_history_mask_warmup_steps must be non-negative")
+        self._global_step = 0
 
         configured_inputs = model_config.get("inputs")
         if configured_inputs is None:
@@ -267,7 +220,7 @@ class ContactWorldModel(nn.Module):
         # module-level vocabulary constants used by the dataset.
         self.PREDICTED_STATE_STREAMS = self.outputs
         self.CONDITION_KEYS = self.inputs + (
-            "action", "action_mask", "action_time", "future_time"
+            "action", "action_mask"
         )
         self.TARGET_KEYS = tuple(f"{key}_future" for key in self.outputs) + (
             "contact_future",
@@ -284,9 +237,8 @@ class ContactWorldModel(nn.Module):
         self.flow_inference_steps = int(model_config.get("flow_inference_steps", 8))
         self.flow_solver = str(model_config.get("flow_solver", "heun")).lower()
         self.flow_source_mode = str(model_config.get("flow_source_mode", "gaussian")).lower()
-        # Keep early v3 checkpoints on their final-hidden path. New training
-        # configs can opt into learned-query attention pooling.
-        self.state_pooling = str(model_config.get("state_pooling", "last")).lower()
+        if "state_pooling" in model_config:
+            raise ValueError("model.state_pooling was removed; all GRU temporal outputs are retained")
         self.dropout = float(model_config.get("dropout", 0.1))
         self.runtime_checks = bool(model_config.get("runtime_checks", True))
         self.use_action_padding_mask = bool(
@@ -309,41 +261,22 @@ class ContactWorldModel(nn.Module):
             )
             for key in self.inputs
         })
-        # Keep each configured state stream independent until it becomes one
-        # modal token.  Distinct embeddings preserve the stream identity even
-        # when two modalities have similar numerical ranges.
+        # Broadcast each stream's identity to all of its temporal GRU outputs.
         self.modality_embeddings = nn.ParameterDict()
-        if self.state_pooling == "attention":
-            self.state_pool_queries = nn.ParameterDict()
         for key in self.inputs:
             embedding = nn.Parameter(torch.empty(self.hidden_dim))
             nn.init.normal_(embedding, mean=0.0, std=0.02)
             self.modality_embeddings[key] = embedding
-            if self.state_pooling == "attention":
-                query = nn.Parameter(torch.empty(1, 1, self.hidden_dim))
-                nn.init.normal_(query, mean=0.0, std=0.02)
-                self.state_pool_queries[key] = query
-        if self.state_pooling == "attention":
-            self.state_pool_attention = nn.MultiheadAttention(
-                self.hidden_dim,
-                self.flow_attention_heads,
-                dropout=self.dropout,
-                batch_first=True,
-            )
         self.action_encoder = nn.GRU(
             self.action_dim, self.hidden_dim, self.action_layers,
             dropout=action_dropout, batch_first=True
         )
-        self.action_time_embedding = PhysicalTimeEmbedding(self.hidden_dim)
-        self.future_time_embedding = PhysicalTimeEmbedding(self.hidden_dim)
+        self.action_pos_embedding = nn.Embedding(
+            self.action_condition_horizon, self.hidden_dim
+        )
+        self.future_pos_embedding = nn.Embedding(self.future_horizon, self.hidden_dim)
         self.state_token_norm = nn.LayerNorm(self.hidden_dim)
         self.action_token_norm = nn.LayerNorm(self.hidden_dim)
-        self.state_to_action_attention = StateToActionBlock(
-            self.hidden_dim,
-            int(model_config.get("state_to_action_attention_heads", self.flow_attention_heads)),
-            self.flow_ffn_multiplier,
-            self.dropout,
-        )
         self.flow_input_projection = nn.Sequential(
             nn.LayerNorm(self.flow_dim), nn.Linear(self.flow_dim, self.hidden_dim)
         )
@@ -389,11 +322,6 @@ class ContactWorldModel(nn.Module):
             "flow_ffn_multiplier": self.flow_ffn_multiplier,
             "flow_inference_steps": self.flow_inference_steps,
             "action_condition_horizon": self.action_condition_horizon,
-            "state_to_action_attention_heads": int(
-                self._config.get("model", {}).get(
-                    "state_to_action_attention_heads", self.flow_attention_heads
-                )
-            ),
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
@@ -402,15 +330,6 @@ class ContactWorldModel(nn.Module):
             raise ValueError("model.dropout must be in [0, 1)")
         if self.hidden_dim % self.flow_attention_heads != 0:
             raise ValueError("model.hidden_dim must be divisible by flow_attention_heads")
-        state_to_action_heads = int(
-            self._config.get("model", {}).get(
-                "state_to_action_attention_heads", self.flow_attention_heads
-            )
-        )
-        if state_to_action_heads <= 0 or self.hidden_dim % state_to_action_heads != 0:
-            raise ValueError(
-                "model.hidden_dim must be divisible by state_to_action_attention_heads"
-            )
         if self.flow_solver not in {"euler", "heun"}:
             raise ValueError("model.flow_solver must be 'euler' or 'heun'")
         if self.flow_source_mode != "gaussian":
@@ -418,14 +337,10 @@ class ContactWorldModel(nn.Module):
                 "model.flow_source_mode must be 'gaussian'; state-to-state "
                 "sources are no longer supported"
             )
-        if self.state_pooling not in {"last", "attention"}:
-            raise ValueError("model.state_pooling must be 'last' or 'attention'")
         if not math.isfinite(self.state_rate_hz) or self.state_rate_hz <= 0.0:
             raise ValueError("dataloader.high_fps must be positive")
         if not math.isfinite(self.action_rate_hz) or self.action_rate_hz <= 0.0:
             raise ValueError("dataloader.expert_fps must be positive")
-        if self.action_time_alignment not in {"zoh", "linear"}:
-            raise ValueError("model.action_time_alignment must be 'zoh' or 'linear'")
 
     def checkpoint_contract(self):
         """Return the complete semantic contract stored beside model weights."""
@@ -437,22 +352,18 @@ class ContactWorldModel(nn.Module):
             str(contact_config.get("metric", "tau_ext_l1")).lower(), {}
         )
         return {
-            "schema_version": 4,
+            "schema_version": 7,
             "model_version": self.MODEL_VERSION,
             "state_contract": "robot_state_streams_v1",
             "architecture": {
                 "condition_encoder": (
-                    "modality_gru_action_gru_state_to_action_cross_attention"
+                    "modality_gru_action_gru"
                 ),
-                "state_token": (
-                    "attention_pooling"
-                    if self.state_pooling == "attention"
-                    else "final_gru_hidden"
-                ),
-                "flow_decoder": "self_attention_cross_attention_ffn",
-                "condition_memory": "state_action_aware_state_plus_raw_action",
-                "action_time_encoding": "uniform_nominal_rate_grid_fourier_mlp",
-                "future_time_encoding": "uniform_nominal_rate_grid_fourier_mlp",
+                "state_token": "all_gru_temporal_outputs_modality_major",
+                "flow_decoder": "self_attention_parallel_dual_cross_attention_residual_sum_ffn",
+                "condition_memories": "independent_history_and_action",
+                "action_position_encoding": "learned_sequence_index",
+                "future_position_encoding": "learned_sequence_index",
             },
             "input_state_streams": list(self.inputs),
             "predicted_continuous_streams": list(self.predicted_state_streams),
@@ -469,14 +380,6 @@ class ContactWorldModel(nn.Module):
             "internal_state_rate_hz": self.state_rate_hz,
             "state_rate_hz": self.state_rate_hz,
             "action_rate_hz": self.action_rate_hz,
-            "time": {
-                "state_rate_hz": self.state_rate_hz,
-                "action_rate_hz": self.action_rate_hz,
-                "action_start_offset": self.action_start_offset,
-                "action_time_key": "action_time",
-                "future_time_key": "future_time",
-                "fallback": "uniform_nominal_rate_seconds",
-            },
             "action": {
                 "semantic": str(
                     action_config.get("semantic", "expert_policy_action_target")
@@ -505,7 +408,7 @@ class ContactWorldModel(nn.Module):
                         "action_alignment", data_config.get("action_resample", "previous")
                     )
                 ),
-                "future_token_alignment": self.action_time_alignment,
+                "future_token_alignment": "nominal_rate_zoh",
                 "inference_delay_s": float(data_config.get("inference_delay_s", 0.0)),
             },
             "flow": {
@@ -575,17 +478,15 @@ class ContactWorldModel(nn.Module):
         )
 
     def prepare_batch(self, batch: Mapping[str, torch.Tensor]):
-        """Adapt public-rate windows to this checkpoint's internal rate."""
+        """Downsample state windows only; preserve every recorded action token."""
         if self.temporal_stride == 1:
             return batch
         result = dict(batch)
         for key, value in batch.items():
             if not torch.is_tensor(value) or value.ndim < 2:
                 continue
-            if key in self.inputs:
+            if key in self.inputs or key == "contact":
                 expected = self.external_history_horizon
-            elif key == "action" or key == "action_mask" or key == "action_time":
-                expected = self.external_action_condition_horizon
             elif key.endswith("_future") or key.endswith("_future_raw") or key in {"future_time", "future_timestamp_ns", "future_indices"}:
                 expected = self.external_future_horizon
             elif key in {"history_timestamp_ns", "history_indices"}:
@@ -593,10 +494,62 @@ class ContactWorldModel(nn.Module):
             else:
                 continue
             if value.shape[1] == expected:
-                result[key] = value[:, :: self.temporal_stride, ...]
+                # History must still end at the current 100 Hz state anchor.
+                is_history = key in self.inputs or key in {
+                    "contact", "history_timestamp_ns", "history_indices"
+                }
+                offset = self.temporal_stride - 1 if is_history else 0
+                result[key] = value[:, offset :: self.temporal_stride, ...]
             elif value.shape[1] != expected // self.temporal_stride:
                 raise ValueError(f"{key} has temporal length {value.shape[1]}, expected {expected} or {expected // self.temporal_stride}")
         return result
+
+    def set_global_step(self, global_step: int):
+        """Set optimizer-update progress used by training-only curricula."""
+        self._global_step = max(int(global_step), 0)
+
+    def _mask_tau_history(self, batch: Mapping[str, torch.Tensor]):
+        """Curricularly mask historical tau on complete free-motion windows."""
+        reference = batch.get("tau")
+        device = reference.device if torch.is_tensor(reference) else None
+        if (
+            not self.training
+            or "tau" not in self.inputs
+            or not torch.is_tensor(reference)
+            or self.tau_history_mask_warmup_steps == 0
+        ):
+            zero = reference.new_zeros(()) if torch.is_tensor(reference) else torch.tensor(0.0)
+            return dict(batch), zero, zero, zero
+
+        probability = min(
+            1.0,
+            self._global_step / float(self.tau_history_mask_warmup_steps),
+        )
+        history_contact = batch.get("contact")
+        future_contact = batch.get("contact_future")
+        if not torch.is_tensor(history_contact) or not torch.is_tensor(future_contact):
+            zero = reference.new_zeros(())
+            return dict(batch), reference.new_tensor(probability), zero, zero
+        history_contact = history_contact.to(device=device)
+        future_contact = future_contact.to(device=device)
+        if history_contact.shape[0] != reference.shape[0] or future_contact.shape[0] != reference.shape[0]:
+            raise ValueError("contact and tau must have the same batch dimension")
+        free_history = history_contact.reshape(reference.shape[0], -1).round().eq(0).all(dim=1)
+        free_future = future_contact.reshape(reference.shape[0], -1).round().eq(0).all(dim=1)
+        free_window = free_history & free_future
+        sampled = torch.rand(reference.shape[0], device=device) < probability
+        mask_samples = free_window & sampled
+        masked = dict(batch)
+        if torch.any(mask_samples):
+            tau = reference.clone()
+            tau[mask_samples] = 0.0
+            masked["tau"] = tau
+        return (
+            masked,
+            reference.new_tensor(probability),
+            mask_samples.to(dtype=reference.dtype).mean(),
+            free_window.to(dtype=reference.dtype).mean(),
+        )
 
     def _action_inputs(self, batch):
         action = batch.get("action")
@@ -609,7 +562,7 @@ class ContactWorldModel(nn.Module):
         if not self.use_action_padding_mask:
             # The direct-action dataset used by the fast training path always
             # supplies a complete action chunk.  Returning an all-valid mask
-            # preserves pooling semantics while allowing fused attention.
+            # preserves all action tokens while allowing fused attention.
             return action, torch.ones(
                 action.shape[:2], device=action.device, dtype=torch.bool
             )
@@ -639,152 +592,43 @@ class ContactWorldModel(nn.Module):
             raise ValueError("action does not match the state batch")
         return states, action, valid
 
-    def _relative_time_values(
-        self,
-        batch,
-        *,
-        value_key,
-        timestamp_key,
-        length,
-        reference,
-        rate_hz,
-        default_offset,
-    ):
-        """Return [B,T] elapsed seconds, preferring recorded timestamps."""
-
-        value = batch.get(value_key)
-        if value is not None:
-            value = torch.as_tensor(value, device=reference.device)
-            if value.ndim == 3 and value.shape[-1] == 1:
-                value = value[..., 0]
-            if value.ndim != 2 or value.shape != (reference.shape[0], length):
-                raise ValueError(
-                    f"{value_key} must have shape [B, {length}], got "
-                    f"{tuple(value.shape)}"
-                )
-            return value.to(device=reference.device, dtype=reference.dtype)
-
-        timestamps = batch.get(timestamp_key)
-        history_timestamps = batch.get("history_timestamp_ns")
-        if timestamps is not None and history_timestamps is not None:
-            timestamps = torch.as_tensor(timestamps, device=reference.device)
-            history_timestamps = torch.as_tensor(
-                history_timestamps, device=reference.device
-            )
-            if timestamps.ndim == 3 and timestamps.shape[-1] == 1:
-                timestamps = timestamps[..., 0]
-            if history_timestamps.ndim == 3 and history_timestamps.shape[-1] == 1:
-                history_timestamps = history_timestamps[..., 0]
-            expected = (reference.shape[0], length)
-            if tuple(timestamps.shape) != expected:
-                raise ValueError(
-                    f"{timestamp_key} must have shape [B, {length}], got "
-                    f"{tuple(timestamps.shape)}"
-                )
-            if history_timestamps.ndim != 2 or history_timestamps.shape[0] != reference.shape[0]:
-                raise ValueError(
-                    "history_timestamp_ns must have one timestamp sequence per batch"
-                )
-            anchor = history_timestamps[:, -1:]
-            return (timestamps.to(dtype=reference.dtype) - anchor.to(dtype=reference.dtype)) / 1.0e9
-
-        offsets = torch.arange(
-            length, device=reference.device, dtype=reference.dtype
-        ) + float(default_offset)
-        return offsets[None].expand(reference.shape[0], -1) / float(rate_hz)
-
-    def _uniform_relative_time_values(
-        self, *, length: int, reference: torch.Tensor, rate_hz: float, offset: int = 0
-    ) -> torch.Tensor:
-        """Return a deterministic nominal-rate grid for token positions.
-
-        Recorded timestamps can contain acquisition jitter.  Positional
-        conditioning uses the nominal sample index instead, while raw
-        timestamps remain available for diagnostics and alignment metadata.
-        """
-        values = torch.arange(
-            length, device=reference.device, dtype=reference.dtype
-        ) + float(offset)
-        return values[None].expand(reference.shape[0], -1) / float(rate_hz)
-
     def encode_conditions(self, batch: Mapping[str, torch.Tensor]):
         batch = self.prepare_batch(batch)
+        batch, tau_mask_probability, tau_mask_fraction, tau_free_fraction = self._mask_tau_history(batch)
         states, action, valid_action = self._condition_inputs(batch)
-        reference = states[self.inputs[0]]
-        action_time = self._uniform_relative_time_values(
-            length=action.shape[1], reference=reference,
-            rate_hz=self.action_rate_hz, offset=self.action_start_offset,
-        )
-        future_time = self._uniform_relative_time_values(
-            length=self.future_horizon, reference=reference,
-            rate_hz=self.state_rate_hz, offset=1,
-        )
         state_token_features = []
         for key in self.inputs:
-            encoded, hidden = _run_gru_compat(self.state_encoders[key], states[key])
-            if self.state_pooling == "last":
-                token = hidden[-1]
-            else:
-                # A learned query can assign high weight to a short impact,
-                # reversal, or pre-contact transient anywhere in history.
-                query = self.state_pool_queries[key].expand(
-                    encoded.shape[0], -1, -1
-                )
-                pooled, _ = self.state_pool_attention(
-                    query=query.contiguous(),
-                    key=encoded.contiguous(),
-                    value=encoded.contiguous(),
-                    need_weights=_npu_legacy_attention(encoded.device),
-                )
-                token = pooled[:, 0]
-            token = token + self.modality_embeddings[key]
-            state_token_features.append(token)
-        # [B, M, d], where M=len(model.inputs).  Keeping M dynamic enables
-        # input-stream ablations without changing the prediction head.
-        state_features = torch.stack(state_token_features, dim=1)
+            sequence, _ = _run_gru_compat(self.state_encoders[key], states[key])
+            state_token_features.append(sequence + self.modality_embeddings[key])
+        # [B, M*T, D]: modality-major concatenation preserves each stream's
+        # chronological order; T is the actual internal history length.
+        state_features = torch.cat(state_token_features, dim=1)
         masked_action = action.masked_fill(~valid_action[..., None], 0.0)
         action_features, _ = _run_gru_compat(self.action_encoder, masked_action)
-        action_features = action_features + self.action_time_embedding(action_time)
+        positions = torch.arange(action.shape[1], device=action.device)
+        action_features = action_features + self.action_pos_embedding(positions)[None].to(
+            action_features.dtype
+        )
         state_tokens = self.state_token_norm(state_features)
         action_tokens = self.action_token_norm(action_features)
-        state_action_tokens = self.state_to_action_attention(
-            state_tokens,
-            action_tokens,
-            valid_action if self.use_action_padding_mask else None,
-        )
-        condition_memory = torch.cat((state_action_tokens, action_tokens), dim=1)
-        memory_padding_mask = None
-        if self.use_action_padding_mask:
-            memory_padding_mask = torch.cat(
-                (
-                    torch.zeros(
-                        state_tokens.shape[0],
-                        state_tokens.shape[1],
-                        device=state_tokens.device,
-                        dtype=torch.bool,
-                    ),
-                    ~valid_action,
-                ),
-                dim=1,
-            )
+        action_padding_mask = ~valid_action if self.use_action_padding_mask else None
         result = {
             "predicted_state_streams": self.predicted_state_streams,
             "state_tokens": state_tokens,
-            "state_action_tokens": state_action_tokens,
             "action_tokens": action_tokens,
-            "action_time": action_time,
-            "future_time": future_time,
-            "condition_memory": condition_memory,
-            "condition_memory_padding_mask": memory_padding_mask,
+            "action_padding_mask": action_padding_mask,
+            "tau_history_mask_probability": tau_mask_probability,
+            "tau_history_mask_fraction": tau_mask_fraction,
+            "tau_history_free_fraction": tau_free_fraction,
+            "_prepared_batch": batch,
         }
-        if memory_padding_mask is None:
-            result["condition_summary"] = condition_memory.mean(dim=1)
-        else:
-            valid_memory = (~memory_padding_mask).to(condition_memory.dtype)
-            result["condition_summary"] = (
-                (condition_memory * valid_memory[..., None]).sum(dim=1)
-                / valid_memory.sum(dim=1, keepdim=True).clamp_min(1.0)
-            )
+        # Preserve the contact head's token-weighted summary without building
+        # a concatenated memory for decoder attention.
+        action_weights = valid_action.to(action_tokens.dtype)
+        result["condition_summary"] = (
+            state_tokens.sum(dim=1)
+            + (action_tokens * action_weights[..., None]).sum(dim=1)
+        ) / (state_tokens.shape[1] + action_weights.sum(dim=1, keepdim=True))
         return result
 
     def _target_flow_state(self, batch, reference):
@@ -851,41 +695,28 @@ class ContactWorldModel(nn.Module):
         features = (
             self.flow_input_projection(trajectory_state)
             + self.flow_time_embedding(flow_time)[:, None, :]
-            + self.future_time_embedding(encoded["future_time"])
+            + self.future_pos_embedding(
+                torch.arange(trajectory_state.shape[1], device=trajectory_state.device)
+            )[None].to(trajectory_state.dtype)
         )
         for block in self.flow_blocks:
-            features = block(features, encoded["condition_memory"], encoded.get("condition_memory_padding_mask"))
+            features = block(
+                features, encoded["state_tokens"], encoded["action_tokens"],
+                encoded["action_padding_mask"],
+            )
         return self.flow_output(features), features
 
-    def _time_aligned_action_features(self, encoded):
-        """Map each high-rate future token to its action by physical time."""
+    def _aligned_action_features(self, encoded):
+        """Preserve nominal-rate ZOH contact alignment without timestamp inputs.
 
+        This selects contact features only; trajectory PE uses sequence indices.
+        """
         action = encoded["action_tokens"]
-        action_time = encoded["action_time"].float()
-        future_time = encoded["future_time"].float()
-        if action_time.ndim != 2 or future_time.ndim != 2:
-            raise ValueError("encoded physical times must have shape [B,T]")
-        if self.action_time_alignment == "zoh":
-            index = torch.searchsorted(action_time, future_time, right=True) - 1
-            index = index.clamp(0, action.shape[1] - 1)
-            return torch.gather(
-                action,
-                1,
-                index[..., None].expand(-1, -1, action.shape[-1]),
-            )
-        right = torch.searchsorted(action_time, future_time, right=False)
-        right = right.clamp(0, action.shape[1] - 1)
-        left = (right - 1).clamp(0, action.shape[1] - 1)
-        left_time = torch.gather(action_time, 1, left)
-        right_time = torch.gather(action_time, 1, right)
-        alpha = ((future_time - left_time) / (right_time - left_time).clamp_min(1.0e-6)).clamp(0.0, 1.0)
-        left_features = torch.gather(
-            action, 1, left[..., None].expand(-1, -1, action.shape[-1])
-        )
-        right_features = torch.gather(
-            action, 1, right[..., None].expand(-1, -1, action.shape[-1])
-        )
-        return (1.0 - alpha[..., None]) * left_features + alpha[..., None] * right_features
+        future_indices = torch.arange(self.future_horizon, device=action.device)
+        index = torch.floor(
+            (future_indices + 1).float() * self.action_rate_hz / self.state_rate_hz
+        ).long() - self.action_start_offset
+        return action.index_select(1, index.clamp(0, action.shape[1] - 1))
 
     def contact_logits(self, continuous_trajectory, encoded):
         expected = (
@@ -899,10 +730,8 @@ class ContactWorldModel(nn.Module):
                 f"[B, {self.future_horizon}, {self.flow_dim}]"
             )
         state = self.contact_state_projection(continuous_trajectory)
-        action = self._time_aligned_action_features(encoded)
-        condition = encoded.get("condition_summary")
-        if condition is None:
-            condition = encoded["condition_memory"].mean(dim=1)
+        action = self._aligned_action_features(encoded)
+        condition = encoded["condition_summary"]
         condition = self.contact_condition_norm(condition)[:, None, :].expand(
             -1, self.future_horizon, -1
         )
@@ -963,7 +792,7 @@ class ContactWorldModel(nn.Module):
             "velocity_pred": velocity_pred,
             "velocity_target": velocity_target,
             "flow_features": flow_features,
-            "_prepared_batch": batch,
+            "_prepared_batch": encoded.get("_prepared_batch", batch),
         }
         result.update(self._decoded_output(endpoint, encoded))
         return result
@@ -1011,7 +840,12 @@ class ContactWorldModel(nn.Module):
         num_samples = int(num_samples)
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
+        batch = self.prepare_batch(batch)
         if source_noise is not None:
+            if (torch.is_tensor(source_noise) and self.temporal_stride > 1
+                    and source_noise.ndim == 4
+                    and source_noise.shape[2] == self.external_future_horizon):
+                source_noise = source_noise[:, :, :: self.temporal_stride, ...].contiguous()
             expected = (
                 batch[self.inputs[0]].shape[0],
                 num_samples,
