@@ -15,7 +15,7 @@ def config(inputs=None, outputs=None):
     result = {
         "dataloader": {"state_history_horizon": 5, "prediction_horizon": 4, "action_condition_horizon": 3, "high_fps": 100, "normalize_mode": None},
         "model": {"inputs": list(inputs or SUPPORTED_STATE_STREAMS), "joint_dim": 2, "action_dim": 2, "contact_state_count": 3, "hidden_dim": 8, "state_layers": 1, "action_layers": 1, "flow_layers": 1, "flow_attention_heads": 2, "flow_ffn_multiplier": 2, "flow_inference_steps": 2, "flow_solver": "heun", "flow_source_mode": "gaussian", "dropout": 0.0},
-        "loss": {"dt": 0.01, "kinematic_consistency_weight": 0.01, "ddq_smoothness_weight": 0.01},
+        "loss": {"dt": 0.01},
     }
     if outputs is not None:
         result["model"]["outputs"] = list(outputs)
@@ -84,8 +84,6 @@ def test_all_temporal_gru_outputs_and_modality_embeddings_reach_loss(inputs, his
     cfg = config(inputs)
     cfg['dataloader'].update(state_history_horizon=history, action_condition_horizon=8)
     cfg['train'] = {'downsample': downsample}
-    # Single-stream losses do not use cross-stream physics regularizers.
-    cfg['loss'].update(kinematic_consistency_weight=0.0, ddq_smoothness_weight=0.0)
     model = ContactWorldModel(cfg)
     values = batch(cfg)
     sequences = {}
@@ -165,8 +163,8 @@ def test_training_configs_temporal_history_tokens(name, history_tokens):
 def test_checkpoint_contract_identifies_simplified_token_architecture():
     model = ContactWorldModel(config())
     contract = model.checkpoint_contract()
-    assert model.MODEL_VERSION == "carswm_v7"
-    assert contract["schema_version"] == 8
+    assert model.MODEL_VERSION == "carswm_v8"
+    assert contract["schema_version"] == 9
     assert contract["architecture"] == {
         "condition_encoder": "modality_gru_action_gru",
         "state_token": "all_gru_temporal_outputs_modality_major",
@@ -178,7 +176,7 @@ def test_checkpoint_contract_identifies_simplified_token_architecture():
     }
     assert contract["action"]["dataset_alignment"] == "previous"
     incompatible = dict(contract)
-    incompatible["model_version"] = "carswm_v6"
+    incompatible["model_version"] = "carswm_v7"
     with pytest.raises(ValueError, match="contract mismatch"):
         model.validate_checkpoint_contract(incompatible)
 
@@ -450,10 +448,8 @@ def test_null_outputs_fall_back_to_inputs():
     assert calculator.predicted_state_streams == ("q", "tau")
 
 
-def test_disabled_cross_stream_regularizers_allow_reduced_outputs():
+def test_flow_loss_allows_reduced_outputs():
     cfg = config(inputs=["q", "dq", "delta_q", "tau"], outputs=["tau"])
-    cfg["loss"]["kinematic_consistency_weight"] = 0.0
-    cfg["loss"]["ddq_smoothness_weight"] = 0.0
     values = batch(cfg)
     values.pop("q_future")
     values.pop("dq_future")
@@ -475,29 +471,6 @@ def test_contract_allows_ablation_without_q():
     assert output["flow_velocity_pred"].shape[-1] == 2 * 2
     loss, _ = ContactWorldModelLoss(cfg)(output, values)
     assert torch.isfinite(loss)
-
-
-def test_endpoint_schedule_and_delta_q_contract():
-    cfg = config()
-    calculator = ContactWorldModelLoss(cfg)
-    calculator.set_global_step(0, 100)
-    assert calculator.endpoint_weight == pytest.approx(0.1)
-    calculator.set_global_step(15, 100)
-    assert calculator.endpoint_weight == pytest.approx(0.05)
-    calculator.set_global_step(30, 100)
-    assert calculator.endpoint_weight == pytest.approx(0.0)
-    assert calculator.delta_q_consistency_weight == 0.0
-
-
-def test_kinematic_loss_is_zero_for_trapezoidal_integration():
-    cfg = config()
-    calculator = ContactWorldModelLoss(cfg)
-    values = batch(cfg)
-    values["q"][:] = 0.0
-    values["dq"][:] = 1.0
-    q = torch.arange(1, 5, dtype=torch.float32)[None, :, None].repeat(2, 1, 2) * 0.01
-    out = {"q_pred": q, "dq_pred": torch.ones_like(q)}
-    assert torch.max(calculator._kinematic_consistency(out, values)) < 1.0e-8
 
 
 @pytest.mark.parametrize('stride', [True, 3])

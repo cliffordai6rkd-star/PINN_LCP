@@ -19,23 +19,24 @@ sampling uses a fixed `max` aggregation of the contact-phase labels already in
 each future window, with importance correction for the original empirical
 risk.
 
-The Teacher encodes each selected state stream with an independent GRU and a
-configurable state-token pool (the training config uses learned-query attention
-pooling over the full history, while legacy v3 checkpoints retain final-hidden
-pooling), encodes the action chunk with a separate GRU plus elapsed physical-time embeddings, and
-uses state-to-action cross-attention (state queries, action keys/values) before
-forming the condition memory as action-aware state tokens plus the raw action
-tokens. Future Flow tokens likewise receive elapsed physical-time embeddings.
-Every Flow block then applies future-token self-attention, cross-attention to
-that condition memory, and an FFN before predicting the conditional velocity
-field. Teacher and Student differ only in configured capacity and Flow
-integration steps.
+The Teacher retains every temporal GRU output from each state modality,
+adds modality embeddings and shared learned recency positions (newest = 0),
+and concatenates history in modality-major order. Actions use a separate GRU
+and learned sequence positions. Each Flow block preserves future self-attention,
+then reads history and action through two parallel, independent cross-attention
+branches and sums their residuals before the FFN. Future positions are learned
+discrete embeddings; FlowTimeEmbedding still conditions on integration time s.
 
-The WM action export stores one executed action for every recorded 100 Hz
-state row. Training slices future action chunks directly from this high-rate
-sequence; no camera-rate ZOH window is materialized. Token positions use the
-nominal uniform 100 Hz grid, while recorded timestamps remain available as
-metadata.
+State rows remain at 100 Hz. The eight action tokens come from consecutive
+recorded 25 Hz camera/VLA action indices, independently of state downsampling.
+Timestamp metadata remains available for alignment and diagnostics.
+
+The baseline enables `loss.free_dynamics_weight: 0.1`. A small shared-encoder
+head reads only the current raw GRU outputs of q/dq/delta_q to predict current
+measured tau in its existing normalization space. Only complete, valid, all-free
+history windows supervise it; padding and skipped contact rows cannot qualify.
+The auxiliary MSE is normalized by the sum of free-sample importance weights.
+Main-model tau history is never masked. Prediction/sampling do not run this head.
 
 ## Training
 
@@ -44,16 +45,16 @@ budget. `num_epochs` is only a data-pass/logging counter when
 `max_optimizer_steps` is set.
 
 ```bash
-carswm-train-contact-wm --config config/train_cfg/contact_world_model.yaml
-carswm-train-contact-wm-opd --config config/train_cfg/contact_world_model_opd.yaml
+carswm-train-contact-wm --config config/train_cfg/cwm_all_50hz.yaml
 ```
 
 The authoritative budgets and checkpoint cadence are the
 `train.max_optimizer_steps` and `train.checkpoint_every_steps` values in each
-YAML. The old `max_train_steps` key is accepted only as a compatibility alias.
+YAML. Set the baseline `dataloader.prediction_horizon` explicitly before training;
+it is currently empty.
 
-Every CARS-WM checkpoint contains `model_version: carswm_v3` and a complete
-`carswm_contract`. Older ContactWorldModel checkpoints do not satisfy this
+Every CARS-WM checkpoint contains `model_version: carswm_v8` and a complete
+`carswm_contract` (schema 9). Older ContactWorldModel checkpoints do not satisfy this
 contract and must be retrained.
 
 ## Checkpoint diagnostics

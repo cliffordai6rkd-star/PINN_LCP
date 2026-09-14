@@ -116,6 +116,9 @@ model:
   emit_contact_probabilities: false
 
 
+loss:
+  free_dynamics_weight: 0.1
+
 train:
   device: cuda:0
   # State windows use the 100 Hz interface; downsample affects states only.
@@ -126,9 +129,6 @@ train:
   dataset_on_device: false
   batch_size: 512
   gradient_every: 1
-  # Curriculum: progressively mask historical tau on complete free-motion windows.
-  # Future tau targets and their flow loss remain fully supervised.
-  tau_history_mask_warmup_steps: 100000
   # Keep host-memo2y pressure bounded on the 15 GiB training workstation.
   # Validation runs in the main process by default (see val_num_workers).
   num_workers: 2
@@ -159,7 +159,7 @@ train:
   # Only these tensors participate in the model/loss.  With dataset_on_device,
   # all materialized sample tensors are already on GPU; this list still
   # controls which keys are retained by the generic transfer path.
-  device_batch_keys: [q, dq, delta_q, tau, action, action_mask, q_future, dq_future, delta_q_future, tau_future, contact_future, importance_weight]
+  device_batch_keys: [q, dq, delta_q, tau, action, action_mask, q_future, dq_future, delta_q_future, tau_future, contact, history_valid_mask, contact_future, importance_weight]
   amp:
     enabled: true
     dtype: bfloat16

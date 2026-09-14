@@ -1649,7 +1649,11 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             high_idx + 1,
             dtype=torch.long,
             device=self.high_timestamps.device,
-        ).clamp_min(start)
+        )
+        # A replicated padding row is not a confirmed free observation. If
+        # contact labeling is disabled, zero placeholder labels are invalid.
+        history_valid_mask = (history >= start) & self.contact_gate_config.enabled
+        history = history.clamp_min(start)
         future = torch.arange(
             high_idx + 1,
             high_idx + self.future_horizon + 1,
@@ -1671,6 +1675,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 device=sample_device,
             ),
             "history_indices": history,
+            "history_valid_mask": history_valid_mask,
             "future_indices": future,
             "history_timestamp_ns": self.high_timestamps.index_select(0, history),
             "future_timestamp_ns": self.high_timestamps.index_select(0, future),

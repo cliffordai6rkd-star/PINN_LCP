@@ -145,3 +145,34 @@ def test_training_configs_keep_eight_recorded_action_tokens(name):
 def test_v3_rejects_old_100hz_action_indices(make_dataset):
     with pytest.raises(ValueError, match='reconvert'):
         make_dataset(hold=1)
+
+
+def test_padding_validity_current_normalized_tau_and_history_alignment(make_dataset):
+    from dataclasses import replace
+    from train.nomalizer import Normalizer
+    dataset, cfg = make_dataset()
+    dataset.contact_gate_config = replace(dataset.contact_gate_config, enabled=True)
+    dataset.contact.zero_()
+    dataset.normalize_mode = 'gaussian'
+    dataset.set_normalizer(Normalizer({'tau': {'mean': torch.tensor([10., 10.]),
+                                            'std': torch.tensor([2., 2.])}}))
+    first = dataset[0]
+    assert not first['history_valid_mask'].all()
+    assert first['history_valid_mask'][-1]
+    sample = dataset[52]
+    assert sample['history_valid_mask'].all()
+    public = torch.utils.data.default_collate([sample])
+    model = ContactWorldModel(cfg)
+    prepared = model.prepare_batch(public)
+    assert prepared['free_dynamics_mask'].item()
+    assert prepared['contact'].shape[1] == prepared['q'].shape[1] == 25
+    assert prepared['history_valid_mask'].shape[1] == 25
+    raw_tau = dataset.high_tensors['tau'][sample['sample_idx']]
+    expected = dataset.normalizer.gaussian_normalize('tau', raw_tau)
+    torch.testing.assert_close(prepared['tau'][0, -1], expected)
+    for episode in dataset.episodes:
+        raw = int(episode['dataset_from_index'])
+        sample = dataset[dataset.valid_indices.index(raw)]
+        assert sample['history_valid_mask'].sum() == 1
+    dataset.contact_gate_config = replace(dataset.contact_gate_config, enabled=False)
+    assert not dataset[52]['history_valid_mask'].any()

@@ -73,7 +73,8 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         # Teacher weights are copied after BaseTrainer has constructed the
         # student so optimizer/EMA state are created for student parameters.
         teacher = ContactWorldModel(self.teacher_config)
-        state = self.teacher_checkpoint.get("model") or self.teacher_checkpoint.get("model_raw")
+        teacher.validate_checkpoint(self.teacher_checkpoint)
+        state = self.teacher_checkpoint.get("model")
         if not isinstance(state, Mapping):
             raise KeyError("teacher checkpoint has no EMA model weights")
         teacher.load_state_dict(state, strict=True)
@@ -82,7 +83,8 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         student = ContactWorldModelStudent.from_teacher(self.teacher, student_steps=self.student_steps)
         if self.student_init_checkpoint_path:
             payload = torch.load(self.student_init_checkpoint_path, map_location="cpu", weights_only=False)
-            state = payload.get("model") or payload.get("model_raw")
+            student.validate_checkpoint(payload)
+            state = payload.get("model")
             if not isinstance(state, Mapping):
                 raise KeyError("student initialization checkpoint has no model weights")
             student.load_state_dict(state, strict=True)

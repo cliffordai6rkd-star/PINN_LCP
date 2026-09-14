@@ -10,7 +10,7 @@ def cfg():
     return {
         "dataloader": {"state_history_horizon": 4, "prediction_horizon": 3, "action_condition_horizon": 2, "high_fps": 100},
         "model": {"inputs": ["q", "dq", "delta_q", "tau"], "joint_dim": 2, "action_dim": 2, "contact_state_count": 3, "hidden_dim": 8, "state_layers": 1, "action_layers": 1, "flow_layers": 1, "flow_attention_heads": 2, "flow_ffn_multiplier": 2, "flow_inference_steps": 1, "flow_solver": "euler", "flow_source_mode": "gaussian", "dropout": 0.0},
-        "loss": {"dt": 0.01, "kinematic_consistency_weight": 0.0, "ddq_smoothness_weight": 0.0},
+        "loss": {"dt": 0.01},
     }
 
 

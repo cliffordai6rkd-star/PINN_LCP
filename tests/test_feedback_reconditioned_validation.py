@@ -136,8 +136,8 @@ def _trainer_config(*, feedback_reconditioned=True):
         },
         "loss": {
             "dt": 0.01,
-            "kinematic_consistency_weight": 0.0,
-            "ddq_smoothness_weight": 0.0,
+
+
         },
         "train": {
             "device": "cpu",

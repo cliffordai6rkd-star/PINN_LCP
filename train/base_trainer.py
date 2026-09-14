@@ -952,7 +952,17 @@ class BaseTrainer:
 
         # ``model`` is the EMA copy when EMA is enabled.  Continue optimizing
         # the raw model, while restoring EMA independently when available.
-        if self.ema is not None:
+        if callable(validate_contract):
+            # Current WM resumes require the recorded raw/EMA states, never
+            # substitute one for a missing checkpoint component.
+            if not isinstance(raw_model_state, Mapping):
+                raise KeyError("WM resume checkpoint is missing model_raw weights")
+            self.model.load_state_dict(raw_model_state, strict=True)
+            if self.ema is not None:
+                if not isinstance(model_state, Mapping):
+                    raise KeyError("WM resume checkpoint is missing EMA model weights")
+                self.ema.model.load_state_dict(model_state, strict=True)
+        elif self.ema is not None:
             self.model.load_state_dict(raw_model_state or model_state, strict=True)
             self.ema.model.load_state_dict(model_state or raw_model_state, strict=True)
         else:

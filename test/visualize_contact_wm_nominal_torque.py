@@ -523,6 +523,7 @@ def run(args: argparse.Namespace) -> dict:
         raise RuntimeError("CUDA was requested but is unavailable")
 
     model = ContactWorldModel(config)
+    model.validate_checkpoint(checkpoint)
     weight_key = "model" if args.weights == "ema" else "model_raw"
     state_dict = checkpoint.get(weight_key)
     if not isinstance(state_dict, Mapping):

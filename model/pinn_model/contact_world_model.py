@@ -130,8 +130,8 @@ class ContactWorldModel(nn.Module):
     TARGET_KEYS = tuple(f"{key}_future" for key in PREDICTED_STATE_STREAMS) + (
         "contact_future",
     )
-    # Shared learned history recency positions change the checkpoint contract.
-    MODEL_VERSION = "carswm_v7"
+    # Shared free-dynamics supervision is part of the current checkpoint contract.
+    MODEL_VERSION = "carswm_v8"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -149,6 +149,8 @@ class ContactWorldModel(nn.Module):
             raise ValueError("train.downsample must be false/true or a positive integer")
         self.temporal_downsample = self.temporal_stride > 1
         self.external_history_horizon = int(data_config.get("state_history_horizon", 50))
+        if data_config.get("prediction_horizon", 40) is None:
+            raise ValueError("dataloader.prediction_horizon is empty; set it explicitly before training")
         self.external_future_horizon = int(data_config.get("prediction_horizon", 40))
         self.external_action_condition_horizon = int(data_config.get("action_condition_horizon", 8))
         for name, value in (("history", self.external_history_horizon), ("future", self.external_future_horizon)):
@@ -170,19 +172,9 @@ class ContactWorldModel(nn.Module):
         } & model_config.keys()
         if removed:
             raise ValueError(f"Removed model time-encoding options: {sorted(removed)}")
-        # During training, complete free-motion windows can optionally hide
-        # their historical measured torque.  The future torque target remains
-        # untouched; this augmentation only reduces shortcut dependence on
-        # tau history.  Keep the legacy key as a compatibility alias.
-        self.tau_history_mask_warmup_steps = int(
-            train_config.get(
-                "tau_history_mask_warmup_steps",
-                train_config.get("tau_free_warmup_steps", 0),
-            )
-        )
-        if self.tau_history_mask_warmup_steps < 0:
-            raise ValueError("train.tau_history_mask_warmup_steps must be non-negative")
-        self._global_step = 0
+        removed_train = {"tau_history_mask_warmup_steps", "tau_free_warmup_steps"} & train_config.keys()
+        if removed_train:
+            raise ValueError(f"Removed tau history masking options: {sorted(removed_train)}")
 
         configured_inputs = model_config.get("inputs")
         if configured_inputs is None:
@@ -276,6 +268,17 @@ class ContactWorldModel(nn.Module):
         )
         self.future_pos_embedding = nn.Embedding(self.future_horizon, self.hidden_dim)
         self.history_pos_embedding = nn.Embedding(self.history_horizon, self.hidden_dim)
+        free_weight = float((config.get("loss") or {}).get("free_dynamics_weight", 0.0))
+        if not math.isfinite(free_weight) or free_weight < 0:
+            raise ValueError("loss.free_dynamics_weight must be finite and non-negative")
+        self.free_dynamics_enabled = free_weight > 0
+        if self.free_dynamics_enabled and not {"q", "dq", "delta_q", "tau"}.issubset(self.inputs):
+            raise ValueError("free dynamics requires q, dq, delta_q and measured tau histories")
+        self.free_dynamics_head = (
+            nn.Sequential(nn.Linear(3 * self.hidden_dim, self.hidden_dim), nn.SiLU(),
+                          nn.Linear(self.hidden_dim, self.joint_dim))
+            if self.free_dynamics_enabled else None
+        )
         self.state_token_norm = nn.LayerNorm(self.hidden_dim)
         self.action_token_norm = nn.LayerNorm(self.hidden_dim)
         self.flow_input_projection = nn.Sequential(
@@ -353,7 +356,7 @@ class ContactWorldModel(nn.Module):
             str(contact_config.get("metric", "tau_ext_l1")).lower(), {}
         )
         return {
-            "schema_version": 8,
+            "schema_version": 9,
             "model_version": self.MODEL_VERSION,
             "state_contract": "robot_state_streams_v1",
             "architecture": {
@@ -366,6 +369,11 @@ class ContactWorldModel(nn.Module):
                 "condition_memories": "independent_history_and_action",
                 "action_position_encoding": "learned_sequence_index",
                 "future_position_encoding": "learned_sequence_index",
+            },
+            "free_dynamics": {
+                "enabled": self.free_dynamics_enabled,
+                "inputs": ["q", "dq", "delta_q"],
+                "target": "normalized_current_measured_tau",
             },
             "input_state_streams": list(self.inputs),
             "predicted_continuous_streams": list(self.predicted_state_streams),
@@ -459,6 +467,12 @@ class ContactWorldModel(nn.Module):
             )
         return expected
 
+    def validate_checkpoint(self, checkpoint):
+        """Reject old versions and schemas before any weight loading."""
+        if checkpoint.get("model_version") != self.MODEL_VERSION:
+            raise ValueError(f"Incompatible WM checkpoint model_version; expected {self.MODEL_VERSION}")
+        return self.validate_checkpoint_contract(checkpoint.get("carswm_contract"))
+
     @staticmethod
     def _require_sequence(batch, key, *, horizon=None, feature_dim=None):
         if key not in batch:
@@ -481,9 +495,22 @@ class ContactWorldModel(nn.Module):
 
     def prepare_batch(self, batch: Mapping[str, torch.Tensor]):
         """Downsample state windows only; preserve every recorded action token."""
-        if self.temporal_stride == 1:
-            return batch
         result = dict(batch)
+        # Reduce BEFORE state striding: padding or contact in a skipped row
+        # cannot become a confirmed all-free history after downsampling.
+        if "free_dynamics_mask" not in result and "contact" in batch and "history_valid_mask" in batch:
+            labels = batch["contact"]
+            valid = batch["history_valid_mask"]
+            reference = batch[self.inputs[0]]
+            if (labels.ndim != 3 or labels.shape[-1] != 1
+                    or valid.shape != labels.shape[:2]
+                    or labels.shape[:2] != reference.shape[:2]):
+                raise ValueError("contact/history_valid_mask must align as [B,H,1] / [B,H]")
+            if valid.dtype != torch.bool:
+                raise TypeError("history_valid_mask must be boolean")
+            result["free_dynamics_mask"] = (valid & torch.isfinite(labels[..., 0]) & labels[..., 0].eq(0)).all(dim=1)
+        if self.temporal_stride == 1:
+            return result
         for key, value in batch.items():
             if not torch.is_tensor(value) or value.ndim < 2:
                 continue
@@ -491,67 +518,20 @@ class ContactWorldModel(nn.Module):
                 expected = self.external_history_horizon
             elif key.endswith("_future") or key.endswith("_future_raw") or key in {"future_time", "future_timestamp_ns", "future_indices"}:
                 expected = self.external_future_horizon
-            elif key in {"history_timestamp_ns", "history_indices"}:
+            elif key in {"history_timestamp_ns", "history_indices", "history_valid_mask"}:
                 expected = self.external_history_horizon
             else:
                 continue
             if value.shape[1] == expected:
                 # History must still end at the current 100 Hz state anchor.
                 is_history = key in self.inputs or key in {
-                    "contact", "history_timestamp_ns", "history_indices"
+                    "contact", "history_timestamp_ns", "history_indices", "history_valid_mask"
                 }
                 offset = self.temporal_stride - 1 if is_history else 0
                 result[key] = value[:, offset :: self.temporal_stride, ...]
             elif value.shape[1] != expected // self.temporal_stride:
                 raise ValueError(f"{key} has temporal length {value.shape[1]}, expected {expected} or {expected // self.temporal_stride}")
         return result
-
-    def set_global_step(self, global_step: int):
-        """Set optimizer-update progress used by training-only curricula."""
-        self._global_step = max(int(global_step), 0)
-
-    def _mask_tau_history(self, batch: Mapping[str, torch.Tensor]):
-        """Curricularly mask historical tau on complete free-motion windows."""
-        reference = batch.get("tau")
-        device = reference.device if torch.is_tensor(reference) else None
-        if (
-            not self.training
-            or "tau" not in self.inputs
-            or not torch.is_tensor(reference)
-            or self.tau_history_mask_warmup_steps == 0
-        ):
-            zero = reference.new_zeros(()) if torch.is_tensor(reference) else torch.tensor(0.0)
-            return dict(batch), zero, zero, zero
-
-        probability = min(
-            1.0,
-            self._global_step / float(self.tau_history_mask_warmup_steps),
-        )
-        history_contact = batch.get("contact")
-        future_contact = batch.get("contact_future")
-        if not torch.is_tensor(history_contact) or not torch.is_tensor(future_contact):
-            zero = reference.new_zeros(())
-            return dict(batch), reference.new_tensor(probability), zero, zero
-        history_contact = history_contact.to(device=device)
-        future_contact = future_contact.to(device=device)
-        if history_contact.shape[0] != reference.shape[0] or future_contact.shape[0] != reference.shape[0]:
-            raise ValueError("contact and tau must have the same batch dimension")
-        free_history = history_contact.reshape(reference.shape[0], -1).round().eq(0).all(dim=1)
-        free_future = future_contact.reshape(reference.shape[0], -1).round().eq(0).all(dim=1)
-        free_window = free_history & free_future
-        sampled = torch.rand(reference.shape[0], device=device) < probability
-        mask_samples = free_window & sampled
-        masked = dict(batch)
-        if torch.any(mask_samples):
-            tau = reference.clone()
-            tau[mask_samples] = 0.0
-            masked["tau"] = tau
-        return (
-            masked,
-            reference.new_tensor(probability),
-            mask_samples.to(dtype=reference.dtype).mean(),
-            free_window.to(dtype=reference.dtype).mean(),
-        )
 
     def _action_inputs(self, batch):
         action = batch.get("action")
@@ -594,13 +574,15 @@ class ContactWorldModel(nn.Module):
             raise ValueError("action does not match the state batch")
         return states, action, valid
 
-    def encode_conditions(self, batch: Mapping[str, torch.Tensor]):
+    def encode_conditions(self, batch: Mapping[str, torch.Tensor], *, compute_free_dynamics=False):
         batch = self.prepare_batch(batch)
-        batch, tau_mask_probability, tau_mask_fraction, tau_free_fraction = self._mask_tau_history(batch)
         states, action, valid_action = self._condition_inputs(batch)
         state_token_features = []
+        motion_current = {}
         for key in self.inputs:
             sequence, _ = _run_gru_compat(self.state_encoders[key], states[key])
+            if compute_free_dynamics and key in {"q", "dq", "delta_q"}:
+                motion_current[key] = sequence[:, -1]
             # GRU outputs remain oldest-to-newest; recency zero is current.
             positions = torch.arange(sequence.shape[1] - 1, -1, -1, device=sequence.device)
             history_position = self.history_pos_embedding(positions)[None].to(sequence.dtype)
@@ -624,9 +606,6 @@ class ContactWorldModel(nn.Module):
             "state_tokens": state_tokens,
             "action_tokens": action_tokens,
             "action_padding_mask": action_padding_mask,
-            "tau_history_mask_probability": tau_mask_probability,
-            "tau_history_mask_fraction": tau_mask_fraction,
-            "tau_history_free_fraction": tau_free_fraction,
             "_prepared_batch": batch,
         }
         # Preserve the contact head's token-weighted summary without building
@@ -636,6 +615,12 @@ class ContactWorldModel(nn.Module):
             state_tokens.sum(dim=1)
             + (action_tokens * action_weights[..., None]).sum(dim=1)
         ) / (state_tokens.shape[1] + action_weights.sum(dim=1, keepdim=True))
+        if compute_free_dynamics:
+            if self.free_dynamics_head is None:
+                raise ValueError("free dynamics head is disabled")
+            result["free_tau_pred"] = self.free_dynamics_head(torch.cat(
+                [motion_current[key] for key in ("q", "dq", "delta_q")], dim=-1
+            ))
         return result
 
     def _target_flow_state(self, batch, reference):
@@ -777,7 +762,7 @@ class ContactWorldModel(nn.Module):
 
     def forward(self, batch, *, flow_time=None, source_noise=None):
         batch = self.prepare_batch(batch)
-        encoded = self.encode_conditions(batch)
+        encoded = self.encode_conditions(batch, compute_free_dynamics=self.free_dynamics_enabled)
         reference = batch[self.inputs[0]]
         target_state = self._target_flow_state(batch, reference)
         source_state = self._gaussian_flow_source(reference, source_noise)

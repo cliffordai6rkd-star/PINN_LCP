@@ -126,9 +126,6 @@ train:
   dataset_on_device: false
   batch_size: 128
   gradient_every: 1
-  # Curriculum: progressively mask historical tau on complete free-motion windows.
-  # Future tau targets and their flow loss remain fully supervised.
-  tau_history_mask_warmup_steps: 100000
   # Keep host-memo2y pressure bounded on the 15 GiB training workstation.
   # Validation runs in the main process by default (see val_num_workers).
   num_workers: 2

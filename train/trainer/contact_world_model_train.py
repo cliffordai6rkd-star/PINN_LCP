@@ -43,7 +43,7 @@ def parse_args():
         "--config",
         "-c",
         type=Path,
-        default=Path("config/train_cfg/contact_world_model.yaml"),
+        default=Path("config/train_cfg/cwm_all_50hz.yaml"),
     )
     return parser.parse_args()
 
@@ -54,6 +54,8 @@ class ContactWorldModelTrainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
         self.loss_calculator = ContactWorldModelLoss(config)
+        if self.loss_calculator.free_dynamics_weight > 0 and self.device_batch_keys is not None:
+            self.device_batch_keys.update({"contact", "history_valid_mask", "tau", "importance_weight"})
         self.validation_flow_time = float(
             self.train_config.get("validation_flow_time", 0.5)
         )
@@ -430,14 +432,6 @@ class ContactWorldModelTrainer(BaseTrainer):
         )
 
     def compute_loss(self, batch):
-        total_steps = getattr(self, "max_optimizer_steps", None)
-        if total_steps is None and self.loader is not None:
-            total_steps = self.num_epochs * len(self.loader)
-        self.loss_calculator.set_global_step(self.global_step, total_steps)
-        # Keep model-side training curricula (e.g. historical tau masking)
-        # synchronized with optimizer updates.
-        if hasattr(self.model, "set_global_step"):
-            self.model.set_global_step(self.global_step)
         flow_time = None if self.model.training else self.validation_flow_time
         out = self.model(batch, flow_time=flow_time)
         loss, loss_dict = self.loss_calculator(out, batch)

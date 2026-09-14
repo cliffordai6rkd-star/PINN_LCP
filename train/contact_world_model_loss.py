@@ -1,9 +1,7 @@
 """Data losses for the configurable state/contact world model.
 
-``delta_q`` is a real
-dataset channel and is supervised directly; it is never reconstructed from a
-predicted q trajectory.  The optional kinematic and velocity-smoothness terms
-are soft regularizers only.
+``delta_q`` is a real dataset channel. Continuous targets use Flow Matching;
+current measured tau also supervises the optional shared free-dynamics head.
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ from model.pinn_model.contact_world_model import PREDICTED_STATE_STREAMS
 
 
 class ContactWorldModelLoss:
-    """Combine flow matching, direct state MSE and contact CE."""
+    """Combine flow matching, contact CE and optional free-dynamics supervision."""
 
     FLOW_STREAM_WEIGHTS = {"q": 1.0, "dq": 1.0, "delta_q": 1.0, "tau": 1.0}
     CONTACT_LOSS_WEIGHT = 0.1
@@ -56,65 +54,25 @@ class ContactWorldModelLoss:
         self.flow_dq_weight = self.FLOW_STREAM_WEIGHTS["dq"]
         self.flow_delta_q_weight = self.FLOW_STREAM_WEIGHTS["delta_q"]
         self.flow_tau_weight = self.FLOW_STREAM_WEIGHTS["tau"]
-        # Kept as a read-only compatibility value for old configs.  Torque
-        # flow supervision is never gated; the curriculum now masks only the
-        # historical tau condition in the model encoder.
-        self.tau_history_mask_warmup_steps = int(
-            train_config.get(
-                "tau_history_mask_warmup_steps",
-                train_config.get("tau_free_warmup_steps", 0),
-            )
-        )
-        if self.tau_history_mask_warmup_steps < 0:
-            raise ValueError("train.tau_history_mask_warmup_steps must be non-negative")
+        removed = {"tau_history_mask_warmup_steps", "tau_free_warmup_steps"} & train_config.keys()
+        if removed:
+            raise ValueError(f"Removed tau history masking options: {sorted(removed)}")
+        self.free_dynamics_weight = float(loss_config.get("free_dynamics_weight", 0.0))
+        if not math.isfinite(self.free_dynamics_weight) or self.free_dynamics_weight < 0:
+            raise ValueError("loss.free_dynamics_weight must be finite and non-negative")
         self.q_weight = float(loss_config.get("q_weight", 1.0))
         self.dq_weight = float(loss_config.get("dq_weight", 1.0))
         self.delta_q_weight = float(loss_config.get("delta_q_weight", 1.0))
         self.tau_weight = float(loss_config.get("tau_weight", 1.0))
         self.contact_weight = self.CONTACT_LOSS_WEIGHT
-        endpoint_config = loss_config.get("endpoint_loss") or {}
-        self.endpoint_enabled = bool(endpoint_config.get("enabled", True))
-        self.endpoint_initial_weight = float(
-            endpoint_config.get("initial_weight", 0.1)
-        )
-        self.endpoint_final_weight = float(
-            endpoint_config.get("final_weight", 0.0)
-        )
-        self.endpoint_decay_fraction = float(
-            endpoint_config.get("decay_fraction", 0.3)
-        )
-        self.endpoint_schedule = str(
-            endpoint_config.get("schedule", "linear")
-        ).lower()
-        self.kinematic_consistency_weight = float(
-            loss_config.get("kinematic_consistency_weight", 0.0)
-        )
-        configured_joint_scales = loss_config.get("kinematic_joint_scales")
-        self.kinematic_joint_scales = (
-            None
-            if configured_joint_scales is None
-            else tuple(float(value) for value in configured_joint_scales)
-        )
-        self.delta_q_consistency_weight = float(
-            loss_config.get("delta_q_consistency_weight", 0.0)
-        )
-        self.torque_contact_weight = float(
-            loss_config.get("torque_contact_weight", 0.0)
-        )
-        self.ddq_smoothness_weight = float(loss_config.get("ddq_smoothness_weight", 0.0))
-        self.ddq_smoothness_warmup_steps = int(
-            loss_config.get("ddq_smoothness_warmup_steps", 1000)
-        )
-        self.ddq_smoothness_huber_delta = float(
-            loss_config.get("ddq_smoothness_huber_delta", 1.0)
-        )
-        self.ddq_smoothness_normalize = bool(
-            loss_config.get("ddq_smoothness_normalize", True)
-        )
+        removed_loss = {
+            "endpoint_loss", "kinematic_consistency_weight", "kinematic_joint_scales",
+            "delta_q_consistency_weight", "torque_contact_weight", "ddq_smoothness_weight",
+            "ddq_smoothness_warmup_steps", "ddq_smoothness_huber_delta", "ddq_smoothness_normalize",
+        } & loss_config.keys()
+        if removed_loss:
+            raise ValueError(f"Removed unused WM loss options: {sorted(removed_loss)}")
         self.emit_physical_diagnostics = bool(loss_config.get("emit_physical_diagnostics", False))
-        self._global_step = 0
-        self._total_steps = None
-        self._ddq_smoothness_factor = 0.0 if self.ddq_smoothness_warmup_steps > 0 else 1.0
         self.dt = float(
             loss_config.get(
                 "dt",
@@ -144,10 +102,6 @@ class ContactWorldModelLoss:
     def _validate(self):
         if self.dt <= 0.0 or not math.isfinite(self.dt):
             raise ValueError("loss.dt must be finite and positive")
-        if self.ddq_smoothness_warmup_steps < 0:
-            raise ValueError("loss.ddq_smoothness_warmup_steps must be non-negative")
-        if self.ddq_smoothness_huber_delta <= 0.0 or not math.isfinite(self.ddq_smoothness_huber_delta):
-            raise ValueError("loss.ddq_smoothness_huber_delta must be finite and positive")
         weights = {
             name: value
             for name, value in vars(self).items()
@@ -160,22 +114,6 @@ class ContactWorldModelLoss:
             not math.isfinite(value) or value <= 0.0 for value in self.contact_class_weights
         ):
             raise ValueError("contact class weights must be finite and positive")
-        if self.kinematic_joint_scales is not None and (
-            len(self.kinematic_joint_scales) != self.joint_dim
-            or any(
-                not math.isfinite(value) or value <= 0.0
-                for value in self.kinematic_joint_scales
-            )
-        ):
-            raise ValueError(
-                f"loss.kinematic_joint_scales must contain {self.joint_dim} "
-                "finite positive values"
-            )
-        if not 0.0 < self.endpoint_decay_fraction <= 1.0:
-            raise ValueError("endpoint_loss.decay_fraction must be in (0, 1]")
-        if self.endpoint_schedule not in {"linear", "cosine"}:
-            raise ValueError("endpoint_loss.schedule must be 'linear' or 'cosine'")
-
     def set_normalizer(self, normalizer):
         self.normalizer = normalizer
 
@@ -189,34 +127,6 @@ class ContactWorldModelLoss:
             )
         self.contact_class_weights = values
         self.contact_class_weights_is_auto = False
-
-    def set_global_step(self, global_step: int, total_steps: int | None = None):
-        self._global_step = max(int(global_step), 0)
-        if total_steps is not None:
-            self._total_steps = max(int(total_steps), 1)
-        if self.ddq_smoothness_warmup_steps <= 0:
-            self._ddq_smoothness_factor = 1.0
-        else:
-            self._ddq_smoothness_factor = min(
-                1.0, self._global_step / float(self.ddq_smoothness_warmup_steps)
-            )
-
-    @property
-    def endpoint_weight(self):
-        if not self.endpoint_enabled:
-            return 0.0
-        progress = (
-            0.0
-            if self._total_steps is None
-            else min(self._global_step / float(self._total_steps), 1.0)
-        )
-        decay_progress = min(progress / self.endpoint_decay_fraction, 1.0)
-        if self.endpoint_schedule == "cosine":
-            decay_progress = 0.5 - 0.5 * math.cos(math.pi * decay_progress)
-        return (
-            (1.0 - decay_progress) * self.endpoint_initial_weight
-            + decay_progress * self.endpoint_final_weight
-        )
 
     @staticmethod
     def _per_sample_mean(value):
@@ -328,129 +238,27 @@ class ContactWorldModelLoss:
         ).reshape(logits.shape[:2])
         return frame_loss.mean(dim=1)
 
-    def _kinematic_consistency(self, out, batch):
-        if (
-            self.kinematic_consistency_weight <= 0.0
-            or not {"q", "dq"}.issubset(self.predicted_state_streams)
-            or not {"q", "dq"}.issubset(batch)
-        ):
-            reference = out[f"{self.predicted_state_streams[0]}_pred"]
-            return reference.new_zeros(reference.shape[0])
-        q_future = self._physical("q", self._required(out, "q_pred"))
-        dq_future = self._physical("dq", self._required(out, "dq_pred"))
-        q_history = self._physical("q", self._required(batch, "q"))
-        dq_history = self._physical("dq", self._required(batch, "dq"))
-        increments = torch.cat(
-            (q_future[:, :1] - q_history[:, -1:], q_future[:, 1:] - q_future[:, :-1]),
-            dim=1,
-        )
-        # Use trapezoidal integration.  The first future interval bridges the
-        # last measured velocity and the first predicted velocity; subsequent
-        # intervals use adjacent predicted velocities.
-        velocity_integral = torch.cat(
-            (
-                0.5 * self.dt * (dq_history[:, -1:] + dq_future[:, :1]),
-                0.5 * self.dt * (dq_future[:, :-1] + dq_future[:, 1:]),
-            ),
-            dim=1,
-        )
-        scale = self.kinematic_joint_scales
-        if scale is None and self.normalizer is not None:
-            stats = getattr(self.normalizer, "stats", {})
-            q_stats = stats.get("q") if isinstance(stats, Mapping) else None
-            if isinstance(q_stats, Mapping):
-                scale = q_stats.get("std")
-        if scale is None:
-            scale = torch.ones(self.joint_dim, device=q_future.device, dtype=q_future.dtype)
-        scale = torch.as_tensor(scale, device=q_future.device, dtype=q_future.dtype)
-        scale = scale.reshape(1, 1, -1).clamp_min(1.0e-6)
-        residual = (increments - velocity_integral) / scale
-        return self._per_sample_mean(residual.square())
-
-    def _ddq_smoothness(self, out):
-        if self.ddq_smoothness_weight <= 0.0 or "dq" not in self.predicted_state_streams:
-            reference_key = self.predicted_state_streams[0]
-            reference = out[f"{reference_key}_pred"]
-            return reference.new_zeros(reference.shape[0])
-        dq_future = self._physical("dq", self._required(out, "dq_pred"))
-        if dq_future.shape[1] < 2:
-            return dq_future.new_zeros(dq_future.shape[0])
-        ddq = torch.diff(dq_future, dim=1) / self.dt
-        # Smoothness is a change-of-acceleration (jerk) penalty.  Penalizing
-        # ddq^2 itself would bias the model toward zero acceleration and can
-        # erase legitimate high-speed motion; the optional kinematic term is
-        # the place where q/dq consistency is enforced.
-        if ddq.shape[1] < 2:
-            return ddq.new_zeros(ddq.shape[0])
-        jerk = torch.diff(ddq, dim=1) / self.dt
-        if self.ddq_smoothness_normalize:
-            scale = None
-            if self.normalizer is not None:
-                stats = getattr(self.normalizer, "stats", {})
-                dq_stats = stats.get("dq") if isinstance(stats, Mapping) else None
-                if isinstance(dq_stats, Mapping):
-                    scale = dq_stats.get("std")
-            if scale is None:
-                scale = dq_future.detach().std(dim=(0, 1), unbiased=False)
-            scale = torch.as_tensor(scale, device=jerk.device, dtype=jerk.dtype)
-            scale = scale.reshape(1, 1, -1).clamp_min(1.0e-6)
-            # jerk has units dq / dt^2.  Scaling by dq_std / dt^2 keeps the
-            # regularizer numerically comparable across joints and datasets.
-            jerk = jerk * (self.dt * self.dt) / scale
-        loss = F.huber_loss(
-            jerk,
-            torch.zeros_like(jerk),
-            delta=self.ddq_smoothness_huber_delta,
-            reduction="none",
-        )
-        return self._per_sample_mean(loss)
-
-    def _delta_q_consistency(self, out, batch):
-        reference = out[f"{self.predicted_state_streams[0]}_pred"]
-        if self.delta_q_consistency_weight <= 0.0:
-            return reference.new_zeros(reference.shape[0])
-        if not {"q", "delta_q"}.issubset(self.predicted_state_streams):
-            raise ValueError(
-                "delta_q_consistency_weight requires q and delta_q outputs"
-            )
-        if "q_cmd_future" not in batch:
-            raise ValueError(
-                "delta_q_consistency_weight requires an explicitly aligned "
-                "q_cmd_future; expert action is not a joint command"
-            )
-        q_cmd = self._required(batch, "q_cmd_future").to(
-            device=reference.device, dtype=reference.dtype
-        )
-        expected = q_cmd - self._required(out, "q_pred")
-        return self._per_sample_mean(
-            (self._required(out, "delta_q_pred") - expected).square()
-        )
-
-    def _torque_contact_consistency(self, out, batch):
-        reference = out[f"{self.predicted_state_streams[0]}_pred"]
-        if self.torque_contact_weight <= 0.0:
-            return reference.new_zeros(reference.shape[0])
-        if "tau_free_future" not in batch or "tau" not in self.predicted_state_streams:
-            raise ValueError(
-                "torque_contact_weight requires aligned tau_free_future and tau output"
-            )
-        tau = self._physical("tau", self._required(out, "tau_pred"))
-        tau_free = self._required(batch, "tau_free_future").to(
-            device=tau.device, dtype=tau.dtype
-        )
-        signal = (tau - tau_free).abs().sum(dim=-1)
-        labels = self._required(batch, "contact_future").squeeze(-1).round().long()
-        gate = self.config.get("contact_gate") or {}
-        thresholds = (gate.get("thresholds") or {}).get(
-            str(gate.get("metric", "tau_ext_l1")).lower(), {}
-        )
-        off = float(thresholds.get("off", thresholds.get(False, 0.0)))
-        on = float(thresholds.get("on", thresholds.get(True, off)))
-        free_loss = torch.relu(signal - off).square()
-        contact_loss = torch.relu(on - signal).square()
-        loss = torch.where(labels == 0, free_loss, torch.zeros_like(signal))
-        loss = torch.where(labels == 2, contact_loss, loss)
-        return loss.mean(dim=1)
+    def free_dynamics_loss(self, out, batch):
+        """MSE in the existing normalized tau space, conditional on free history."""
+        batch = out.get("_prepared_batch", batch)
+        prediction = out["free_tau_pred"]
+        tau = batch["tau"]
+        mask = batch["free_dynamics_mask"]
+        if prediction.shape != tau[:, -1].shape or mask.shape != prediction.shape[:1]:
+            raise ValueError("free dynamics target/mask must align with current tau")
+        target = tau[:, -1].detach()
+        mask = mask & torch.isfinite(target).all(dim=-1)
+        weights = batch.get("importance_weight", prediction.new_ones(prediction.shape[0]))
+        weights = weights.to(device=prediction.device, dtype=torch.float32).reshape(-1)
+        if weights.shape != mask.shape or not torch.isfinite(weights).all() or torch.any(weights < 0):
+            raise ValueError("importance_weight must contain one finite non-negative weight per sample")
+        # Index before MSE so invalid/non-free targets (including NaNs) cannot
+        # contaminate the zero-sample case. The empty sum retains a grad path.
+        selected_weights = weights[mask]
+        mse = (prediction[mask].float() - target[mask].float()).square().mean(dim=-1)
+        denominator = selected_weights.sum()
+        loss = (selected_weights * mse).sum() / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+        return loss, mask.sum()
 
     def __call__(self, out, batch):
         batch = out.get("_prepared_batch", batch)
@@ -459,17 +267,13 @@ class ContactWorldModelLoss:
         if flow_prediction is None or flow_target is None:
             raise KeyError("model output must contain flow velocity prediction and target")
         flow_loss_ps, flow_q_ps, flow_dq_ps, flow_delta_q_ps, flow_tau_ps = self.flow_loss_components(flow_prediction, flow_target)
-        # Future tau supervision is always active, including free-motion
-        # windows. Historical tau masking is applied only in the encoder.
-        flow_tau_unmasked_ps = flow_tau_ps
         flow_loss_ps = (
             self.flow_q_weight * flow_q_ps
             + self.flow_dq_weight * flow_dq_ps
             + self.flow_delta_q_weight * flow_delta_q_ps
             + self.flow_tau_weight * flow_tau_ps
         )
-        # Evaluate auxiliary targets for diagnostics/validation, but do not
-        # include any of them in the optimization objective.
+        # Future direct-state MSE remains diagnostic only.
         direct = self._direct_losses(out, batch)
         contact_loss_ps = self._contact_loss(out, batch, out[f"{self.predicted_state_streams[0]}_pred"])
         importance_weight = batch.get("importance_weight")
@@ -478,7 +282,12 @@ class ContactWorldModelLoss:
         # is trained jointly with its fixed CE term. Other state losses remain
         # diagnostics only.
         contact_loss = self._weighted_mean(contact_loss_ps, importance_weight)
-        total = self.flow_weight * flow_loss + self.contact_weight * contact_loss
+        free_loss, free_count = (
+            self.free_dynamics_loss(out, batch) if self.free_dynamics_weight > 0
+            else (flow_loss.new_zeros(()), flow_loss.new_zeros(()))
+        )
+        total = (self.flow_weight * flow_loss + self.contact_weight * contact_loss
+                 + self.free_dynamics_weight * free_loss)
         loss_dict = {
             "total_loss": total.detach(),
             "flow_loss": flow_loss.detach(),
@@ -491,20 +300,14 @@ class ContactWorldModelLoss:
             "flow_q_raw": self._weighted_mean(flow_q_ps, importance_weight).detach(),
             "flow_dq_raw": self._weighted_mean(flow_dq_ps, importance_weight).detach(),
             "flow_delta_q_raw": self._weighted_mean(flow_delta_q_ps, importance_weight).detach(),
-            "flow_tau_raw": self._weighted_mean(flow_tau_unmasked_ps, importance_weight).detach(),
+            "flow_tau_raw": self._weighted_mean(flow_tau_ps, importance_weight).detach(),
             "flow_q_contribution": (self.flow_q_weight * self._weighted_mean(flow_q_ps, importance_weight)).detach(),
             "flow_dq_contribution": (self.flow_dq_weight * self._weighted_mean(flow_dq_ps, importance_weight)).detach(),
             "flow_delta_q_contribution": (self.flow_delta_q_weight * self._weighted_mean(flow_delta_q_ps, importance_weight)).detach(),
             "flow_tau_contribution": (self.flow_tau_weight * self._weighted_mean(flow_tau_ps, importance_weight)).detach(),
-            "tau_history_mask_probability": out.get(
-                "tau_history_mask_probability", flow_loss.new_zeros(())
-            ).detach(),
-            "tau_history_mask_fraction": out.get(
-                "tau_history_mask_fraction", flow_loss.new_zeros(())
-            ).detach(),
-            "tau_history_free_fraction": out.get(
-                "tau_history_free_fraction", flow_loss.new_zeros(())
-            ).detach(),
+            "free_dynamics_loss": free_loss.detach(),
+            "free_dynamics_contribution": (self.free_dynamics_weight * free_loss).detach(),
+            "free_dynamics_count": free_count.detach(),
             **{f"{key}_loss": self._weighted_mean(value, importance_weight).detach() for key, value in direct.items()},
             "contact_loss": contact_loss.detach(),
             "contact_contribution": (self.contact_weight * contact_loss).detach(),

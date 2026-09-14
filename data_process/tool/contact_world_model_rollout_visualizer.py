@@ -146,8 +146,6 @@ def load_model_and_dataset(
 
     checkpoint_path = resolve_checkpoint_path(rollout_config["checkpoint_path"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("model_version") != "contact_world_model_v1" or not any(str(key).startswith("state_encoders.") for key in (checkpoint.get("model") or {})):
-        raise ValueError("checkpoint is not a canonical ContactWorldModel checkpoint")
     checkpoint_config = checkpoint.get("config")
     if not isinstance(checkpoint_config, Mapping):
         raise KeyError("world-model checkpoint is missing config")
@@ -156,6 +154,7 @@ def load_model_and_dataset(
     inference_config = rollout_config.get("inference") or {}
     device = _requested_device(str(inference_config.get("device", "cuda:0")))
     model = ContactWorldModel(checkpoint_config)
+    model.validate_checkpoint(checkpoint)
     weights = str(inference_config.get("weights", "ema")).lower()
     if weights in {"ema", "model"}:
         state_dict = checkpoint.get("model")
@@ -180,15 +179,15 @@ def load_model_and_dataset(
         normalizer=normalizer,
         compute_normalizer=False,
     )
-    if dataset.history_horizon != model.history_horizon:
+    if dataset.history_horizon != model.external_history_horizon:
         raise ValueError(
             "inference dataset history horizon differs from checkpoint model: "
-            f"{dataset.history_horizon} != {model.history_horizon}"
+            f"{dataset.history_horizon} != {model.external_history_horizon}"
         )
-    if dataset.future_horizon != model.future_horizon:
+    if dataset.future_horizon != model.external_future_horizon:
         raise ValueError(
             "inference dataset prediction horizon differs from checkpoint model: "
-            f"{dataset.future_horizon} != {model.future_horizon}"
+            f"{dataset.future_horizon} != {model.external_future_horizon}"
         )
     if dataset.action_condition_horizon != model.action_condition_horizon:
         raise ValueError(

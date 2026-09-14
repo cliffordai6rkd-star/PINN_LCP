@@ -67,9 +67,14 @@ class ContactWorldModelStudent(ContactWorldModel):
         nn.init.zeros_(self.student_flow_output[-1].weight)
         nn.init.zeros_(self.student_flow_output[-1].bias)
 
+    def checkpoint_contract(self):
+        contract = super().checkpoint_contract()
+        contract["student"] = {"integration": "delta_s_euler", "steps": self.student_steps}
+        return contract
+
     @classmethod
     def from_teacher(cls, teacher: ContactWorldModel, *, student_steps: int = 8):
-        """Construct a student and copy all compatible teacher parameters.
+        """Construct a student and strictly copy the complete current teacher.
 
         The delta-step embedding and zero-initialized student output head are
         intentionally left at their constructor values.
@@ -80,21 +85,12 @@ class ContactWorldModelStudent(ContactWorldModel):
         config.setdefault("model", {})["flow_solver"] = "euler"
         config.setdefault("distillation", {})["student_steps"] = int(student_steps)
         student = cls(config)
-        teacher_state = teacher.state_dict()
-        student_state = student.state_dict()
-        compatible = {
-            key: value
-            for key, value in teacher_state.items()
-            if key in student_state and student_state[key].shape == value.shape
-        }
-        # Do not overwrite the explicitly zero-initialized student head.
-        compatible = {
-            key: value
-            for key, value in compatible.items()
-            if not key.startswith("student_flow_output.")
-            and not key.startswith("flow_delta_embedding.")
-        }
-        student.load_state_dict(compatible, strict=False)
+        # Strictly restore the complete current teacher architecture first.
+        # Only the student's newly defined delta-step/head modules are new.
+        base = ContactWorldModel(config)
+        base.load_state_dict(teacher.state_dict(), strict=True)
+        for name, module in base.named_children():
+            setattr(student, name, module)
         return student
 
     def flow_velocity_student(self, trajectory_state, flow_time, delta_s, encoded):
@@ -129,8 +125,8 @@ class ContactWorldModelStudent(ContactWorldModel):
     def flow_velocity(self, trajectory_state, flow_time, encoded, delta_s=None):
         """Dispatch to the student head when ``delta_s`` is supplied.
 
-        Omitting ``delta_s`` retains the base CFM velocity for compatibility
-        with checkpoint tooling and generic model utilities.
+        Omitting ``delta_s`` uses the base CFM velocity for teacher-interval
+        integration and ordinary flow diagnostics.
         """
 
         if delta_s is None:

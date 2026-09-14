@@ -360,7 +360,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
             return
         checkpoint_path = self._resolve_teacher_checkpoint(self.teacher_checkpoint_path)
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        teacher_config = checkpoint.get("config", self.config)
+        teacher_config = checkpoint.get("config")
+        if not isinstance(teacher_config, Mapping):
+            raise ValueError("Teacher checkpoint is missing its config")
         teacher_config = copy.deepcopy(dict(teacher_config))
         if checkpoint.get("model_version") != ContactWorldModel.MODEL_VERSION:
             raise ValueError(
@@ -373,7 +375,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         )
         teacher_config.setdefault("model", {})["flow_inference_steps"] = self.teacher_steps
         self.teacher = self._student_model_from_config(teacher_config).to(self.device)
-        state_dict = checkpoint.get("model") or checkpoint.get("model_raw")
+        state_dict = checkpoint.get("model")
         if not isinstance(state_dict, Mapping):
             raise KeyError("Teacher checkpoint does not contain model weights")
         if not any(str(key).startswith("state_encoders.") for key in state_dict):
