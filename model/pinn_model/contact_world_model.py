@@ -23,6 +23,25 @@ def _npu_legacy_attention(device: torch.device) -> bool:
     return torch.device(device).type == "npu"
 
 
+def _run_gru_compat(gru: nn.GRU, value: torch.Tensor):
+    """Run GRU through an NPU-safe FP32 island.
+
+    Several torch_npu releases fail while compiling the fused FP16 GRU
+    kernel (``tiling offset out of range``).  Keeping only the recurrent
+    operator in FP32 avoids that kernel; the surrounding model remains under
+    the configured autocast context.  CUDA/CPU use the original fast path.
+    """
+    if value.device.type != "npu":
+        return gru(value)
+    original_dtype = value.dtype
+    with torch.autocast(device_type="npu", enabled=False):
+        encoded, hidden = gru(value.float().contiguous())
+    if original_dtype != encoded.dtype:
+        encoded = encoded.to(dtype=original_dtype)
+        hidden = hidden.to(dtype=original_dtype)
+    return encoded, hidden
+
+
 class PhysicalTimeEmbedding(nn.Module):
     """Embed elapsed physical seconds instead of a token index."""
 
@@ -702,7 +721,7 @@ class ContactWorldModel(nn.Module):
         )
         state_token_features = []
         for key in self.inputs:
-            encoded, hidden = self.state_encoders[key](states[key])
+            encoded, hidden = _run_gru_compat(self.state_encoders[key], states[key])
             if self.state_pooling == "last":
                 token = hidden[-1]
             else:
@@ -724,7 +743,7 @@ class ContactWorldModel(nn.Module):
         # input-stream ablations without changing the prediction head.
         state_features = torch.stack(state_token_features, dim=1)
         masked_action = action.masked_fill(~valid_action[..., None], 0.0)
-        action_features, _ = self.action_encoder(masked_action)
+        action_features, _ = _run_gru_compat(self.action_encoder, masked_action)
         action_features = action_features + self.action_time_embedding(action_time)
         state_tokens = self.state_token_norm(state_features)
         action_tokens = self.action_token_norm(action_features)
