@@ -163,8 +163,8 @@ def test_training_configs_temporal_history_tokens(name, history_tokens):
 def test_checkpoint_contract_identifies_simplified_token_architecture():
     model = ContactWorldModel(config())
     contract = model.checkpoint_contract()
-    assert model.MODEL_VERSION == "carswm_v8"
-    assert contract["schema_version"] == 9
+    assert model.MODEL_VERSION == "carswm_v9"
+    assert contract["schema_version"] == 10
     assert contract["architecture"] == {
         "condition_encoder": "modality_gru_action_gru",
         "state_token": "all_gru_temporal_outputs_modality_major",
@@ -173,10 +173,12 @@ def test_checkpoint_contract_identifies_simplified_token_architecture():
         "condition_memories": "independent_history_and_action",
         "action_position_encoding": "learned_sequence_index",
         "future_position_encoding": "learned_sequence_index",
+        "flow_input_projection": "linear_raw_state",
+        "contact_head": "linear_fusion_shared_future_pe_temporal_transformer_classifier",
     }
     assert contract["action"]["dataset_alignment"] == "previous"
     incompatible = dict(contract)
-    incompatible["model_version"] = "carswm_v7"
+    incompatible["model_version"] = "carswm_v8"
     with pytest.raises(ValueError, match="contract mismatch"):
         model.validate_checkpoint_contract(incompatible)
 

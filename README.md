@@ -53,8 +53,8 @@ The authoritative budgets and checkpoint cadence are the
 YAML. Set the baseline `dataloader.prediction_horizon` explicitly before training;
 it is currently empty.
 
-Every CARS-WM checkpoint contains `model_version: carswm_v8` and a complete
-`carswm_contract` (schema 9). Older ContactWorldModel checkpoints do not satisfy this
+Every CARS-WM checkpoint contains `model_version: carswm_v9` and a complete
+`carswm_contract` (schema 10). Older ContactWorldModel checkpoints do not satisfy this
 contract and must be retrained.
 
 ## Checkpoint diagnostics

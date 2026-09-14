@@ -130,8 +130,8 @@ class ContactWorldModel(nn.Module):
     TARGET_KEYS = tuple(f"{key}_future" for key in PREDICTED_STATE_STREAMS) + (
         "contact_future",
     )
-    # Shared free-dynamics supervision is part of the current checkpoint contract.
-    MODEL_VERSION = "carswm_v8"
+    # Raw-state projections and temporal contact classification define this contract.
+    MODEL_VERSION = "carswm_v9"
 
     def __init__(self, config: Mapping):
         super().__init__()
@@ -281,9 +281,7 @@ class ContactWorldModel(nn.Module):
         )
         self.state_token_norm = nn.LayerNorm(self.hidden_dim)
         self.action_token_norm = nn.LayerNorm(self.hidden_dim)
-        self.flow_input_projection = nn.Sequential(
-            nn.LayerNorm(self.flow_dim), nn.Linear(self.flow_dim, self.hidden_dim)
-        )
+        self.flow_input_projection = nn.Linear(self.flow_dim, self.hidden_dim)
         self.flow_time_embedding = FlowTimeEmbedding(self.hidden_dim)
         self.flow_blocks = nn.ModuleList(
             FlowDecoderBlock(
@@ -299,14 +297,23 @@ class ContactWorldModel(nn.Module):
             model_config.get("contact_head_hidden_dim", max(self.hidden_dim // 2, 16))
         )
         self.contact_state_projection = nn.Sequential(
-            nn.LayerNorm(self.flow_dim),
             nn.Linear(self.flow_dim, self.hidden_dim),
             nn.SiLU(),
         )
         self.contact_condition_norm = nn.LayerNorm(self.hidden_dim)
+        self.contact_fusion = nn.Linear(3 * self.hidden_dim, self.hidden_dim)
+        self.contact_temporal = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.flow_attention_heads,
+            dim_feedforward=2 * self.hidden_dim,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
         self.contact_head = nn.Sequential(
-            nn.LayerNorm(3 * self.hidden_dim),
-            nn.Linear(3 * self.hidden_dim, contact_hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, contact_hidden_dim),
             nn.SiLU(),
             nn.Dropout(self.dropout),
             nn.Linear(contact_hidden_dim, self.contact_state_count),
@@ -356,7 +363,7 @@ class ContactWorldModel(nn.Module):
             str(contact_config.get("metric", "tau_ext_l1")).lower(), {}
         )
         return {
-            "schema_version": 9,
+            "schema_version": 10,
             "model_version": self.MODEL_VERSION,
             "state_contract": "robot_state_streams_v1",
             "architecture": {
@@ -369,6 +376,8 @@ class ContactWorldModel(nn.Module):
                 "condition_memories": "independent_history_and_action",
                 "action_position_encoding": "learned_sequence_index",
                 "future_position_encoding": "learned_sequence_index",
+                "flow_input_projection": "linear_raw_state",
+                "contact_head": "linear_fusion_shared_future_pe_temporal_transformer_classifier",
             },
             "free_dynamics": {
                 "enabled": self.free_dynamics_enabled,
@@ -727,7 +736,13 @@ class ContactWorldModel(nn.Module):
         condition = self.contact_condition_norm(condition)[:, None, :].expand(
             -1, self.future_horizon, -1
         )
-        return self.contact_head(torch.cat((state, action, condition), dim=-1))
+        features = self.contact_fusion(torch.cat((state, action, condition), dim=-1))
+        positions = torch.arange(continuous_trajectory.shape[1], device=continuous_trajectory.device)
+        features = features + self.future_pos_embedding(positions)[None].to(features.dtype)
+        # Classify one complete predicted trajectory at a time, outside ODE
+        # integration. No causal mask: all future predictions are available.
+        features = self.contact_temporal(features)
+        return self.contact_head(features)
 
     def _decoded_output(self, flow_state, encoded):
         result = {"flow_state_pred": flow_state}
