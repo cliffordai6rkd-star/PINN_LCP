@@ -120,7 +120,7 @@ train:
   device: cuda:0
   # State windows use the 100 Hz interface; downsample affects states only.
   # Action stays at eight consecutive 25 Hz tokens with either setting.
-  downsample: true
+  downsample: false
   # Keep decoded raw columns resident on the GPU. Samples are indexed per
   # batch; the full window cache is not pre-materialized.
   dataset_on_device: false
