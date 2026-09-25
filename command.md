@@ -3,3 +3,5 @@ python data_process/tool/visualize_tau_other_inference.py   --checkpoint outputs
 降采样:
 python data_process/tool/downsample_h5_2_lerobotv3.py \
   --config config/shape_meta/data/next_data_dual_phase.yaml
+
+inference

@@ -33,10 +33,10 @@ dataloader:
   v3_only: true
 
   high_fps: 100
-  state_history_horizon: 50
-  prediction_horizon: 80
+  state_history_horizon: 20
+  prediction_horizon: 40
   # Eight consecutive unique 25 Hz action indices, independent of state stride.
-  action_condition_horizon: 20
+  action_condition_horizon: 10
   action_start_offset: 1
   action_condition_mode: direct
   action_key: action.ee_pose
@@ -80,7 +80,7 @@ contact_gate:
   # Units follow metric: N for force_xyz_l2, N.m for tau_ext_l1. Selecting
   # contact_gate.metric automatically selects the matching threshold pair.
   thresholds:
-    tau_ext_l1: {"off": 0.6, "on": 3}
+    tau_ext_l1: {"off": 0.4, "on": 1.5}
   consecutive_frames: 5
   class_weights: [1.0, 1.0, 1.0]
   # max_class_weight: 3.0
@@ -124,7 +124,7 @@ train:
   # Keep decoded raw columns resident on the GPU. Samples are indexed per
   # batch; the full window cache is not pre-materialized.
   dataset_on_device: false
-  batch_size: 256
+  batch_size: 128
   gradient_every: 1
   # Keep host-memo2y pressure bounded on the 15 GiB training workstation.
   # Validation runs in the main process by default (see val_num_workers).
@@ -135,10 +135,10 @@ train:
   val_persistent_workers: false
   # Optimizer updates are the authoritative training budget. Epoch remains a
   # data-pass/logging counter and does not terminate this run.
-  max_optimizer_steps: 500000
+  max_optimizer_steps: 400000
   num_epochs: 1000000
   checkpoint_every_steps: 50000
-  val_ratio: 0.1
+  val_ratio: 0.05
   val_every: 10  # val_episode_indices: [15, 50, 90]
   split_mode: episode
   seed: 42
@@ -210,14 +210,14 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir: outputs/cwm_insert_usb_100hz_80step
+  output_dir: outputs/cwm_insert_usb_100hz_40step
   monitor_key: val_loss
   top_k: 5
   save_latest_checkpoint: true
   contact_sampling:
     enabled: true
     # free, pre-contact, contact; aggregate the existing future labels only.
-    phase_weights: [1.0, 5.0, 5.0]
+    phase_weights: [1.0, 2.0, 2.0]
     future_phase_reduction: max
     replacement: true
 

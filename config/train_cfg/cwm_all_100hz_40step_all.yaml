@@ -18,6 +18,9 @@ train_data:
     - name: cuccumber_peeling
       repo_id: cucumber_peeling_lerobot_v3
       root: ../nero_ws/runs/swm/cucumber_peeling_lerobot_v3
+    - name: wipe_board
+      repo_id: cucumber_peeling_lerobot_v3
+      root: ../nero_ws/runs/swm/wipe_board_lerobot_v3
 
 action_contract:
   semantic: expert_policy_action_target
@@ -34,9 +37,9 @@ dataloader:
 
   high_fps: 100
   state_history_horizon: 40
-  prediction_horizon: 16
+  prediction_horizon: 40
   # Eight consecutive unique 25 Hz action indices, independent of state stride.
-  action_condition_horizon: 4
+  action_condition_horizon: 10
   action_start_offset: 1
   action_condition_mode: direct
   action_key: action.ee_pose
@@ -211,7 +214,7 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir: outputs/cwm_all_50hz
+  output_dir: outputs/cwm_all_100hz_40step
   monitor_key: val_loss
   top_k: 3
   save_latest_checkpoint: true

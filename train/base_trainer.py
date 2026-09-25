@@ -940,7 +940,10 @@ class BaseTrainer:
                 f"does not match {expected_model_version!r}; retrain with the current model"
             )
         validate_contract = getattr(self.model, "validate_checkpoint_contract", None)
-        if callable(validate_contract):
+        validate_checkpoint = getattr(self.model, "validate_checkpoint", None)
+        if callable(validate_checkpoint):
+            validate_checkpoint(checkpoint)
+        elif callable(validate_contract):
             validate_contract(checkpoint.get("carswm_contract"))
 
         model_state = checkpoint.get("model")
@@ -952,9 +955,11 @@ class BaseTrainer:
 
         # ``model`` is the EMA copy when EMA is enabled.  Continue optimizing
         # the raw model, while restoring EMA independently when available.
-        if callable(validate_contract):
-            # Current WM resumes require the recorded raw/EMA states, never
-            # substitute one for a missing checkpoint component.
+        if callable(validate_contract) and (
+            self.ema is not None or (checkpoint.get("ema") or {}).get("enabled") is not False
+        ):
+            # EMA WM resumes require both recorded states. With EMA explicitly
+            # disabled, native checkpoints store raw weights only under model.
             if not isinstance(raw_model_state, Mapping):
                 raise KeyError("WM resume checkpoint is missing model_raw weights")
             self.model.load_state_dict(raw_model_state, strict=True)
