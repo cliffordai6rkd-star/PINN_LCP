@@ -1,0 +1,17 @@
+# Overlay applied to the pretraining checkpoint configuration.
+train_data:
+  format: lerobot_v3
+  sources:
+    - name: push_button
+      repo_id: push_button_lerobot_v3
+      root: ../nero_ws/runs/swm/push_button_lerobot_v3
+train:
+  pretrained_checkpoint: outputs/cwm_pretrain_four_tasks/checkpoints/latest.pt
+  output_dir: outputs/cwm_finetune_push_button
+  lr: 0.00001
+  batch_size: 64
+  max_optimizer_steps: 10000
+  checkpoint_every_steps: 1000
+  split_mode: episode
+  wandb:
+    name: cwm-finetune-push-button

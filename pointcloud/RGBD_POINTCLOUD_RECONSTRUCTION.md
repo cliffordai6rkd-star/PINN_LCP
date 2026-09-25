@@ -10,7 +10,12 @@
 ./setup.sh
 conda activate pinn
 python -m pip install -e ".[vision]"
+python -m pip check
 ```
+
+基础环境使用 `opencv-python-headless`，适合服务器上的离线重建。需要
+`visualization.view: true` 或运行带窗口的标定脚本时，请在有图形显示服务
+的机器上运行，并设置正确的 `DISPLAY`。
 
 数据路径为：
 

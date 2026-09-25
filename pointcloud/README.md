@@ -26,7 +26,13 @@ python pointcloud/single_frame_reconstruct.py --help
 conda activate pinn
 python -m pip install -e ".[vision]" \
   git+https://github.com/ultralytics/CLIP.git
+python -m pip check
 ```
+
+基础环境已经包含服务器端使用的 `opencv-python-headless` 和 Pillow
+12.2.0；`.[vision]` 只补充 Open3D、RealSense 和 Ultralytics。需要打开
+OpenCV/Open3D 图形窗口时，还必须在带显示服务的机器上运行并配置
+`DISPLAY`。
 
 注意不要使用：
 
@@ -132,7 +138,7 @@ hf download facebook/sam3 sam3.pt --local-dir weights
 
 ### 0.6 依赖冲突修复
 
-如果安装时出现类似：
+如果环境被其他项目升级后出现类似：
 
 ```text
 lerobot requires huggingface-hub <0.36.0, >=0.34.2
@@ -144,9 +150,9 @@ lerobot requires packaging <26.0, >=24.2
 
 ```bash
 python -m pip install --force-reinstall \
-  "huggingface-hub[cli,hf-transfer]>=0.34.2,<0.36.0" \
-  "fsspec[http]>=2023.1.0,<=2025.3.0" \
-  "packaging>=24.2,<26.0"
+  "huggingface-hub[cli,hf-transfer]==0.35.3" \
+  "fsspec[http]==2025.3.0" \
+  "packaging==25.0"
 ```
 
 然后检查：

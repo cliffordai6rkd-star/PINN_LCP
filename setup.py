@@ -18,23 +18,31 @@ setup(
         ]
     ),
     install_requires=[
-        # Pinocchio 3.9 / cmeel-boost on Python 3.10 requires NumPy 2.2.
-        "numpy>=2.2,<2.3",
-        "scipy>=1.14,<2",
-        "PyYAML>=6.0,<7",
-        "tqdm>=4.65,<5",
-        "matplotlib>=3.7,<4",
-        "h5py>=3.9,<4",
-        # Zarr v2 keeps the synchronous local-store API used by the training
-        # workers; Zarr v3's async bridge can block during group creation.
-        "zarr>=2.16,<3",
-        "pandas>=2.0,<3",
-        "pyarrow>=14,<20",
+        # These versions are the validated baseline of the pinn Conda
+        # environment. NumPy 2.2 is required by Pinocchio 3.9/cmeel-boost.
+        "numpy==2.2.6",
+        "scipy==1.15.3",
+        "PyYAML==6.0.3",
+        "tqdm==4.70.0",
+        "matplotlib==3.10.9",
+        "h5py==3.16.0",
+        "pandas==2.3.3",
+        "pyarrow==19.0.1",
         "lerobot==0.4.0",
-        "huggingface-hub[cli,hf-transfer]>=0.34.2,<0.36.0",
-        "fsspec[http]>=2023.1.0,<=2025.3.0",
-        "packaging>=24.2,<26.0",
-        "wandb>=0.19,<0.27",
+        "huggingface-hub[cli,hf-transfer]==0.35.3",
+        "fsspec[http]==2025.3.0",
+        "packaging==25.0",
+        "wandb==0.21.4",
+        "Pillow==12.2.0",
+        # LeRobot and the server-side data tools use the headless OpenCV build.
+        "opencv-python-headless==4.12.0.88",
+        "rerun-sdk==0.26.2",
+        # The CUDA wheel is installed from download.pytorch.org by setup.sh.
+        # The versions also make a direct editable install reproducible.
+        "torch==2.6.0",
+        "torchvision==0.21.0",
+        "torchaudio==2.6.0",
+        "torchcodec==0.2.1",
     ],
     extras_require={
         "physics": [
@@ -42,17 +50,20 @@ setup(
             "cmeel-urdfdom==4.0.1",
             "libpinocchio==3.9.0",
             "pin==3.9.0",
-            "mujoco>=3.1.3,<3.4.0",
+            "mujoco==3.3.7",
+        ],
+        "cache": [
+            # The default training cache is RAM. Zarr is only needed for the
+            # optional train_data.cache.mode=ssd_zarr path.
+            "zarr>=2.16,<3",
         ],
         "vision": [
-            "opencv-python>=4.8,<5",
             "open3d>=0.18,<1",
-            "Pillow>=10,<12",
             "pyrealsense2",
             "ultralytics",
         ],
         "test": [
-            "pytest>=7.4,<9",
+            "pytest==8.4.2",
         ],
     },
     entry_points={

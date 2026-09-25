@@ -494,6 +494,9 @@ class BaseTrainer:
     def build_model(self):
         raise NotImplementedError
 
+    def initialize_model_weights(self):
+        """Optional initialization before EMA and optimizer are created."""
+
     def compute_loss(self, batch):
         raise NotImplementedError
 
@@ -891,7 +894,11 @@ class BaseTrainer:
 
     def _model_checkpoint_metadata(self):
         contract = getattr(self.model, "checkpoint_contract", None)
-        return {"carswm_contract": contract()} if callable(contract) else {}
+        metadata = {"carswm_contract": contract()} if callable(contract) else {}
+        extra = getattr(self, "checkpoint_metadata", None)
+        if isinstance(extra, dict):
+            metadata.update(copy.deepcopy(extra))
+        return metadata
 
     @staticmethod
     def _save_checkpoint_atomic(checkpoint, path):
@@ -1428,6 +1435,8 @@ class BaseTrainer:
                 self.checkpoint_every_steps = self.max_optimizer_steps
 
         self.model = self.build_model().to(self.device)
+        if self.resume_from is None:
+            self.initialize_model_weights()
         if self.ema_enabled:
             self.ema = ModelEMA(
                 self.model,

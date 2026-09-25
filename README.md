@@ -38,6 +38,56 @@ history windows supervise it; padding and skipped contact rows cannot qualify.
 The auxiliary MSE is normalized by the sum of free-sample importance weights.
 Main-model tau history is never masked. Prediction/sampling do not run this head.
 
+## Environment
+
+The repository uses the `pinn` Conda environment with Python 3.10.20. The
+validated GPU baseline is PyTorch 2.6.0 with CUDA 12.4, Pinocchio 3.9.0,
+MuJoCo 3.3.7, and LeRobot 0.4.0. There is no separate `requirements.txt`;
+the dependency declarations are in `setup.py` and the reproducible install
+entry point is `setup.sh`.
+
+From the repository root, check that the NVIDIA driver is visible and run:
+
+```bash
+nvidia-smi
+bash setup.sh
+conda activate pinn
+python -m pip check
+```
+
+`setup.sh` installs the CUDA 12.4 PyTorch wheels, the core data-processing
+packages, the physics extras, and the test tools. It also performs a CUDA
+availability check. To use another Conda environment name, set
+`PINN_CONDA_ENV_NAME` before running the script.
+
+The base environment uses `opencv-python-headless`, which works on servers
+without a display. Install optional features only when needed:
+
+```bash
+# SSD-backed dataset cache (`train_data.cache.mode: ssd_zarr`)
+python -m pip install -e ".[cache]"
+
+# RGB-D/point-cloud and SAM tooling
+python -m pip install -e ".[vision]" \
+  git+https://github.com/ultralytics/CLIP.git
+```
+
+After installation, verify the main runtime with:
+
+```bash
+python - <<'PY'
+import mujoco
+import pinocchio
+import torch
+
+print(f"torch={torch.__version__}, cuda={torch.version.cuda}")
+print(f"cuda_available={torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"gpu={torch.cuda.get_device_name(0)}")
+print(f"pinocchio={pinocchio.__version__}, mujoco={mujoco.__version__}")
+PY
+```
+
 ## Training
 
 Teacher and OPD Student training use optimizer updates as the authoritative
@@ -45,7 +95,8 @@ budget. `num_epochs` is only a data-pass/logging counter when
 `max_optimizer_steps` is set.
 
 ```bash
-carswm-train-contact-wm --config config/train_cfg/cwm_all_50hz.yaml
+carswm-train-contact-wm \
+  --config config/train_cfg/cwm_all_100hz_40step_all.yaml
 ```
 
 The authoritative budgets and checkpoint cadence are the

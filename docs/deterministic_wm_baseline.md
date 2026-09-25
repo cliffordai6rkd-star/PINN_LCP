@@ -21,7 +21,8 @@ The implementation is `DeterministicRobotStateWorldModel(nn.Module)`, version
 
 `config/train_cfg/deterministic_wm_baseline.yaml` copies data sources, filters,
 normalization, contact labels/sampling, episode split and training settings from
-`cwm_all_50hz.yaml`. It has its own output directory and regression objective.
+`cwm_all_100hz_40step_all.yaml`. It has its own output directory and regression
+objective.
 The model, action, and temporal dimensions are all configurable.
 
 | Setting | Default |
@@ -89,7 +90,8 @@ from one confusion matrix accumulated over the complete validation set; all
 configured classes are included, with zero F1 for an absent class. Validation
 uses EMA when configured. There is no sampling or rollout validation.
 
-The default baseline has 2,283,537 parameters. The current `cwm_all_50hz.yaml`
+The default baseline has 2,283,537 parameters. The current
+`cwm_all_100hz_40step_all.yaml`
 model has 2,354,712 parameters, including its auxiliary free-dynamics head.
 The baseline intentionally uses only state MSE + contact CE, as requested;
 the WM's `free_dynamics_weight: 0.1` auxiliary objective is not included.
