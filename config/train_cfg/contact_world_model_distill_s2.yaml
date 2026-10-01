@@ -1,9 +1,10 @@
-# Optional T64 -> S8 bridge; supervision remains the original T64.
+# S2 initializes from trained S4 EMA; T64 remains the supervisor.
 distillation:
   enabled: true
   teacher_checkpoint_path: /absolute/path/to/original_teacher_ema.pt
+  student_init_checkpoint_path: /absolute/path/to/s4/checkpoints/best_terminal/step_...pt
   teacher_steps: 64
-  student_steps: 8
+  student_steps: 2
   local_weight: 1.0
   terminal_weight: 1.0
   q_d1_weight: 0.05
@@ -18,7 +19,7 @@ distillation:
   latency_batches: 1
 train:
   device: cuda:0
-  output_dir: outputs/contact_world_model_distill_s8
+  output_dir: outputs/contact_world_model_distill_s2
   lr: 3.0e-5
   max_optimizer_steps: 100000
   checkpoint_every_steps: 5000

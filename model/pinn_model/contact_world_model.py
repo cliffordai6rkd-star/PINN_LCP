@@ -7,6 +7,7 @@ from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 SUPPORTED_STATE_STREAMS = ("q", "dq", "delta_q", "tau")
@@ -93,7 +94,73 @@ class FlowDecoderBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, trajectory, history, action, action_padding_mask=None):
+    @staticmethod
+    def _project_kv(attention, value):
+        """Project a cross-attention memory with the block's own parameters."""
+        embed_dim = attention.embed_dim
+        if attention._qkv_same_embed_dim:
+            key_weight, value_weight = attention.in_proj_weight.chunk(3, dim=0)[1:]
+            if attention.in_proj_bias is None:
+                key_bias = value_bias = None
+            else:
+                key_bias, value_bias = attention.in_proj_bias.chunk(3)[1:]
+        else:
+            key_weight, value_weight = attention.k_proj_weight, attention.v_proj_weight
+            if attention.in_proj_bias is None:
+                key_bias = value_bias = None
+            else:
+                key_bias = attention.in_proj_bias[embed_dim:2 * embed_dim]
+                value_bias = attention.in_proj_bias[2 * embed_dim:]
+        return (
+            F.linear(value, key_weight, key_bias),
+            F.linear(value, value_weight, value_bias),
+        )
+
+    def prepare_condition_kv(self, history, action):
+        """Build this block's immutable history/action K/V memories.
+
+        Each decoder block owns different projection parameters, so the cache
+        is deliberately a per-block tuple and is never shared between blocks.
+        """
+        history_k, history_v = self._project_kv(self.history_cross_attn, history)
+        action_k, action_v = self._project_kv(self.action_cross_attn, action)
+        return history_k, history_v, action_k, action_v
+
+    def _cached_cross_attention(self, query, attention, key, value, key_padding_mask=None):
+        embed_dim = attention.embed_dim
+        head_dim = embed_dim // attention.num_heads
+        if attention._qkv_same_embed_dim:
+            q_weight = attention.in_proj_weight[:embed_dim]
+            q_bias = None if attention.in_proj_bias is None else attention.in_proj_bias[:embed_dim]
+        else:
+            q_weight = attention.q_proj_weight
+            q_bias = None if attention.in_proj_bias is None else attention.in_proj_bias[:embed_dim]
+        query = F.linear(query, q_weight, q_bias)
+        batch, query_length, _ = query.shape
+        key_length = key.shape[1]
+        query = query.view(batch, query_length, attention.num_heads, head_dim).transpose(1, 2)
+        key = key.view(batch, key_length, attention.num_heads, head_dim).transpose(1, 2)
+        value = value.view(batch, key_length, attention.num_heads, head_dim).transpose(1, 2)
+        # SDPA uses True to mean "may attend".  MultiheadAttention's
+        # key_padding_mask uses True to mean "ignore", hence the inversion.
+        attn_mask = None
+        if key_padding_mask is not None:
+            attn_mask = (~key_padding_mask).to(device=query.device)[:, None, None, :]
+        if _npu_legacy_attention(query.device):
+            # Keep the same projection and mask semantics while avoiding the
+            # SDPA format conversion failure seen on several torch_npu builds.
+            scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
+            if attn_mask is not None:
+                scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
+            attended = torch.matmul(torch.softmax(scores, dim=-1), value)
+        else:
+            attended = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attn_mask, dropout_p=0.0,
+            )
+        attended = attended.transpose(1, 2).contiguous().view(batch, query_length, embed_dim)
+        return F.linear(attended, attention.out_proj.weight, attention.out_proj.bias)
+
+    def forward(self, trajectory, history, action, action_padding_mask=None, condition_kv=None):
         normalized = self.self_norm(trajectory)
         attended, _ = self.self_attention(
             query=normalized.contiguous(),
@@ -102,19 +169,27 @@ class FlowDecoderBlock(nn.Module):
             need_weights=_npu_legacy_attention(normalized.device),
         )
         trajectory = trajectory + self.dropout(attended)
-        history_attended, _ = self.history_cross_attn(
-            query=self.history_norm(trajectory).contiguous(),
-            key=history.contiguous(),
-            value=history.contiguous(),
-            need_weights=_npu_legacy_attention(trajectory.device),
-        )
-        action_attended, _ = self.action_cross_attn(
-            query=self.action_norm(trajectory).contiguous(),
-            key=action.contiguous(),
-            value=action.contiguous(),
-            key_padding_mask=action_padding_mask,
-            need_weights=_npu_legacy_attention(trajectory.device),
-        )
+        history_query = self.history_norm(trajectory).contiguous()
+        action_query = self.action_norm(trajectory).contiguous()
+        if condition_kv is None:
+            history_attended, _ = self.history_cross_attn(
+                query=history_query, key=history.contiguous(), value=history.contiguous(),
+                need_weights=_npu_legacy_attention(trajectory.device),
+            )
+            action_attended, _ = self.action_cross_attn(
+                query=action_query, key=action.contiguous(), value=action.contiguous(),
+                key_padding_mask=action_padding_mask,
+                need_weights=_npu_legacy_attention(trajectory.device),
+            )
+        else:
+            history_k, history_v, action_k, action_v = condition_kv
+            history_attended = self._cached_cross_attention(
+                history_query, self.history_cross_attn, history_k, history_v,
+            )
+            action_attended = self._cached_cross_attention(
+                action_query, self.action_cross_attn, action_k, action_v,
+                action_padding_mask,
+            )
         trajectory = trajectory + self.dropout(history_attended) + self.dropout(action_attended)
         return trajectory + self.dropout(self.ffn(self.ffn_norm(trajectory)))
 
@@ -583,7 +658,12 @@ class ContactWorldModel(nn.Module):
             raise ValueError("action does not match the state batch")
         return states, action, valid
 
-    def encode_conditions(self, batch: Mapping[str, torch.Tensor], *, compute_free_dynamics=False):
+    def encode_conditions(
+        self, batch: Mapping[str, torch.Tensor], *, compute_free_dynamics=False,
+        cache_condition_kv=False,
+    ):
+        if cache_condition_kv and self.training:
+            raise ValueError("condition K/V caching is available only in eval/inference mode")
         batch = self.prepare_batch(batch)
         states, action, valid_action = self._condition_inputs(batch)
         state_token_features = []
@@ -624,6 +704,11 @@ class ContactWorldModel(nn.Module):
             state_tokens.sum(dim=1)
             + (action_tokens * action_weights[..., None]).sum(dim=1)
         ) / (state_tokens.shape[1] + action_weights.sum(dim=1, keepdim=True))
+        if cache_condition_kv:
+            result["condition_kv_cache"] = tuple(
+                block.prepare_condition_kv(state_tokens, action_tokens)
+                for block in self.flow_blocks
+            )
         if compute_free_dynamics:
             if self.free_dynamics_head is None:
                 raise ValueError("free dynamics head is disabled")
@@ -700,10 +785,12 @@ class ContactWorldModel(nn.Module):
                 torch.arange(trajectory_state.shape[1], device=trajectory_state.device)
             )[None].to(trajectory_state.dtype)
         )
-        for block in self.flow_blocks:
+        condition_kv_cache = encoded.get("condition_kv_cache")
+        for index, block in enumerate(self.flow_blocks):
             features = block(
                 features, encoded["state_tokens"], encoded["action_tokens"],
                 encoded["action_padding_mask"],
+                None if condition_kv_cache is None else condition_kv_cache[index],
             )
         return self.flow_output(features), features
 
@@ -813,25 +900,29 @@ class ContactWorldModel(nn.Module):
             raise ValueError("solver must be 'euler' or 'heun'")
         trajectory = source_state
         step_size = 1.0 / steps
+        # Keep flow times tensor-valued so compiled calls do not guard on a
+        # changing Python scalar time value.
+        time_grid = torch.arange(
+            steps + 1, device=trajectory.device, dtype=trajectory.dtype
+        ) / steps
         for step in range(steps):
-            flow_time = trajectory.new_full((trajectory.shape[0], 1), step / steps)
+            flow_time = time_grid[step].expand(trajectory.shape[0], 1)
             first, _ = self.flow_velocity(trajectory, flow_time, encoded)
             if solver == "euler":
                 trajectory = trajectory + step_size * first
                 continue
             proposal = trajectory + step_size * first
-            next_time = trajectory.new_full((trajectory.shape[0], 1), (step + 1) / steps)
+            next_time = time_grid[step + 1].expand(trajectory.shape[0], 1)
             second, _ = self.flow_velocity(proposal, next_time, encoded)
             trajectory = trajectory + 0.5 * step_size * (first + second)
         return trajectory
 
     @torch.no_grad()
-    def predict(self, batch, *, steps=None, solver=None, source_noise=None):
-        batch = self.prepare_batch(batch)
-        encoded = self.encode_conditions(batch)
-        reference = batch[self.inputs[0]]
-        source = self._gaussian_flow_source(reference, source_noise)
-        generated = self.integrate_flow(source, encoded, steps=steps, solver=solver)
+    def _predict_encoded(
+        self, source, encoded, *, steps=None, solver=None, integration_fn=None,
+    ):
+        integrate = self.integrate_flow if integration_fn is None else integration_fn
+        generated = integrate(source, encoded, steps=steps, solver=solver)
         result = {
             **encoded,
             "flow_source_state": source,
@@ -841,7 +932,23 @@ class ContactWorldModel(nn.Module):
         return self._expand_external_outputs(result)
 
     @torch.no_grad()
-    def sample(self, batch, *, num_samples=1, steps=None, solver=None, source_noise=None):
+    def predict(
+        self, batch, *, steps=None, solver=None, source_noise=None,
+        cache_condition_kv=False, integration_fn=None,
+    ):
+        batch = self.prepare_batch(batch)
+        encoded = self.encode_conditions(batch, cache_condition_kv=cache_condition_kv)
+        reference = batch[self.inputs[0]]
+        source = self._gaussian_flow_source(reference, source_noise)
+        return self._predict_encoded(
+            source, encoded, steps=steps, solver=solver, integration_fn=integration_fn,
+        )
+
+    @torch.no_grad()
+    def sample(
+        self, batch, *, num_samples=1, steps=None, solver=None, source_noise=None,
+        cache_condition_kv=False, integration_fn=None,
+    ):
         """Draw K conditional futures and retain the sample dimension."""
 
         num_samples = int(num_samples)
@@ -862,12 +969,20 @@ class ContactWorldModel(nn.Module):
             if not torch.is_tensor(source_noise) or tuple(source_noise.shape) != expected:
                 actual = None if not torch.is_tensor(source_noise) else tuple(source_noise.shape)
                 raise ValueError(f"source_noise must have shape {expected}, got {actual}")
+        # Encode conditions and build every block's K/V memories once per
+        # request.  All explicit samples then share only these fixed memories;
+        # their source noise and trajectory states remain independent.
+        encoded = self.encode_conditions(batch, cache_condition_kv=cache_condition_kv)
         draws = [
-            self.predict(
-                batch,
+            self._predict_encoded(
+                self._gaussian_flow_source(
+                    batch[self.inputs[0]],
+                    None if source_noise is None else source_noise[:, index],
+                ),
+                encoded,
                 steps=steps,
                 solver=solver,
-                source_noise=(None if source_noise is None else source_noise[:, index]),
+                integration_fn=integration_fn,
             )
             for index in range(num_samples)
         ]

@@ -58,9 +58,10 @@ class ContactWorldModelStudent(ContactWorldModel):
         if self.student_steps <= 0:
             raise ValueError("distillation.student_steps must be positive")
         self.flow_delta_embedding = DeltaSEmbedding(self.hidden_dim)
-        # A zero initialized residual leaves the copied teacher velocity intact
-        # at initialization while allowing the student to learn a step-specific
-        # correction.
+        # The embedding is added BEFORE the copied decoder.  Its output must
+        # also start at zero; zeroing only the residual head is insufficient.
+        nn.init.zeros_(self.flow_delta_embedding.projection[-1].weight)
+        nn.init.zeros_(self.flow_delta_embedding.projection[-1].bias)
         self.student_flow_output = nn.Sequential(
             nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.flow_dim)
         )
@@ -69,7 +70,14 @@ class ContactWorldModelStudent(ContactWorldModel):
 
     def checkpoint_contract(self):
         contract = super().checkpoint_contract()
-        contract["student"] = {"integration": "delta_s_euler", "steps": self.student_steps}
+        distill = self._config.get("distillation") or {}
+        contract["student"] = {
+            "type": "ContactWorldModelStudent",
+            "integration": "delta_s_euler",
+            "interval_velocity": "learned_teacher_heun_interval_average",
+            "steps": self.student_steps,
+            "teacher_checkpoint_sha256": distill.get("teacher_checkpoint_sha256"),
+        }
         return contract
 
     @classmethod
@@ -85,12 +93,21 @@ class ContactWorldModelStudent(ContactWorldModel):
         config.setdefault("model", {})["flow_solver"] = "euler"
         config.setdefault("distillation", {})["student_steps"] = int(student_steps)
         student = cls(config)
-        # Strictly restore the complete current teacher architecture first.
-        # Only the student's newly defined delta-step/head modules are new.
-        base = ContactWorldModel(config)
-        base.load_state_dict(teacher.state_dict(), strict=True)
-        for name, module in base.named_children():
-            setattr(student, name, module)
+        # Copy values, never module objects: a frozen teacher's parameters
+        # would otherwise leave the student's copied backbone frozen too.
+        teacher_state = teacher.state_dict()
+        student_state = student.state_dict()
+        extra = set(student_state) - set(teacher_state)
+        expected_extra = {name for name in student_state if name.startswith(
+            ("flow_delta_embedding.", "student_flow_output.")
+        )}
+        if set(teacher_state) != set(student_state) - extra or extra != expected_extra:
+            raise ValueError("teacher/student backbone state keys differ")
+        for name, value in teacher_state.items():
+            if student_state[name].shape != value.shape:
+                raise ValueError(f"teacher/student parameter shape differs: {name}")
+            student_state[name] = value.detach().clone()
+        student.load_state_dict(student_state, strict=True)
         return student
 
     def flow_velocity_student(self, trajectory_state, flow_time, delta_s, encoded):
@@ -133,7 +150,7 @@ class ContactWorldModelStudent(ContactWorldModel):
             return super().flow_velocity(trajectory_state, flow_time, encoded)
         return self.flow_velocity_student(trajectory_state, flow_time, delta_s, encoded)
 
-    def integrate_flow(self, source_state, encoded, *, steps=None, solver=None):
+    def integrate_flow(self, source_state, encoded, *, steps=None, solver=None, return_states=False):
         """Integrate with one student decoder call per step (Euler update)."""
 
         steps = self.student_steps if steps is None else int(steps)
@@ -142,6 +159,7 @@ class ContactWorldModelStudent(ContactWorldModel):
         if solver is not None and str(solver).lower() not in {"euler", "student"}:
             raise ValueError("student flow integration only supports Euler updates")
         trajectory = source_state
+        states = [trajectory] if return_states else None
         delta = 1.0 / float(steps)
         delta_tensor = trajectory.new_full((trajectory.shape[0], 1), delta)
         for step in range(steps):
@@ -150,16 +168,14 @@ class ContactWorldModelStudent(ContactWorldModel):
                 trajectory, flow_time, delta_tensor, encoded
             )
             trajectory = trajectory + delta * velocity
-        return trajectory
+            if states is not None:
+                states.append(trajectory)
+        return states if states is not None else trajectory
 
     def predict_differentiable(self, batch, *, steps=None, solver=None, source_noise=None):
-        encoded = self.encode_conditions(batch)
-        reference = batch[self.inputs[0]]
-        source = self._gaussian_flow_source(reference, source_noise)
-        generated = self.integrate_flow(source, encoded, steps=steps, solver=solver)
-        result = {**encoded, "flow_source_state": source, "flow_source_noise": source}
-        result.update(self._decoded_output(generated, encoded))
-        return result
+        return super().predict_differentiable(
+            batch, steps=steps, solver=solver, source_noise=source_noise
+        )
 
 
 @torch.no_grad()
