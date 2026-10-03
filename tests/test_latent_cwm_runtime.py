@@ -76,6 +76,17 @@ def test_compile_core_has_no_graph_break_and_matches_eager():
     torch.testing.assert_close(result["latent"], eager["latent"])
 
 
+def test_custom_integrator_workspace_cannot_overwrite_returned_trajectory():
+    cfg = config()
+    model = ready_model(cfg).eval()
+    workspace = torch.zeros(2, 4, 5)
+    def integrate(source, encoded, **kwargs):
+        return workspace
+    result = model.sample(batch(cfg, b=2), steps=2, integration_fn=integrate)
+    workspace.fill_(10)
+    assert torch.count_nonzero(result["latent"]) == 0
+
+
 def test_prepared_motion_normalizers_preserve_features_and_clear_on_setup_change():
     cfg = config(pretrained=True)
     model = ready_model(cfg).eval()

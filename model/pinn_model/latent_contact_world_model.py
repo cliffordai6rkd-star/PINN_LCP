@@ -461,6 +461,10 @@ class LatentContactWorldModel(nn.Module):
             b*num_samples, self.future_horizon, self.latent_dim)
         integrate = self.integrate_latent if integration_fn is None else integration_fn
         z = integrate(z, encoded, steps=steps, solver=solver, cache_time_embeddings=cache_time_embeddings)
+        if integration_fn is not None:
+            # Compiled/CUDA-graph integrators may reuse their workspace on the
+            # next request. Public sampled trajectories own their storage.
+            z = z.clone()
         raw = z.float()*self.latent_std + self.latent_mean
         out = {key:value.reshape(b, num_samples, self.future_horizon, -1) for key,value in self.decode(raw).items()}
         out.update(latent=z.reshape(shape), raw_latent=raw.reshape(shape), nfe=steps*(2 if solver == "heun" else 1),
