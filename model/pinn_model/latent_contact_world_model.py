@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from data_process.relative_time_grid import RelativeTimeGrid, grid_sinusoidal
 from model.pinn_model.contact_world_model import FlowDecoderBlock, FlowTimeEmbedding
+from model.pinn_model.inverse_gaussian_source import ConditionalGaussianLatentSource
 from model.pinn_model.latent_pretrained import MOTION_KEYS, convert_scale, load_motion_checkpoint
 
 MODEL_VERSION = "latent_carswm_lstm_v1"
@@ -38,7 +39,7 @@ class LatentContactWorldModel(nn.Module):
     CODEC_MODULES = ("future_encoder", "q_head", "tau_head", "contact_head")
     CONDITION_MODULES = ("motion_encoder", "tau_encoder", "action_encoder", "modality_embeddings",
                          "history_norm", "action_norm")
-    FLOW_MODULES = ("latent_projection", "flow_time_embedding", "flow_blocks", "velocity_head")
+    FLOW_MODULES = ("latent_projection", "flow_time_embedding", "flow_blocks", "velocity_head", "source_model")
 
     def __init__(self, config):
         super().__init__()
@@ -54,8 +55,9 @@ class LatentContactWorldModel(nn.Module):
             raise ValueError("condition LSTMs and codec MLPs must each have exactly two layers")
         if m.get("temporal_position_encoding", "relative_grid_sinusoidal") != "relative_grid_sinusoidal":
             raise ValueError("only shared relative_grid_sinusoidal robot-time PE is supported")
-        if m.get("flow_source_mode", "gaussian") != "gaussian":
-            raise ValueError("latent flow source must be Gaussian")
+        self.source_mode = m.get("flow_source_mode", "gaussian")
+        if self.source_mode not in {"gaussian", "conditional_gaussian"}:
+            raise ValueError("latent flow source must be gaussian or conditional_gaussian")
         for key, default in (("joint_dim", 7), ("action_dim", 7), ("hidden_dim", 128),
                              ("latent_dim", 128), ("decoder_hidden_dim", 128), ("contact_state_count", 3)):
             setattr(self, key, int(m.get(key, default)))
@@ -102,6 +104,17 @@ class LatentContactWorldModel(nn.Module):
         if not self.flow_blocks:
             raise ValueError("flow_layers must be positive")
         self.velocity_head = nn.Sequential(nn.LayerNorm(h), nn.Linear(h, self.latent_dim))
+        self.source_model = (
+            ConditionalGaussianLatentSource(
+                2*h, self.future_horizon, self.latent_dim,
+                hidden_dim=int(m.get("conditional_source_hidden_dim", 256)),
+                min_log_std=float(m.get("conditional_source_min_log_std", -4.0)),
+                max_log_std=float(m.get("conditional_source_max_log_std", 1.5)),
+            ) if self.source_mode == "conditional_gaussian" else nn.Identity()
+        )
+        self.source_temperature = float(m.get("conditional_source_temperature", 1.0))
+        if not math.isfinite(self.source_temperature) or self.source_temperature < 0:
+            raise ValueError("conditional_source_temperature must be finite and nonnegative")
         self.frozen_motion = m.get("pretrained_taufree_path") is not None
         self.free_tau_head = None if self.frozen_motion else two_linear(h, h, self.joint_dim)
         self.pretrained_normalizer, self.pretrained_contract, self.wm_normalizer = None, None, None
@@ -124,7 +137,7 @@ class LatentContactWorldModel(nn.Module):
 
     def checkpoint_contract(self):
         m, data = self.config.get("model") or {}, self.config.get("dataloader") or {}
-        return {"model_version": MODEL_VERSION, "schema": 1, "codec": self.codec_contract(),
+        contract = {"model_version": MODEL_VERSION, "schema": 1, "codec": self.codec_contract(),
                 "motion_input_order": list(MOTION_KEYS), "lstm_layers": 2, "history_mode": "stateless_sliding_window",
                 "hidden_dim": self.hidden_dim, "action_dim": self.action_dim, "frozen_motion": self.frozen_motion,
                 "history_horizon": self.external_history_horizon, "action_horizon": self.action_condition_horizon,
@@ -136,6 +149,14 @@ class LatentContactWorldModel(nn.Module):
                 "preprocessing": {k:data.get(k) for k in ("filters", "normalize_mode", "normalize_lowdim_keys",
                                                         "action_key", "high_keys", "action_condition_mode", "inference_delay_s")},
                 "transfer": "pretrained_normalizer_and_contract_embedded_in_model_extra_state"}
+        if self.source_mode == "conditional_gaussian":
+            contract["source"] = {"mode": self.source_mode, "condition": "pooled_history_and_action_tokens",
+                                  "hidden_dim": self.source_model.network[1].out_features,
+                                  "min_log_std": self.source_model.min_log_std,
+                                  "max_log_std": self.source_model.max_log_std,
+                                  "temperature": self.source_temperature,
+                                  "inverse_solver": "fixed_point_heun"}
+        return contract
 
     def codec_contract(self):
         data = self.config.get("dataloader") or {}
@@ -299,6 +320,8 @@ class LatentContactWorldModel(nn.Module):
         encoded = {"history":history, "action":action, "action_padding_mask":~valid,
                    "future_pe":grid_sinusoidal(future_positions, self.hidden_dim, dtype=motion.dtype),
                    "_prepared_batch":batch}
+        encoded["source_condition"] = torch.cat(
+            (history.mean(1), (action * valid[..., None]).sum(1) / valid.sum(1, keepdim=True)), -1)
         if auxiliary and self.free_tau_head is not None:
             encoded["free_tau_pred"] = self.free_tau_head(motion[:, -1])
         return encoded
@@ -315,6 +338,12 @@ class LatentContactWorldModel(nn.Module):
             features = block(features, encoded["history"], encoded["action"], encoded["action_padding_mask"])
         return self.velocity_head(features)
 
+    def source_from_noise(self, noise, encoded):
+        if self.source_mode == "gaussian":
+            return noise
+        return self.source_model.transform(encoded["source_condition"], noise,
+                                           temperature=self.source_temperature)
+
     def forward(self, batch, *, flow_time=None, source_noise=None):
         if self.stage == "codec":
             return self.codec_forward(batch)
@@ -323,6 +352,7 @@ class LatentContactWorldModel(nn.Module):
         noise = torch.randn_like(target) if source_noise is None else source_noise
         if noise.shape != target.shape:
             raise ValueError("source_noise must match latent future")
+        noise = self.source_from_noise(noise, encoded)
         time = torch.rand(target.shape[0], device=target.device) if flow_time is None else torch.as_tensor(flow_time, device=target.device, dtype=target.dtype)
         if time.ndim == 0:
             time = time.expand(target.shape[0])
@@ -348,10 +378,14 @@ class LatentContactWorldModel(nn.Module):
         for key in ("history", "action", "action_padding_mask", "future_pe"):
             encoded[key] = encoded[key].repeat_interleave(num_samples, 0)
         shape = (b, num_samples, self.future_horizon, self.latent_dim)
-        z = torch.randn(shape, device=encoded["history"].device) if source_noise is None else source_noise
+        z = torch.randn(shape, device=encoded["history"].device,
+                        dtype=encoded["history"].dtype) if source_noise is None else source_noise
         if z.shape != shape or z.device != encoded["history"].device:
             raise ValueError(f"source_noise must have shape {shape} on the condition device")
-        z = z.clone().reshape(b*num_samples, self.future_horizon, self.latent_dim)
+        # source_noise is the base epsilon for both source modes.  This allows
+        # fixed-noise, paired comparisons against the original checkpoint.
+        z = self.source_from_noise(z, encoded).clone().reshape(
+            b*num_samples, self.future_horizon, self.latent_dim)
         dt = 1.0 / steps
         for i in range(steps):
             first = self.velocity(z, i*dt, encoded)
