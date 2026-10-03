@@ -10,10 +10,15 @@ import copy
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Subset
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from data_process.latent_contact_world_model_dataset import LatentContactWorldModelDataset
 from model.pinn_model.inverse_gaussian_source import invert_heun
@@ -58,14 +63,23 @@ def heun_rollout(velocity, source, encoded, steps, *, return_queries=False):
     return (state, queries) if return_queries else state
 
 
-def make_student(base, base_payload, steps, *, source_hidden_dim, temperature):
+def make_student(base, base_payload, steps, *, source_hidden_dim, temperature, flow_layers=None):
+    flow_layers = len(base.flow_blocks) if flow_layers is None else flow_layers
+    if not 1 <= flow_layers <= len(base.flow_blocks):
+        raise ValueError("student flow layers must be between 1 and the teacher depth")
     config = copy.deepcopy(base_payload["config"])
     config["model"].update(flow_source_mode="conditional_gaussian",
                            flow_inference_steps=steps, flow_solver="heun",
+                           flow_layers=flow_layers,
                            conditional_source_hidden_dim=source_hidden_dim,
                            conditional_source_temperature=temperature)
+    # This script exports its final raw student, rather than an EMA envelope.
+    if isinstance((config.get("train") or {}).get("ema"), dict):
+        config["train"]["ema"]["enabled"] = False
     student = LatentContactWorldModel(config)
-    missing, unexpected = student.load_state_dict(base.state_dict(), strict=False)
+    state = {key: value for key, value in base.state_dict().items()
+             if not (key.startswith("flow_blocks.") and int(key.split(".")[1]) >= flow_layers)}
+    missing, unexpected = student.load_state_dict(state, strict=False)
     if unexpected or any(not key.startswith("source_model.") for key in missing):
         raise ValueError(f"base checkpoint transfer mismatch: missing={missing}, unexpected={unexpected}")
     student.set_stage("flow")
@@ -89,6 +103,9 @@ def save_checkpoint(path, student, config, base_payload, args, metrics):
             "inverse_iterations": args.inverse_iterations,
             "source_updates": args.source_updates,
             "joint_updates": args.joint_updates,
+            "teacher_flow_layers": (base_payload["config"].get("model") or {}).get("flow_layers", 4),
+            "student_flow_layers": len(student.flow_blocks),
+            "flow_transfer": "teacher_prefix_blocks_then_joint_distillation",
             "metrics": metrics,
         },
     }
@@ -102,6 +119,8 @@ def main():
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=4, help="deployed Heun steps")
+    parser.add_argument("--flow-layers", type=int, default=None,
+                        help="optional smaller flow depth; requires joint distillation")
     parser.add_argument("--teacher-steps", type=int, default=None)
     parser.add_argument("--inverse-iterations", type=int, default=8)
     parser.add_argument("--maximum-cycle-rmse", type=float, default=0.05)
@@ -139,10 +158,12 @@ def main():
         raise ValueError("this post-training path requires a Heun base checkpoint")
     if base.source_mode != "gaussian":
         raise ValueError("base checkpoint must have a standard Gaussian flow source")
+    if args.flow_layers is not None and args.flow_layers != len(base.flow_blocks) and args.joint_updates == 0:
+        raise ValueError("changing flow depth requires positive joint updates")
     args.teacher_steps = args.teacher_steps or base.flow_inference_steps
     student, config = make_student(base, base_payload, args.steps,
                                    source_hidden_dim=args.source_hidden_dim,
-                                   temperature=args.temperature)
+                                   temperature=args.temperature, flow_layers=args.flow_layers)
     student = student.to(device)
     dataset = LatentContactWorldModelDataset(base_payload["config"], compute_normalizer=False)
     saved_normalizer = base_payload.get("normalizer")
@@ -188,15 +209,19 @@ def main():
         for update in range(updates):
             batch = next_batch()
             with torch.no_grad():
-                base_encoded = base.encode_conditions(batch)
+                base_encoded = base.encode_conditions(batch, cache_condition_kv=True)
                 target = base.target_latent(batch).float()
                 inverse, cycle = invert_heun(base.velocity, target, base_encoded,
                                               steps=args.steps, iterations=args.inverse_iterations)
+                if not torch.isfinite(cycle).all():
+                    raise RuntimeError("inverse solve produced a nonfinite cycle error")
                 worst = float(cycle.max())
                 metrics["maximum_cycle_rmse"] = max(metrics["maximum_cycle_rmse"], worst)
                 if worst > args.maximum_cycle_rmse:
                     raise RuntimeError(f"inverse cycle RMSE {worst:.5f} exceeds limit; increase iterations or steps")
-            encoded = student.encode_conditions(batch)
+            # All condition encoders are copied from the teacher and frozen.
+            # Reuse their tokens, but student K/V projections must keep gradients.
+            encoded = {key: value for key, value in base_encoded.items() if key != "condition_kv_cache"}
             condition = encoded["source_condition"]
             nll = student.source_model.nll_per_sample(condition, inverse).mean()
             kl = student.source_model.kl_per_sample(condition).mean()
@@ -218,6 +243,8 @@ def main():
                 velocity_loss = torch.stack(velocity_losses).mean()
                 loss = loss + args.endpoint_weight*endpoint_loss + args.velocity_weight*velocity_loss
             optimizer.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"nonfinite {stage} loss at update {update+1}")
             loss.backward()
             torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.requires_grad), 1.0)
             optimizer.step()

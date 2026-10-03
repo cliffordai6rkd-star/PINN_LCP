@@ -1,6 +1,7 @@
 """Focused source/inversion checks without LeRobot data or robot hardware."""
 import copy
 
+import pytest
 import torch
 
 from model.pinn_model.inverse_gaussian_source import ConditionalGaussianLatentSource, invert_heun
@@ -81,3 +82,22 @@ def test_few_step_distillation_updates_source_and_velocity():
     loss.backward()
     assert student.source_model.network[-1].weight.grad is not None
     assert student.velocity_head[-1].weight.grad is not None
+
+
+def test_shallower_student_transfers_only_prefix_blocks_and_reloads(tmp_path):
+    cfg = config()
+    cfg["model"]["flow_layers"] = 4
+    base = ready_model(cfg)
+    student, new_cfg = make_student(base, {"config": cfg}, 4, source_hidden_dim=12,
+                                    temperature=1.0, flow_layers=2)
+    assert len(student.flow_blocks) == 2
+    for index in range(2):
+        for key, value in student.flow_blocks[index].state_dict().items():
+            torch.testing.assert_close(value, base.flow_blocks[index].state_dict()[key])
+    with pytest.raises(ValueError, match="teacher depth"):
+        make_student(base, {"config": cfg}, 4, source_hidden_dim=12, temperature=1.0, flow_layers=5)
+    path = tmp_path / "shallow.pt"
+    torch.save({"model_version": student.MODEL_VERSION, "carswm_contract": student.checkpoint_contract(),
+                "config": new_cfg, "model": student.state_dict()}, path)
+    restored, _ = load_latent_checkpoint(path)
+    assert len(restored.flow_blocks) == 2

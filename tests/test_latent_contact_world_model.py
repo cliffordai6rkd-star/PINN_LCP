@@ -149,7 +149,7 @@ def test_sample_only_conditions_full_heun_interval_and_shared_decoding():
     cfg=config();model=ready_model(cfg).eval();values=batch(cfg)
     condition={key:values[key] for key in model.CONDITION_KEYS}
     times=[]
-    def velocity(z,time,encoded):
+    def velocity(z,time,encoded,**kwargs):
         times.append(float(time));return torch.ones_like(z)*2
     model.velocity=velocity
     model.latent_mean.fill_(3);model.latent_std.fill_(4)
