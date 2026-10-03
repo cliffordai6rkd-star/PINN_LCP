@@ -129,12 +129,14 @@ class ContactWorldModelStudent(ContactWorldModel):
                 torch.arange(trajectory_state.shape[1], device=trajectory_state.device)
             )[None].to(trajectory_state.dtype)
         )
-        for block in self.flow_blocks:
+        condition_kv_cache = encoded.get("condition_kv_cache")
+        for index, block in enumerate(self.flow_blocks):
             features = block(
                 features,
                 encoded["state_tokens"],
                 encoded["action_tokens"],
                 encoded["action_padding_mask"],
+                None if condition_kv_cache is None else condition_kv_cache[index],
             )
         velocity = self.flow_output(features) + self.student_flow_output(features)
         return velocity, features
@@ -153,9 +155,16 @@ class ContactWorldModelStudent(ContactWorldModel):
     def integrate_flow(self, source_state, encoded, *, steps=None, solver=None, return_states=False):
         """Integrate with one student decoder call per step (Euler update)."""
 
-        steps = self.student_steps if steps is None else int(steps)
+        steps = self.student_steps if steps is None else steps
+        if not isinstance(steps, int) or isinstance(steps, bool):
+            raise ValueError('Student integration steps must be an integer')
         if steps <= 0:
             raise ValueError("Flow integration steps must be positive")
+        if steps != self.student_steps:
+            raise ValueError(
+                f"Student checkpoint trained as S{self.student_steps}; steps={steps} "
+                "requires a separately distilled checkpoint"
+            )
         if solver is not None and str(solver).lower() not in {"euler", "student"}:
             raise ValueError("student flow integration only supports Euler updates")
         trajectory = source_state

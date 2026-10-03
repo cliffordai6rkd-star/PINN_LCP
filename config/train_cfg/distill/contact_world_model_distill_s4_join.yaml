@@ -1,0 +1,41 @@
+# Independent join ablation. Requires a Teacher ALREADY using measured dq history and predicting q.
+# Keep its existing architecture/action/horizon. Compare against join_weight=0 with the SAME Teacher.
+# The current q/delta_q/tau USB Teacher cannot enable this loss; loader rejects it.
+# 0.01 is an experiment weight (rad^2), not a tuned optimum. Checkpoint path is a placeholder.
+distillation:
+  enabled: true
+  teacher_checkpoint_path: /absolute/path/to/teacher_with_measured_dq_input_ema.pt
+  teacher_steps: 64
+  student_steps: 4
+  local_weight: 1.0
+  local_loss_mode: velocity
+  execution_weight: 0.0
+  join_weight: 0.01
+  validation_short_windows:
+  - 1
+  - 4
+  - 8
+  diagnostics_every_steps: 0
+  terminal_weight: 1.0
+  q_d1_weight: 0.05
+  q_d2_weight: 0.01
+  student_start_probability_max: 0.5
+  student_start_probability_warmup_steps: 5000
+  contact_distill_weight: 0.1
+  contact_ce_weight: 0.0
+  validation_seed: 2026
+  validation_num_samples: 4
+  validation_max_batches: 0
+  latency_batches: 1
+train:
+  device: cuda:0
+  output_dir: outputs/contact_world_model_distill_s4_join
+  lr: 3.0e-05
+  max_optimizer_steps: 100000
+  checkpoint_every_steps: 5000
+  batch_size: 64
+  top_k: 3
+  ema:
+    enabled: true
+    decay: 0.999
+    use_for_validation: true

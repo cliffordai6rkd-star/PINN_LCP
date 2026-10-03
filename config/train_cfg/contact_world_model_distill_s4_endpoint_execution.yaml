@@ -1,0 +1,43 @@
+# Experimental ablation, not tuned optimum. delay_steps=4 assumes 40 ms at 100 Hz.
+# Keep the original full-terminal match. Motor tau receives no smoothing penalty.
+distillation:
+  enabled: true
+  teacher_checkpoint_path: outputs/cwm_teacher_policy/insert_usb_50h_40step/checkpoints/step_00250000.pt
+  teacher_steps: 64
+  student_steps: 4
+  local_weight: 1.0
+  local_loss_mode: endpoint
+  execution_weight: 0.25
+  join_weight: 0.0
+  validation_short_windows:
+  - 1
+  - 4
+  - 8
+  diagnostics_every_steps: 1000
+  terminal_weight: 1.0
+  q_d1_weight: 0.05
+  q_d2_weight: 0.01
+  student_start_probability_max: 0.5
+  student_start_probability_warmup_steps: 5000
+  contact_distill_weight: 0.1
+  contact_ce_weight: 0.0
+  validation_seed: 2026
+  validation_num_samples: 4
+  validation_max_batches: 0
+  latency_batches: 1
+  execution_window:
+    delay_steps: 4
+    execute_steps: 8
+    mode: prefetch
+train:
+  device: cuda:0
+  output_dir: outputs/contact_world_model_distill_s4_endpoint_execution
+  lr: 3.0e-05
+  max_optimizer_steps: 100000
+  checkpoint_every_steps: 5000
+  batch_size: 64
+  top_k: 3
+  ema:
+    enabled: true
+    decay: 0.999
+    use_for_validation: true

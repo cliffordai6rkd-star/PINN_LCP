@@ -175,3 +175,123 @@ def test_validation_uses_internal_future_horizon_after_temporal_stride():
               "action": torch.randn(1, 2, 2), "action_mask": torch.ones(1, 2, dtype=torch.bool)}
     trainer.val_loader = [values]
     assert torch.isfinite(torch.tensor(trainer.validate_one_epoch(0)))
+
+
+@pytest.mark.parametrize('steps', [2, 4])
+def test_student_cache_equivalence_and_each_flow_state_receives_terminal_gradient(steps):
+    torch.set_num_threads(1)
+    teacher = ContactWorldModel(config()).eval().requires_grad_(False)
+    student = ContactWorldModelStudent.from_teacher(teacher, student_steps=steps).eval()
+    values, noise = batch(), torch.randn(1, 3, 4)
+    with torch.no_grad():
+        uncached = student.predict(values, source_noise=noise, cache_condition_kv=False)
+        cached = student.predict(values, source_noise=noise, cache_condition_kv=True)
+        for key in ('flow_state_pred', 'contact_probability'):
+            torch.testing.assert_close(uncached[key], cached[key], atol=2e-6, rtol=2e-5)
+    encoded = student.encode_conditions(values)
+    states = student.integrate_flow(noise, encoded, return_states=True)
+    for state in states[1:]:
+        state.retain_grad()
+    states[-1].square().mean().backward()
+    assert all(state.grad is not None and state.grad.abs().sum() > 0 for state in states[1:])
+    assert student.action_encoder.weight_ih_l0.grad.abs().sum() > 0
+    assert student.state_encoders['q'].weight_ih_l0.grad.abs().sum() > 0
+    assert all(p.grad is None for p in teacher.parameters())
+    with pytest.raises(ValueError, match='separately distilled'):
+        student.predict(values, steps=8, source_noise=noise)
+    with pytest.raises(ValueError, match='Euler'):
+        student.predict(values, solver='heun', source_noise=noise)
+
+
+def test_checkpoint_dispatch_metadata_and_strict_state():
+    from model.pinn_model.checkpoint import model_from_checkpoint
+    teacher = ContactWorldModel(config())
+    student = ContactWorldModelStudent.from_teacher(teacher, student_steps=4)
+    for model in (teacher, student):
+        payload = {'config': model._config, 'model_version': model.MODEL_VERSION,
+                   'carswm_contract': model.checkpoint_contract(), 'model': model.state_dict()}
+        restored = model_from_checkpoint(payload)
+        assert type(restored) is type(model)
+        restored.load_state_dict(payload['model'], strict=True)
+    payload['model'] = teacher.state_dict()
+    with pytest.raises(RuntimeError, match='Missing key'):
+        model_from_checkpoint(payload).load_state_dict(payload['model'], strict=True)
+    payload['carswm_contract']['student']['steps'] = 2
+    with pytest.raises(ValueError, match='contract mismatch'):
+        model_from_checkpoint(payload)
+
+
+def test_low_frequency_gradient_diagnostics_do_not_overwrite_accumulated_gradients():
+    torch.set_num_threads(1)
+    teacher = ContactWorldModel(config()).eval().requires_grad_(False)
+    student = ContactWorldModelStudent.from_teacher(teacher, student_steps=4)
+    trainer = ContactWorldModelDistillTrainer.__new__(ContactWorldModelDistillTrainer)
+    trainer.teacher, trainer.model, trainer.device = teacher, student, 'cpu'
+    trainer.teacher_steps, trainer.student_steps, trainer.global_step = 64, 4, 10
+    trainer.loss_calculator = ContactWorldModelLoss(student._config)
+    trainer.weights = {'local_weight': 1., 'terminal_weight': 1., 'q_d1_weight': 0., 'q_d2_weight': 0.,
+                       'contact_distill_weight': .1, 'contact_ce_weight': 0.}
+    trainer.student_start_probability_max, trainer.student_start_probability_warmup_steps = .5, 10
+    trainer.diagnostics_every, trainer.local_loss_mode = 10, 'endpoint'
+    shared = student.flow_input_projection.weight
+    shared.grad = torch.ones_like(shared)
+    previous = shared.grad.clone()
+    loss, info = trainer.compute_loss(batch())
+    torch.testing.assert_close(shared.grad, previous)
+    assert 'local_shared_grad_norm' in info['loss_dict']
+    assert 'terminal_shared_grad_norm' in info['loss_dict']
+    assert 'flow_state_mse_s1' in info['loss_dict']
+    (loss / 2).backward()
+    accumulated = shared.grad.clone()
+    loss2, info2 = trainer.compute_loss(batch())
+    torch.testing.assert_close(shared.grad, accumulated)
+    assert 'local_shared_grad_norm' not in info2['loss_dict']
+    (loss2 / 2).backward()
+    assert torch.isfinite(shared.grad).all()
+    assert all(p.grad is None for p in teacher.parameters())
+
+
+def test_teacher_request_cache_matches_uncached_and_is_built_once_for_draws(monkeypatch):
+    torch.set_num_threads(1)
+    teacher = ContactWorldModel(config()).eval().requires_grad_(False)
+    values, noise = batch(), torch.randn(1, 3, 3, 4)
+    calls = []
+    original = teacher.flow_blocks[0].prepare_condition_kv
+    def count(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(teacher.flow_blocks[0], 'prepare_condition_kv', count)
+    eager = teacher.sample(values, num_samples=3, steps=4, solver='euler', source_noise=noise)
+    cached = teacher.sample(values, num_samples=3, steps=4, solver='euler', source_noise=noise, cache_condition_kv=True)
+    assert len(calls) == 1
+    torch.testing.assert_close(cached['flow_state_pred'], eager['flow_state_pred'], atol=2e-6, rtol=2e-5)
+    assert all(p.grad is None for p in teacher.parameters())
+
+
+def test_endpoint_execution_and_optional_physical_join_with_partially_normalized_streams():
+    torch.set_num_threads(1)
+    cfg = config()
+    cfg['model']['inputs'] = ['q', 'dq', 'tau']
+    cfg['dataloader'].update(normalize_mode='gaussian', normalize_lowdim_keys=['tau', 'action'])
+    teacher = ContactWorldModel(cfg).eval().requires_grad_(False)
+    student = ContactWorldModelStudent.from_teacher(teacher, student_steps=4)
+    trainer = ContactWorldModelDistillTrainer.__new__(ContactWorldModelDistillTrainer)
+    trainer.teacher, trainer.model, trainer.device, trainer.config = teacher, student, 'cpu', cfg
+    trainer.teacher_steps, trainer.student_steps, trainer.global_step = 64, 4, 0
+    trainer.loss_calculator = ContactWorldModelLoss(cfg)
+    # q and dq are physical already: no statistics should be required for them.
+    from train.nomalizer import Normalizer
+    trainer.loss_calculator.normalizer = Normalizer({})
+    trainer.weights = {'local_weight': 1., 'terminal_weight': 1., 'q_d1_weight': 0., 'q_d2_weight': 0.,
+                       'contact_distill_weight': 0., 'contact_ce_weight': 0., 'execution_weight': .25, 'join_weight': .01}
+    trainer.student_start_probability_max, trainer.student_start_probability_warmup_steps = .5, 5000
+    trainer.local_loss_mode = 'endpoint'
+    trainer.execution_window = {'delay_steps': 1, 'execute_steps': 2, 'mode': 'prefetch'}
+    values = batch()
+    values['dq'] = torch.randn_like(values['q'])
+    loss, info = trainer.compute_loss(values)
+    assert torch.isfinite(loss) and torch.isfinite(info['loss_dict']['join'])
+    assert info['loss_dict']['execution'] > 0
+    loss.backward()
+    assert student.state_encoders['dq'].weight_ih_l0.grad.abs().sum() > 0
+    assert all(p.grad is None for p in teacher.parameters())

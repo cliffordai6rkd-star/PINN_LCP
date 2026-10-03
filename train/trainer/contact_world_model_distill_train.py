@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import json
 import logging
 import math
 import shutil
@@ -24,6 +25,9 @@ from model.pinn_model.contact_world_model_student import (
 )
 from train.base_trainer import BaseTrainer
 from train.carswm_metrics import distribution_metrics
+from train.carswm_execution_metrics import (
+    execution_slice, local_interval_loss, physical_frame_errors, ContactAccumulator,
+)
 from train.contact_world_model_loss import ContactWorldModelLoss
 from train.nomalizer import Normalizer
 
@@ -127,7 +131,7 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         self.teacher_config = copy.deepcopy(self.teacher_checkpoint.get("config") or {})
         if not self.teacher_config:
             raise ValueError("teacher checkpoint has no config")
-        if (self.teacher_config.get("distillation") or {}).get("enabled"):
+        if (self.teacher_config.get("distillation") or {}).get("enabled") or 'student' in (self.teacher_checkpoint.get('carswm_contract') or {}):
             raise ValueError("teacher_checkpoint_path must be the original teacher, not a student")
         if not (self.teacher_checkpoint.get("ema") or {}).get("enabled", False):
             raise ValueError("teacher checkpoint must contain EMA deployment weights")
@@ -178,11 +182,29 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         self.weights = {}
         for name, default in (("local_weight", 1.0), ("terminal_weight", 1.0),
                               ("q_d1_weight", 0.0), ("q_d2_weight", 0.0),
-                              ("contact_distill_weight", 0.0), ("contact_ce_weight", 0.0)):
+                              ("contact_distill_weight", 0.0), ("contact_ce_weight", 0.0),
+                              ("execution_weight", 0.0), ("join_weight", 0.0)):
             value = float(d.get(name, default))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"distillation.{name} must be finite and non-negative")
             self.weights[name] = value
+        self.local_loss_mode = d.get("local_loss_mode", "velocity")
+        if self.local_loss_mode not in ("velocity", "endpoint"):
+            raise ValueError("distillation.local_loss_mode must be velocity/endpoint")
+        self.execution_window = dict(d.get("execution_window") or {})
+        self.short_windows = tuple(d.get("validation_short_windows", (1, 4, 8)))
+        if any(not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in self.short_windows):
+            raise ValueError("validation_short_windows must contain positive integers")
+        self.diagnostics_every = int(d.get("diagnostics_every_steps", 0))
+        if self.diagnostics_every < 0:
+            raise ValueError("diagnostics_every_steps must be nonnegative")
+        if self.weights["execution_weight"] and not self.execution_window:
+            raise ValueError("execution_weight requires explicit execution_window assumptions")
+        horizon = int(self.config['dataloader']['prediction_horizon'])
+        if self.execution_window:
+            execution_slice(horizon, **self.execution_window)
+        if self.weights["join_weight"] and (not {'q', 'dq'} <= set(self.config['model']['inputs']) or 'q' not in self.loss_calculator.predicted_state_streams):
+            raise ValueError("join_weight requires actual q/dq history inputs")
         if not any(self.weights.values()):
             raise ValueError("at least one distillation loss weight must be positive")
         if (self.weights["q_d1_weight"] or self.weights["q_d2_weight"]) and "q" not in self.loss_calculator.predicted_state_streams:
@@ -248,6 +270,14 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         if payload.get("normalize_mode") != self.config["dataloader"].get("normalize_mode"):
             raise ValueError("teacher normalizer mode differs from data config")
         normalizer = Normalizer(copy.deepcopy(payload["stats"]), eps=float(payload.get("eps", 1e-6)))
+        data = self.config['dataloader']
+        keys = data.get('normalize_lowdim_keys', [])
+        if payload.get('normalize_lowdim_keys', keys) != keys:
+            raise ValueError('teacher normalizer keys differ from data config')
+        if data.get('normalize_mode'):
+            normalizer.validate(data['normalize_mode'], keys,
+                                {**{key: int(self.config['model'].get('joint_dim', 7)) for key in ('q', 'dq', 'delta_q', 'tau')},
+                                 'action': int(self.config['model'].get('action_dim', 7))})
         self.dataset.set_normalizer(normalizer)
         self.loss_calculator.set_normalizer(normalizer)
 
@@ -314,7 +344,7 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         reference = prepared[self.model.inputs[0]]
         noise = self.model._gaussian_flow_source(reference).float()
         with torch.no_grad(), self._teacher_fp32():
-            encoded_teacher = self.teacher.encode_conditions(prepared)
+            encoded_teacher = self.teacher.encode_conditions(prepared, cache_condition_kv=True)
             teacher_states = self._teacher_trajectory(noise, encoded_teacher)
         student_states = self._student_trajectory(noise, encoded_student)
         target = teacher_states[-1]
@@ -342,7 +372,27 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
                     )
             else:
                 next_state = teacher_states[(index + 1) * (self.teacher_steps // self.student_steps)]
-            local = self._stream_loss(predicted_velocity, ((next_state - x) / h).detach(), prepared)
+            local = local_interval_loss(
+                predicted_velocity, x, next_state, h, getattr(self, 'local_loss_mode', 'velocity'),
+                lambda a, b: self._stream_loss(a, b, prepared),
+            )
+        execution = join = zero
+        if self.weights.get('execution_weight', 0):
+            # Expand exactly as public sampling does before applying Nero's
+            # external-frame array indices. Never stride action conditions.
+            stride = self.model.temporal_stride
+            window = execution_slice(self.model.external_future_horizon, **self.execution_window)
+            execution = self._stream_loss(generated.repeat_interleave(stride, 1)[:, window],
+                                          target.repeat_interleave(stride, 1)[:, window], prepared)
+        if self.weights.get('join_weight', 0):
+            index = self.model.predicted_state_streams.index('q') * self.model.joint_dim
+            first_q = self._physical_stream('q', generated[:, 0, index:index + self.model.joint_dim])
+            current_q = self._physical_stream('q', prepared['q'][:, -1])
+            current_dq = self._physical_stream('dq', prepared['dq'][:, -1])
+            dt = prepared.get('future_time')
+            dt = dt[:, :1] if dt is not None else first_q.new_full((first_q.shape[0], 1), 1 / self.model.external_state_rate_hz)
+            join = self.loss_calculator._weighted_mean(
+                (first_q - (current_q + dt * current_dq)).square().mean(1), prepared.get('importance_weight'))
         q_d1 = q_d2 = zero
         if "q" in self.model.predicted_state_streams:
             index = self.model.predicted_state_streams.index("q") * self.model.joint_dim
@@ -378,11 +428,33 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         loss = (self.weights["local_weight"] * local + self.weights["terminal_weight"] * terminal
                 + self.weights["q_d1_weight"] * q_d1 + self.weights["q_d2_weight"] * q_d2
                 + self.weights["contact_distill_weight"] * contact_kl
-                + self.weights["contact_ce_weight"] * contact_ce)
-        return loss, {"loss_dict": {"local": local.detach(), "terminal": terminal.detach(),
-                                   "q_d1": q_d1.detach(), "q_d2": q_d2.detach(),
-                                   "contact_kl": contact_kl.detach(), "contact_ce": contact_ce.detach(),
-                                   "student_start_probability": probability, "total": loss.detach()}}
+                + self.weights["contact_ce_weight"] * contact_ce
+                + self.weights.get('execution_weight', 0) * execution
+                + self.weights.get('join_weight', 0) * join)
+        terms = {'local': local, 'terminal': terminal, 'q_d1': q_d1, 'q_d2': q_d2,
+                 'contact_kl': contact_kl, 'contact_ce': contact_ce, 'execution': execution, 'join': join}
+        info = {key: value.detach() for key, value in terms.items()}
+        for key, value in terms.items():
+            weight_key = 'contact_distill_weight' if key == 'contact_kl' else f'{key}_weight'
+            info[f'weighted_{key}'] = (self.weights.get(weight_key, 0) * value).detach()
+        info.update(student_start_probability=probability, total=loss.detach())
+        every = getattr(self, 'diagnostics_every', 0)
+        if every and self.global_step % every == 0 and getattr(self, '_diagnosed_step', None) != self.global_step:
+            self._diagnosed_step = self.global_step
+            # autograd.grad leaves .grad untouched: accumulation, scaler and
+            # DDP reducer still receive exactly one ordinary loss.backward().
+            if not torch.distributed.is_initialized():
+                shared = (self.model.flow_input_projection.weight, self.model.state_encoders[self.model.inputs[0]].weight_ih_l0)
+                for key in ('local', 'terminal'):
+                    if terms[key].requires_grad:
+                        grads = torch.autograd.grad(terms[key], shared, retain_graph=True, allow_unused=True)
+                        info[f'{key}_shared_grad_norm'] = sum(g.float().square().sum() for g in grads if g is not None).sqrt().detach()
+            for i in range(1, self.student_steps):
+                info[f'flow_state_mse_s{i}'] = (student_states[i].detach() - teacher_states[i * (self.teacher_steps // self.student_steps)]).square().mean()
+            if self.weights['local_weight']:
+                info['local_target_velocity_norm'] = ((next_state - x) / h).flatten(1).norm(dim=1).mean().detach()
+                info['local_student_start'] = float(from_student)
+        return loss, {'loss_dict': info}
 
     def _sync_device(self):
         kind = torch.device(self.device).type
@@ -390,6 +462,116 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
             torch.cuda.synchronize(self.device)
         elif kind == "npu":
             torch.npu.synchronize(self.device)
+
+    def _physical_stream(self, key, value):
+        data = self.config.get('dataloader') or {}
+        if data.get('normalize_mode') is None or key not in data.get('normalize_lowdim_keys', []):
+            return value.float()
+        normalizer = getattr(getattr(self, 'loss_calculator', None), 'normalizer', None)
+        if normalizer is None:
+            payload = self._teacher_normalizer
+            normalizer = Normalizer(payload['stats'], eps=float(payload.get('eps', 1e-6)))
+        return getattr(normalizer, f"{data['normalize_mode']}_denormalize")(key, value.float())
+
+    def _accumulate_execution_metrics(self, outputs, model, batch, add, contact_accumulators, encoded_student, encoded_teacher):
+        """External-frame metrics; scalar losses above retain their original scale."""
+        b = batch[model.inputs[0]].shape[0]
+        h = model.external_future_horizon
+        stride = model.temporal_stride
+        time_axis = batch.get('future_time')
+        if time_axis is None:
+            time_axis = torch.arange(1, h + 1, device=self.device).float()[None].expand(b, -1) / model.external_state_rate_hz
+        add('physical_dt_nominal_fallback', torch.full((b,), float('future_time' not in batch), device=self.device))
+        windows = {'full': slice(0, h)}
+        for n in getattr(self, 'short_windows', (1, 4, 8)):
+            if n <= h:
+                windows[f'first{n}'] = slice(0, n)
+        execution = getattr(self, 'execution_window', {})
+        if execution:
+            windows['execution'] = execution_slice(h, **execution)
+        tasks = batch.get('task_index')
+
+        def report(key, values):
+            add(key, values)
+            if tasks is not None and values.shape == (b,):
+                for task in tasks.unique():
+                    add(f'task_{int(task)}_{key}', values, tasks.reshape(-1) == task)
+
+        phases = batch.get('contact_future') if (self.config.get('contact_gate') or {}).get('enabled', False) else None
+        for name, samples_internal in outputs.items():
+            samples = samples_internal.repeat_interleave(stride, dim=2)
+            for j, key in enumerate(model.predicted_state_streams):
+                sl = slice(j * model.joint_dim, (j + 1) * model.joint_dim)
+                physical = self._physical_stream(key, samples[..., sl])
+                truth = self._physical_stream(key, batch[f'{key}_future'])
+                teacher = self._physical_stream(key, outputs['teacher'].repeat_interleave(stride, dim=2)[..., sl])
+                unit = {'q': 'rad2', 'tau': 'nm2', 'dq': 'rad2_s2', 'delta_q': 'rad2'}[key]
+                for reference_name, reference in [('label', truth), ('teacher', teacher)]:
+                    if reference_name == 'teacher' and name == 'teacher':
+                        continue
+                    # physical_frame_errors uses a deterministic label. Paired
+                    # teacher errors retain the SAME sample axis throughout.
+                    if reference_name == 'teacher':
+                        error_input = physical - reference
+                        error_target = torch.zeros_like(truth)
+                    else:
+                        error_input, error_target = physical, reference
+                    errors = physical_frame_errors(error_input, error_target, time_axis, key)
+                    for metric, frame_error in errors.items():
+                        suffix = unit if metric == f'{key}_mse' else ('rad2_s2' if metric == 'q_d1_mse' else 'rad2_s4')
+                        for window_name, window in windows.items():
+                            order = 1 if metric == 'q_d1_mse' else 2 if metric == 'q_d2_mse' else 0
+                            end = window.stop - order
+                            if end > window.start:
+                                report(f'{name}_{window_name}_{reference_name}_{metric}_{suffix}', frame_error[:, window.start:end].mean(1))
+                        if phases is not None:
+                            order = h - frame_error.shape[1]
+                            # Assign differences to their right endpoint phase.
+                            # Labels remain the dataset's existing transition-band proxy.
+                            frame_phase = phases[:, order:, 0].long()
+                            for phase, label in enumerate(('free', 'establishing', 'contact') if model.contact_state_count == 3 else tuple(f'phase_{c}' for c in range(model.contact_state_count))):
+                                mask = frame_phase.eq(phase)
+                                add(f'{name}_{label}_{reference_name}_{metric}_{suffix}', frame_error[mask])
+                    if key == 'tau':
+                        # Motor total torque magnitude tail, not external contact force.
+                        tail = truth.abs().amax(-1)
+                        mask = tail >= torch.quantile(tail.flatten(), 0.95)
+                        add(f'{name}_tau_motor_tail_{reference_name}_mse_nm2', errors['tau_mse'][mask])
+                        report(f'{name}_tau_motor_peak_abs_error_nm', (physical.abs().amax((2, 3)) - truth.abs().amax((1, 2))[:, None]).abs().mean(1))
+                if key == 'q':
+                    current = self._physical_stream('q', batch['q'][:, -1])
+                    report(f'{name}_join_q_displacement_mse_rad2', (physical[:, :, 0] - current[:, None]).square().mean((1, 2)))
+                    if 'dq' in batch:
+                        dq = self._physical_stream('dq', batch['dq'][:, -1])
+                        first_dt = time_axis[:, 0]
+                        if torch.any(first_dt <= 0):
+                            raise ValueError('first forecast time must be positive relative to anchor')
+                        slope = (physical[:, :, 0] - current[:, None]) / first_dt[:, None, None]
+                        report(f'{name}_join_measured_dq_mse_rad2_s2', (slope - dq[:, None]).square().mean((1, 2)))
+            logits_encoded = model if name == 'student' else self.teacher
+            encoded = encoded_student if name == 'student' else encoded_teacher
+            probabilities = torch.stack([logits_encoded.contact_logits(samples_internal[:, k], encoded).float().softmax(-1)
+                                         for k in range(samples_internal.shape[1])], dim=1).repeat_interleave(stride, dim=2)
+            outputs_contact = contact_accumulators.setdefault('_paired', {})
+            outputs_contact[name] = probabilities
+            if phases is not None:
+                accumulator = contact_accumulators.setdefault(name, ContactAccumulator(model.contact_state_count))
+                accumulator.update(probabilities, phases, time_axis, batch.get('contact'))
+                for window_name, window in windows.items():
+                    if window_name == 'full':
+                        continue
+                    previous = batch.get('contact') if window.start == 0 else phases[:, window.start - 1:window.start]
+                    accumulator = contact_accumulators.setdefault(f'{name}_{window_name}', ContactAccumulator(model.contact_state_count))
+                    accumulator.update(probabilities[:, :, window], phases[:, window], time_axis[:, window], previous)
+                if tasks is not None:
+                    for task in tasks.unique():
+                        mask = tasks.reshape(-1) == task
+                        accumulator = contact_accumulators.setdefault(f'task_{int(task)}_{name}', ContactAccumulator(model.contact_state_count))
+                        history_contact = batch.get('contact')
+                        accumulator.update(probabilities[mask], phases[mask], time_axis[mask], None if history_contact is None else history_contact[mask])
+        paired = contact_accumulators.pop('_paired')
+        for name in ('student', 'short_teacher'):
+            report(f'{name}_contact_same_noise_probability_mse', (paired[name] - paired['teacher']).square().mean((1, 2, 3)))
 
     @torch.no_grad()
     def _latency_ms(self, model, prepared, noise, *, steps, solver):
@@ -414,6 +596,7 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         model.eval()
         self.teacher.eval()
         sums, counts = {}, {}
+        contact_accumulators = {}
 
         def add(name, value, phase=None):
             value = value.float().reshape(-1)
@@ -435,13 +618,14 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
             outputs = {"student": [], "teacher": [], "short_teacher": []}
             encoded_student = model.encode_conditions(prepared)
             with self._teacher_fp32():
-                encoded_teacher = self.teacher.encode_conditions(prepared)
+                encoded_teacher = self.teacher.encode_conditions(prepared, cache_condition_kv=True)
             for noise in noises:
                 with self._teacher_fp32():
                     outputs["teacher"].append(self.teacher.integrate_flow(noise.float(), encoded_teacher, steps=64, solver="heun").float())
                     outputs["short_teacher"].append(self.teacher.integrate_flow(noise.float(), encoded_teacher, steps=self.student_steps, solver="euler").float())
                 outputs["student"].append(model.integrate_flow(noise, encoded_student, steps=self.student_steps).float())
             outputs = {key: torch.stack(value, dim=1) for key, value in outputs.items()}
+            self._accumulate_execution_metrics(outputs, model, batch, add, contact_accumulators, encoded_student, encoded_teacher)
             targets = torch.cat([prepared[f"{key}_future"].float() for key in model.predicted_state_streams], dim=-1)
             labels_enabled = (self.config.get("contact_gate") or {}).get("enabled", False)
             phase_values = prepared.get("future_phase") if labels_enabled else None
@@ -489,6 +673,10 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
                             add(f"{name}_{phase_name}_{metric}", distribution[metric], phases == phase_index)
                 if name != "teacher":
                     add(f"{name}_terminal_mse", (samples - outputs["teacher"]).square().mean(dim=(1, 2, 3)))
+                    if 'task_index' in batch:
+                        per_sample = (samples - outputs['teacher']).square().mean((1, 2, 3))
+                        for task in batch['task_index'].unique():
+                            add(f'task_{int(task)}_{name}_terminal_mse', per_sample, batch['task_index'].reshape(-1) == task)
                     if phases is not None:
                         paired = (samples - outputs["teacher"]).square().mean(dim=(1, 2, 3))
                         for phase_index, phase_name in enumerate(phase_names):
@@ -502,6 +690,16 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
                     with self._teacher_fp32():
                         add(f"{name}_latency_ms", torch.tensor([self._latency_ms(measured, single, noise, steps=steps, solver=solver)]))
         metrics = {key: value / counts[key] for key, value in sums.items()}
+        for name, accumulator in contact_accumulators.items():
+            metrics.update({f'{name}_contact_marginal_{key}': value for key, value in accumulator.finalize().items()})
+        task_keys = {}
+        for key, value in list(metrics.items()):
+            if key.startswith('task_'):
+                _, _, suffix = key.split('_', 2)
+                task_keys.setdefault(suffix, []).append(value)
+            if key.endswith(('_mse_rad2', '_mse_nm2', '_mse_rad2_s2', '_mse_rad2_s4')):
+                metrics[key.replace('_mse_', '_rmse_').replace('rad2', 'rad').replace('nm2', 'nm').replace('_s2', '_s').replace('_s4', '_s2')] = math.sqrt(value)
+        metrics.update({f'task_macro_{key}': sum(values) / len(values) for key, values in task_keys.items()})
         if "student_terminal_mse" not in metrics:
             raise ValueError("validation produced no samples")
         metrics["terminal_mse"] = metrics["student_terminal_mse"]
@@ -521,6 +719,13 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
         best_dir.mkdir(parents=True, exist_ok=True)
         selected = best_dir / f"step_{self.global_step:08d}_mse_{val_loss:.8f}.pt"
         shutil.copy2(self.ckpt_dir / "latest.pt", selected)
+        summary = {'global_step': self.global_step, 'student_steps': self.student_steps,
+                   'checkpoint': str(selected), 'ema': True,
+                   'execution_window_assumption': self.execution_window,
+                   'validation_num_samples': self.validation_num_samples,
+                   'task_sources': (self.config.get('train_data') or {}).get('sources', []),
+                   'metrics': self.last_val_epoch_metrics}
+        (self.ckpt_dir / f'step_{self.global_step:08d}_diagnostics.json').write_text(json.dumps(summary, indent=2) + '\n')
         ranked = sorted(best_dir.glob("step_*_mse_*.pt"), key=lambda path: float(path.stem.rsplit("_", 1)[-1]))
         for extra in ranked[self.top_k:]:
             extra.unlink()
@@ -530,10 +735,58 @@ class ContactWorldModelDistillTrainer(BaseTrainer):
 def main():
     parser = argparse.ArgumentParser(description="Distill original T64 CaRS-WM into S8/S4/S2")
     parser.add_argument("--config", "-c", type=Path, required=True)
+    parser.add_argument('--teacher-checkpoint', type=Path)
+    parser.add_argument('--student-init-checkpoint', type=Path)
+    parser.add_argument('--device')
+    parser.add_argument('--batch-size', type=int)
+    parser.add_argument('--max-batches', type=int)
+    parser.add_argument('--max-optimizer-steps', type=int)
+    parser.add_argument('--offline', action='store_true', help='disable external experiment logging')
+    parser.add_argument('--validate-only', action='store_true', help='no optimizer steps')
+    parser.add_argument('--student-checkpoint', type=Path)
+    parser.add_argument('--output', type=Path, help='validation JSON output')
     args = parser.parse_args()
     with args.config.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
-    ContactWorldModelDistillTrainer(config).train()
+    d, t = config.setdefault('distillation', {}), config.setdefault('train', {})
+    if args.teacher_checkpoint:
+        d['teacher_checkpoint_path'] = str(args.teacher_checkpoint.resolve())
+    if args.student_init_checkpoint:
+        d['student_init_checkpoint_path'] = str(args.student_init_checkpoint.resolve())
+    for key, value in [('device', args.device), ('batch_size', args.batch_size), ('max_optimizer_steps', args.max_optimizer_steps)]:
+        if value is not None:
+            t[key] = value
+    if args.max_batches is not None:
+        d['validation_max_batches'] = args.max_batches
+    if args.offline or args.validate_only:
+        t['wandb'] = {'enabled': False}
+    if args.validate_only:
+        t['amp'] = {'enabled': False}  # FP32 quality baseline on CPU or CUDA
+    if args.validate_only and not args.student_checkpoint:
+        parser.error('--validate-only requires --student-checkpoint (no untrained Student quality claims)')
+    trainer = ContactWorldModelDistillTrainer(config)
+    if args.validate_only:
+        from model.pinn_model.checkpoint import model_from_checkpoint
+        trainer.setup()
+        payload = torch.load(args.student_checkpoint, map_location='cpu', weights_only=False)
+        model = model_from_checkpoint(payload)
+        if not isinstance(model, ContactWorldModelStudent) or model.student_steps != trainer.student_steps:
+            raise ValueError('evaluation checkpoint is not the configured Student stage')
+        if model.checkpoint_contract() != trainer.model.checkpoint_contract() or not _equal_nested(payload.get('normalizer'), trainer._teacher_normalizer):
+            raise ValueError('evaluation checkpoint contract/normalizer differs from supervisor')
+        model.load_state_dict(payload['model'], strict=True)
+        trainer.model = model.to(trainer.device).eval()
+        trainer.ema = None
+        trainer.validate_one_epoch(0, force=True)
+        result = {'student_checkpoint': str(args.student_checkpoint.resolve()), 'weights_ema': bool((payload.get('ema') or {}).get('enabled')),
+                  'execution_window_assumption': trainer.execution_window, 'metrics': trainer.last_val_epoch_metrics}
+        text = json.dumps(result, indent=2)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(text + '\n')
+        print(text)
+    else:
+        trainer.train()
 
 
 if __name__ == "__main__":

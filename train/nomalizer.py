@@ -12,6 +12,28 @@ class Normalizer:
         self.stats = stats
         self.eps = eps
 
+    def validate(self, mode, keys, dimensions):
+        """Reject missing/nonfinite or time-dependent deployment statistics."""
+        import math
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError('normalizer eps must be finite and positive')
+        required = {'gaussian': ('mean', 'std'), 'limit': ('min', 'max'),
+                    'quantile': ('q01', 'q99')}
+        if mode not in required:
+            raise ValueError(f'unsupported normalization {mode}')
+        for key in keys:
+            if key not in self.stats or key not in dimensions:
+                raise ValueError(f'missing/unsupported normalizer stream: {key}')
+            for name in required[mode]:
+                value = self.stats[key].get(name)
+                if not torch.is_tensor(value) or value.shape != (dimensions[key],) or not torch.isfinite(value).all():
+                    raise ValueError(f'invalid normalizer {key}.{name}: expected finite per-feature tensor')
+            a, b = (self.stats[key][name] for name in required[mode])
+            if mode == 'gaussian' and torch.any(b < 0):
+                raise ValueError(f'negative normalizer std for {key}')
+            if mode != 'gaussian' and torch.any(b < a):
+                raise ValueError(f'reversed normalizer bounds for {key}')
+
 
     @classmethod
     def stats_from_dataset(cls, dataset, valid_indices,lowdim_keys, normalize_keys, eps=1e-6):

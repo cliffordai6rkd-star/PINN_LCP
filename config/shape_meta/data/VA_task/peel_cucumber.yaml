@@ -1,7 +1,7 @@
 io:
-  input: ../nero_ws/runs/cuccumber_peeling
-  output: ../nero_ws/runs/cuccumber_peeling_lerobotv3
-  repo_id: cuccumber_peeling_lerobotv3
+  input: ../nero_ws/runs/peel_cucumber
+  output: ../nero_ws/runs/peel_cucumber_lerobotv3
+  repo_id: peel_cucumber_lerobotv3
   max_episodes: null
   no_videos: false
   push_to_hub: false

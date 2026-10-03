@@ -1,13 +1,13 @@
 io:
   # Resolved to the sibling repository regardless of the launch directory.
-  input: nero_ws/runs/next_data_filted
-  output: data/train_episode/next_data_lbv3
-  repo_id: next_bg_data50hz_lbv3
+  input: data/xarm_bg
+  output: data/train_episode/xarm_bg_lbv3
+  repo_id:  xarm_bg_lbv3
   max_episodes: null
   no_videos: True
   push_to_hub: false
 
-task: next_bg_data50hz_lbv3
+task: xarm_bg_lbv3
 master_timestamp_path: teleop/timestamp_us
 fps: 100
 
