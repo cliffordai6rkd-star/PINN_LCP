@@ -86,7 +86,7 @@ def generate_tau_labels(dataset):
     if not checkpoint.is_file():
         raise FileNotFoundError(f'Torque-label checkpoint does not exist: {checkpoint}')
     checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    code_sha = hashlib.sha256((ROOT/'model/xarm_tau_free.py').read_bytes()+Path(__file__).read_bytes()).hexdigest()
+    code_sha = hashlib.sha256((ROOT/'model/xarm_tau_free.py').read_bytes()+(ROOT/'model/xarm_tau_sequence.py').read_bytes()+Path(__file__).read_bytes()).hexdigest()
     cache = Path(cfg.get('cache_dir', ROOT/'outputs/cache/wm_tau_labels')).expanduser()
     count = len(dataset.high_timestamps)
     for key in ('q', 'dq', 'delta_q', 'tau'):
@@ -96,7 +96,7 @@ def generate_tau_labels(dataset):
     result['valid_context'] = torch.zeros(count, dtype=torch.bool)
     report = dict(checkpoint=str(checkpoint), checkpoint_sha256=checkpoint_sha,
                   pipeline_sha256=code_sha, cache_dir=str(cache.resolve()),
-                  teacher_inputs=['q', 'dq', 'delta_q'], filter='zero-phase Butterworth 4th order 5 Hz -> 50 Hz',
+                  teacher_inputs=['q', 'dq', 'delta_q'], filter='defined by exported checkpoint spec/contract',
                   episodes=[], cache_hits=0, cache_misses=0)
     teacher = None
     old_threads = torch.get_num_threads()

@@ -90,6 +90,61 @@ PY
 
 ## Training
 
+For xArm erase-board training with shared torque-derived contact labels, use
+`config/train_cfg/latent_cwm_erase_board_100hz_40step.yaml` or
+`config/train_cfg/pretrain/xarm/cwm_erase_board_100hz_40step.yaml`.
+Both use eight native 25 Hz action tokens and predict 32 state frames at 100 Hz.
+See [the xArm training guide](docs/xarm_tau_labeling.md) for commands and the
+retained torque model, label cache, and phase rules.
+
+Train Contact WM and Latent WM sequentially, then evaluate each model's final
+weights with **32, 16, and 8 Flow integration steps**:
+
+```bash
+# Run from the repository root. Keep this directory to resume the same run.
+export WM_RUN_ROOT="outputs/xarm_wm_flow_sweep/erase_board_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$WM_RUN_ROOT"
+nohup bash scripts/train_xarm_wm_flow_sweep.sh \
+  > "$WM_RUN_ROOT/launcher.log" 2>&1 < /dev/null &
+echo "Launcher PID: $!; results: $WM_RUN_ROOT"
+
+# Monitor training and inspect timing/status records.
+tail -f "$WM_RUN_ROOT/contact_wm/train.log"
+# After Contact WM finishes, the launcher starts latent_wm/train.log.
+.conda-env/bin/python scripts/xarm_wm_flow_sweep.py report "$WM_RUN_ROOT"
+```
+
+Both models train for **250,000 optimizer updates**, saving every **50,000**.
+Latent WM additionally trains its codec for 10,000 updates before Flow;
+its reported training time includes this stage. The action condition remains
+eight native 25 Hz actions, with 32 predicted state frames at 100 Hz.
+Inference integration steps do not change these training budgets.
+
+The launcher snapshots the two erase-board YAMLs under the run directory and
+trains each model only once. It preserves their configured training-time
+sampling defaults (Contact: 32; Latent: 16) and aligns Contact's separate
+probabilistic-validation step setting with that default. Post-training
+evaluation uses the same final EMA weights, validation windows, and source
+noise for all three step counts within each model. By default it scores eight
+validation batches with eight generated futures per window, using Heun.
+
+`training_times.csv` records training start/completion timestamps, measured
+wall time, budgets, and status. Training time includes setup, codec where
+applicable, in-training validation, checkpoint writing, and logging.
+`evaluation_results.csv` records the six evaluations, prediction metrics, and
+sampling time. Sampling time excludes warmup, data loading, and metric
+calculation; `sampling_ms_per_window` includes all eight sampled futures and
+is a batched throughput measurement, not single-request latency. Each model's
+`timing.json` retains detailed attempts and the final checkpoint hash.
+
+Re-run the same command with the same `WM_RUN_ROOT` to skip completed models
+and resume incomplete ones from their saved checkpoints. Original config
+snapshots are reused; changing the source YAML requires a new run directory.
+A failed or interrupted run stops the sequence. Completed attempt times are
+summed across restarts; hard-killed attempts without a recorded duration are
+flagged with `timing_complete=False`. Use `WM_PREPARE_ONLY=1` to generate
+configs without starting training, or `WANDB_MODE=offline` for local W&B logs.
+
 Teacher and OPD Student training use optimizer updates as the authoritative
 budget. `num_epochs` is only a data-pass/logging counter when
 `max_optimizer_steps` is set.

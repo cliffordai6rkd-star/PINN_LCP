@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from data_process.causal_data_filter import filter_episode_values
 from model.tau_other_sequence import build_tau_other_sequence_model
+from model.xarm_tau_sequence import SequenceTorqueRegressor as Regressor
 
 KEYS = ('q', 'dq', 'delta_q', 'tau')
 
@@ -199,26 +200,6 @@ def predict_original(episode, checkpoint, device):
     return prediction, columns['tau'][horizon-1:]
 
 
-class Regressor(nn.Module):
-    def __init__(self, spec):
-        super().__init__()
-        self.spec = spec
-        input_dim = (14 if spec.get('no_delta') else 21) + (7 if spec.get('ddq') else 0)
-        if spec['arch'] == 'mlp':
-            self.encoder = None
-            self.head = nn.Sequential(nn.Linear(input_dim,256),nn.SiLU(),nn.Linear(256,256),nn.SiLU(),nn.Linear(256,7))
-        else:
-            bidirectional = spec['arch'] == 'bilstm'
-            self.encoder = nn.LSTM(input_dim,128,2,batch_first=True,dropout=.1,bidirectional=bidirectional)
-            self.head = nn.Sequential(nn.Linear(256 if bidirectional else 128,256),nn.ReLU(),nn.Dropout(.1),nn.Linear(256,7))
-
-    def forward(self, value):
-        if self.encoder is None:
-            return self.head(value[:,-1])
-        value,_ = self.encoder(value)
-        return self.head(value[:, value.shape[1]//2 if self.spec['arch']=='bilstm' else -1])
-
-
 def model_features(processed, spec):
     values = [processed[k] for k in (('q','dq') if spec.get('no_delta') else ('q','dq','delta_q'))]
     if spec.get('ddq'):
@@ -227,9 +208,9 @@ def model_features(processed, spec):
 
 
 @functools.lru_cache(maxsize=8)
-def load_physics_prior(path):
+def load_physics_prior(path, urdf_path=None):
     import pinocchio as pin
-    model=pin.buildModelFromUrdf(str(ROOT.parent/'xarm_ws/gello_teleop/models/xarm7_dynamics.urdf'))
+    model=pin.buildModelFromUrdf(str(urdf_path or ROOT.parent/'xarm_ws/gello_teleop/models/xarm7_dynamics.urdf'))
     coefficients=np.load(path)['coefficients']
     return model,coefficients
 
@@ -238,7 +219,7 @@ def physics_prior(processed,spec):
     if not spec.get('physics_prior'):
         return np.zeros_like(processed['tau'])
     import pinocchio as pin
-    model,coefficients=load_physics_prior(spec['physics_prior'])
+    model,coefficients=load_physics_prior(spec['physics_prior'], spec.get('urdf_path'))
     data=model.createData()
     q,dq=processed['q'].astype(float),processed['dq'].astype(float)
     ddq=np.gradient(dq,1/spec['rate'],axis=0)

@@ -220,3 +220,22 @@ def test_optional_rollout_contact_loss_uses_temporal_alignment_and_preserves_gra
     assert metrics['rollout_contact_physical'] > .1  # No upcoming contact: cannot be alignment.
     loss.backward()
     assert prediction['tau_pred'].grad.abs().sum() > 0
+
+
+def test_real_format2_network_labels_both_wm_families(generated_config, monkeypatch):
+    from model.xarm_tau_free import LearnedTorqueModel
+    from model.xarm_tau_sequence import SequenceTorqueRegressor
+    cfg, _, _ = generated_config
+    spec=dict(arch='bilstm',horizon=51,rate=50,filter='zero5',physics_prior=False)
+    network=SequenceTorqueRegressor(spec)
+    for p in network.parameters():
+        p.data.zero_()
+    cp=dict(format_version=2,spec=spec,model=network.state_dict(),normalization=dict(
+        x_mean=torch.zeros(21),x_std=torch.ones(21),y_mean=torch.zeros(7),y_std=torch.ones(7)))
+    torch.save(cp,cfg['dataloader']['tau_ext_generation']['checkpoint'])
+    monkeypatch.setattr(labeling,'LearnedTorqueModel',LearnedTorqueModel)
+    direct=dataset_module.ContactWorldModelDataset(cfg)
+    latent=LatentContactWorldModelDataset(cfg)
+    torch.testing.assert_close(direct.contact,latent.contact)
+    assert latent.tau_label_report['cache_hits']==2
+    assert set(direct.contact[:,0].tolist())=={-1.,0.,1.,2.}

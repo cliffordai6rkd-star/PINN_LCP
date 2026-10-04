@@ -1,7 +1,7 @@
-"""Frozen offline xArm torque teacher, exported with normalization and dynamics.
+"""Frozen offline xArm torque teachers with portable preprocessing and weights.
 
-Matches xarm_ws's validated zero5/50 Hz/51-frame residual BiLSTM pipeline.
-Only used for episode labeling before WM training; never a WM input encoder.
+Supports legacy residual BiLSTM (v1), and direct/hybrid LSTM/BiLSTM (v2).
+Used for episode labeling before WM training; never a WM input encoder.
 """
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ class LearnedTorqueModel:
     """Portable artifact: weights, normalization, 98 coefficients and URDF XML."""
 
     def __init__(self, checkpoint, device='cpu', threads=None):
-        import pinocchio as pin
         import torch
         from torch import nn
         from scipy.signal import butter
@@ -20,6 +19,14 @@ class LearnedTorqueModel:
         if threads is not None:
             torch.set_num_threads(threads)
         cp = torch.load(checkpoint, map_location='cpu', weights_only=True)
+        self._sequence_teacher = None
+        if cp.get('format_version') == 2:
+            from model.xarm_tau_sequence import SequenceTorqueTeacher
+            self._sequence_teacher = SequenceTorqueTeacher(cp, device=device)
+            self.calibration = self._sequence_teacher.calibration
+            self.contract = self._sequence_teacher.contract
+            return
+        import pinocchio as pin
         expected = dict(arch='bilstm', filter='zero5', rate=50, horizon=51)
         if cp.get('format_version') != 1 or any(cp['spec'].get(k) != v for k, v in expected.items()):
             raise ValueError('Expected the exported zero5/50 Hz/51-frame residual BiLSTM artifact')
@@ -53,6 +60,9 @@ class LearnedTorqueModel:
 
     def predict(self, times, q, dq, q_cmd, tau, *, output_times=None, grid_origin=None):
         """One uninterrupted segment; optional sparse outputs reduce live CPU cost."""
+        if self._sequence_teacher is not None:
+            return self._sequence_teacher.predict(times, q, dq, q_cmd, tau,
+                output_times=output_times, grid_origin=grid_origin)
         import pinocchio as pin
         import torch
         from scipy.signal import resample_poly, sosfiltfilt
