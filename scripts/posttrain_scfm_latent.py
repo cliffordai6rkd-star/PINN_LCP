@@ -20,6 +20,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data_process.latent_contact_world_model_dataset import LatentContactWorldModelDataset
+from data_process.contact_world_model_dataset import ContactWorldModelDataset
+from model.pinn_model.contact_scfm import load_contact_checkpoint, make_contact_student
 from model.pinn_model.latent_contact_world_model import load_latent_checkpoint
 from model.pinn_model.latent_pretrained import convert_scale, normalizer_envelope
 from model.pinn_model.scfm_distillation import (
@@ -58,6 +60,23 @@ def seed_worker(_):
     seed = torch.initial_seed() % 2**32
     random.seed(seed)
     np.random.seed(seed)
+
+
+def relocate_data(config, root, repo_id):
+    """Relocate a single dataset without changing its sampling contract."""
+    result = copy.deepcopy(config)
+    sources = (result.get("train_data") or {}).get("sources")
+    if sources and (root or repo_id):
+        if len(sources) != 1 or not isinstance(sources[0], dict):
+            raise ValueError("CLI relocation requires one mapping in train_data.sources")
+        destination = sources[0]
+    else:
+        destination = result["dataloader"]
+    if root:
+        destination["root"] = str(root.resolve())
+    if repo_id:
+        destination["repo_id"] = repo_id
+    return result
 
 
 class BatchStream:
@@ -110,7 +129,10 @@ def validate(student, teacher, loader, settings, device, envelope):
         batch = to_device(raw, device)
         prepared = teacher.prepare_batch(batch)
         size = batch["q"].shape[0]
-        noise = torch.randn(size, settings.validation_samples, teacher.future_horizon, teacher.latent_dim,
+        legacy = hasattr(teacher, "flow_dim") and not hasattr(teacher, "latent_dim")
+        dimension = teacher.flow_dim if legacy else teacher.latent_dim
+        state_key = "flow_state_pred" if legacy else "latent"
+        noise = torch.randn(size, settings.validation_samples, teacher.future_horizon, dimension,
                             device=device, generator=generator)
         with precision_context(device, settings.precision):
             outputs = {name: model.sample(batch, steps=steps, solver=solver,
@@ -122,8 +144,8 @@ def validate(student, teacher, loader, settings, device, envelope):
                 {key: prepared[key+"_future"].float() for key in ("q", "tau")},
                 output["contact_probability"].float(), prepared["contact_future"])
             metrics.pop("contact_macro_f1")
-            metrics["paired_teacher_latent_rmse"] = (
-                output["latent"].float()-outputs["teacher_fine"]["latent"].float()
+            metrics["paired_teacher_flow_rmse" if legacy else "paired_teacher_latent_rmse"] = (
+                output[state_key].float()-outputs["teacher_fine"][state_key].float()
             ).square().mean(dim=(1, 2, 3)).sqrt()
             # Physical metrics are reported per stream, never combining radians
             # and Nm into an unlabelled distance. Clipped quantiles cannot invert.
@@ -161,19 +183,29 @@ def save_checkpoint(path, student, config, teacher_payload, metadata, training_s
                "dataloader_filters": teacher_payload.get("dataloader_filters"),
                "latent_training": teacher_payload.get("latent_training"),
                "scfm_posttrain": copy.deepcopy(metadata), "scfm_training_state": training_state}
+    for key in ("sample_rate_hz", "derived_target_config"):
+        if key in teacher_payload:
+            payload[key] = copy.deepcopy(teacher_payload[key])
     temporary = path.with_suffix(path.suffix+".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT/"config/train_cfg/latent_cwm_scfm.yaml")
+def main(architecture="latent"):
+    if architecture not in {"latent", "contact"}:
+        raise ValueError("unknown SCFM architecture")
+    legacy = architecture == "contact"
+    load_checkpoint = load_contact_checkpoint if legacy else load_latent_checkpoint
+    parser = argparse.ArgumentParser(description=("SCFM post-training of schema-10 GRU CARS-WM" if legacy else __doc__))
+    default_config = "contact_cwm_scfm.yaml" if legacy else "latent_cwm_scfm.yaml"
+    parser.add_argument("--config", type=Path, default=ROOT/"config/train_cfg"/default_config)
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--data-root", type=Path, help="relocate the original LeRobot v3 data; preserve preprocessing")
+    parser.add_argument("--repo-id", help="dataset repo_id at the relocated root")
     parser.add_argument("--updates", type=int)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--precision", choices=("fp32", "bf16"))
@@ -203,24 +235,29 @@ def main():
     torch.manual_seed(settings.seed)
     random.seed(settings.seed)
     np.random.seed(settings.seed)
-    teacher, teacher_payload = load_latent_checkpoint(args.base_checkpoint, device=device)
+    teacher, teacher_payload = load_checkpoint(args.base_checkpoint, device=device)
     teacher.eval().requires_grad_(False)
-    if teacher.source_mode != "gaussian":
+    if (teacher.flow_source_mode if legacy else teacher.source_mode) != "gaussian":
         raise ValueError("SCFM is an independent Gaussian-source route; supply the original teacher")
     if teacher_payload.get("scfm_posttrain") or teacher_payload.get("inverse_gaussian_posttrain"):
         raise ValueError("use an original Flow checkpoint, not another post-training experiment")
     augmentation = (teacher_payload["config"].get("dataloader") or {}).get("action_augmentation") or {}
     if augmentation.get("enabled", False):
         raise ValueError("SCFM's repeatable held-out validation requires action augmentation disabled")
-    student, config = make_student(teacher, teacher_payload, settings.steps, source_hidden_dim=256,
-                                   temperature=1.0, mode="distill-only")
+    if legacy:
+        student, config = make_contact_student(teacher, teacher_payload, settings.steps)
+    else:
+        student, config = make_student(teacher, teacher_payload, settings.steps, source_hidden_dim=256,
+                                      temperature=1.0, mode="distill-only")
     config["model"]["flow_solver"] = "euler"
     student.flow_solver = "euler"
     student.to(device)
     fast, slow = frozen_snapshot(student), frozen_snapshot(student)
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad),
                                  lr=settings.learning_rate)
-    dataset = LatentContactWorldModelDataset(teacher_payload["config"], compute_normalizer=False)
+    data_config = relocate_data(teacher_payload["config"], args.data_root, args.repo_id)
+    dataset_class = ContactWorldModelDataset if legacy else LatentContactWorldModelDataset
+    dataset = dataset_class(data_config, compute_normalizer=False)
     saved = teacher_payload.get("normalizer") or {}
     if not saved.get("stats"):
         raise ValueError("original checkpoint must contain its training normalizer")
@@ -231,7 +268,7 @@ def main():
     train_set = set(train_indices)
     val_indices = [index for index in range(len(dataset)) if index not in train_set]
     contract = (teacher_payload.get("latent_training") or {}).get("data_contract") or {}
-    if contract.get("train_indices_sha256") != digest or contract.get("val_indices_sha256") != index_hash(val_indices):
+    if not legacy and (contract.get("train_indices_sha256") != digest or contract.get("val_indices_sha256") != index_hash(val_indices)):
         raise ValueError("LeRobot v3 episode split differs from original checkpoint (train/val hashes)")
     if contract.get("raw_valid_indices_sha256") and contract["raw_valid_indices_sha256"] != index_hash(dataset.valid_indices):
         raise ValueError("LeRobot v3 retained raw windows differ from original checkpoint")
@@ -248,6 +285,8 @@ def main():
                             collate_fn=dataset.batch_collate, num_workers=0,
                             generator=torch.Generator().manual_seed(settings.seed+10001))
     metadata = {"method": "scfm_dual_target_velocity", "upstream_commit": UPSTREAM,
+                "architecture": architecture, "dataset_config": copy.deepcopy(data_config.get("train_data") or data_config["dataloader"]),
+                "original_split_hash_verified": not legacy,
                 "upstream_url": "https://github.com/caitree/scfm", "base_checkpoint": str(args.base_checkpoint.resolve()),
                 "base_sha256": file_hash(args.base_checkpoint), "settings": settings.as_dict(),
                 "time_convention": "0=noise, 1=data; s=1-sigma_flux", "source_mode": "gaussian",
@@ -264,9 +303,9 @@ def main():
     schedule_rng = torch.Generator().manual_seed(settings.seed+2)
     stream_state = None
     if args.resume:
-        candidate, payload = load_latent_checkpoint(args.resume, device=device)
+        candidate, payload = load_checkpoint(args.resume, device=device)
         previous = payload.get("scfm_posttrain") or {}
-        for key in ("method", "base_sha256", "selected_train_indices_sha256", "val_indices_sha256",
+        for key in ("method", "architecture", "base_sha256", "selected_train_indices_sha256", "val_indices_sha256",
                     "evaluated_val_indices_sha256", "training_device_type"):
             if previous.get(key) != metadata[key]:
                 raise ValueError(f"SCFM resume mismatch: {key}")
@@ -310,7 +349,9 @@ def main():
         batch = to_device(stream.next(), device)
         with torch.no_grad(), precision_context(device, settings.precision):
             encoded = teacher.encode_conditions(batch, cache_condition_kv=False)
-            target = teacher.target_latent(encoded["_prepared_batch"]).float()
+            prepared = encoded["_prepared_batch"]
+            target = (teacher._target_flow_state(prepared, prepared["q"]) if legacy
+                      else teacher.target_latent(prepared)).float()
         # Frozen condition tokens shared across models; no cached Flow projections.
         encoded = {key: value for key, value in encoded.items() if key not in {"_prepared_batch", "condition_kv_cache"}}
         noise = torch.randn(target.shape, device=device, generator=noise_rng)
@@ -341,7 +382,7 @@ def main():
             metadata["last_train"] = stats
             save_checkpoint(args.output, student, config, teacher_payload, metadata, state)
     # Confirm the deployment loader can load this self-contained artifact strictly.
-    restored, _ = load_latent_checkpoint(args.output, device="cpu")
+    restored, _ = load_checkpoint(args.output, device="cpu")
     if restored.flow_solver != "euler" or restored.flow_inference_steps != settings.steps:
         raise RuntimeError("exported sampler contract mismatch")
     print(json.dumps({"checkpoint": str(args.output), "updates": settings.updates, "nfe": settings.steps}), flush=True)

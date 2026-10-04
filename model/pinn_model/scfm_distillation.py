@@ -113,8 +113,9 @@ def sample_schedule(batch_size, settings, generator, *, device="cpu"):
 def slice_conditions(encoded, indices):
     # K/V projections belong to each separate velocity model. Never reuse the
     # teacher cache for an EMA or a student; frozen encoder tokens can be shared.
-    return {key: value[indices] for key, value in encoded.items()
-            if key in {"history", "action", "action_padding_mask", "future_pe"}}
+    return {key: (None if value is None else value[indices]) for key, value in encoded.items()
+            if key in {"history", "action", "action_padding_mask", "future_pe",
+                       "state_tokens", "action_tokens", "condition_summary"}}
 
 
 @torch.no_grad()

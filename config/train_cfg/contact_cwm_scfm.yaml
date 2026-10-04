@@ -1,0 +1,16 @@
+# Old carswm_v9/schema-10 architecture; remaining SCFM settings use dataclass defaults.
+# Data contract and normalization are inherited from the teacher checkpoint.
+scfm:
+  steps: 4
+  updates: 1000
+  batch_size: 32
+  learning_rate: 1.0e-5
+  teacher_ratio: 0.4
+  anchor_ratio: 0.0
+  fast_ema_decay: 0.0
+  slow_ema_decay: 0.999
+  precision: fp32  # BF16 autocast was slower for this small GRU WM on RTX 5090.
+  save_every: 100
+  validate_every: 100
+  validation_batches: 8
+  validation_samples: 8
