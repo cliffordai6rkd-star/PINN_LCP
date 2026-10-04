@@ -249,6 +249,8 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
     parser.add_argument("--steps", type=step_list, default=step_list("16,4,2"))
+    parser.add_argument("--reference-steps", type=int,
+                        help="same-checkpoint numerical reference; default: checkpoint/config inference steps")
     parser.add_argument("--solver", choices=("euler", "heun"), help="default: checkpoint/config solver")
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=5)
@@ -264,6 +266,8 @@ def main():
     args = parser.parse_args()
     if args.num_samples < 1 or args.warmup < 0 or args.repeats < 1:
         parser.error("samples/repeats must be positive; warmup must be nonnegative")
+    if args.reference_steps is not None and args.reference_steps < 1:
+        parser.error("reference steps must be positive")
     if args.cpu_threads is not None:
         if args.cpu_threads < 1:
             parser.error("--cpu-threads must be positive")
@@ -284,6 +288,7 @@ def main():
     batch = condition_batch(model, args.condition, device)
     noise = torch.randn(1, args.num_samples, model.future_horizon, model.latent_dim, device=device)
     solver = args.solver or model.flow_solver
+    reference_steps = args.reference_steps or model.flow_inference_steps
     normalizer, units_note = output_normalizer(model, payload) if args.checkpoint else (None, "synthetic model has no physical output calibration")
     report = {
         "weights": "loaded_checkpoint" if args.checkpoint else "synthetic_random_initialization",
@@ -300,14 +305,15 @@ def main():
         "scope": "full_sample covers 3 LSTMs (including frozen NEXT scale conversion), condition/time caches, source transform, ODE and output codec; excludes robot I/O, external physical preprocessing/normalization, input H2D, action scoring and control",
         "latency_threshold_note": "10 ms is the model budget comparison only; this report cannot certify a complete 100 Hz control loop",
         "quality_note": "paired output differences are numerical comparisons, not task success validation; fewer ODE steps and lower precision require held-out task evaluation",
-        "reference": "same checkpoint, same base noise, cached 16-step output at selected precision",
+        "reference_steps": reference_steps,
+        "reference": f"same checkpoint, same base noise, cached {reference_steps}-step output at selected precision",
         "timing_note": "synchronized wall-clock latency; input/H2D/noise creation and report comparisons excluded; caches rebuilt within every full_sample call",
         "compile": {"enabled": args.compile, "backend": args.compile_backend if args.compile else None,
                     "mode": args.compile_mode if args.compile and args.compile_backend == "inductor" else None,
                     "note": "compilation covers the pure ODE core; eager backend checks graph capture and cannot certify an Inductor speedup"},
     }
     if payload.get("inverse_gaussian_posttrain") or model.source_mode == "conditional_gaussian":
-        report["reference"] += "; this post-trained checkpoint's 16-step output is NOT the original teacher"
+        report["reference"] += "; this post-trained checkpoint's output is NOT the original teacher"
 
     def invoke(function, precision=args.precision):
         with torch.inference_mode(), precision_context(device, precision):
@@ -326,7 +332,8 @@ def main():
                                           cache_time_embeddings=cached,
                                           integration_fn=compiled_integrator if compiled else None), precision)
 
-    reference = sample(16, True)
+    reference = sample(reference_steps, True)
+    report["reference_nfe"] = reference["nfe"]
     report["stages"] = {}
     for cached in (False, True):
         label = "cached" if cached else "uncached"
@@ -352,8 +359,10 @@ def main():
             "full_sample_cached": measure(lambda: sample(steps, True), device=device, warmup=args.warmup, repeats=args.repeats),
             "full_sample_uncached": measure(lambda: sample(steps, False), device=device, warmup=args.warmup, repeats=args.repeats),
             "cache_difference_same_noise": output_difference(cached_output, uncached_output, normalizer),
-            "difference_from_same_checkpoint_16_steps": output_difference(cached_output, reference, normalizer),
+            "difference_from_same_checkpoint_reference_steps": output_difference(cached_output, reference, normalizer),
         }
+        if reference_steps == 16:
+            row["difference_from_same_checkpoint_16_steps"] = row["difference_from_same_checkpoint_reference_steps"]
         row["cache_p50_speedup"] = row["full_sample_uncached"]["p50_ms"] / row["full_sample_cached"]["p50_ms"]
         if args.compile:
             sync(device)

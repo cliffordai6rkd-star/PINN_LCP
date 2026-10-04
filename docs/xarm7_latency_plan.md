@@ -25,7 +25,7 @@ Warm up the intended shape/steps/precision before operation. GPU Inductor/CUDA g
 
 ## Structure compression and evaluation
 
-The conditional Gaussian post-training script supports `--flow-layers 2 --steps 4`. It keeps the condition LSTMs and codec, and distills the smaller Flow decoder from the original teacher. Reducing steps or depth changes predictions and requires held-out data/task evaluation. The Gaussian source alone does not establish unchanged success rate. See [post-training instructions](inverse_gaussian_few_step.md).
+The post-training script separates `--mode source-only` (conditional Gaussian, original Flow frozen) from `--mode distill-only` (standard Gaussian, Flow distillation). First test these methods independently at the original depth. A later distill-only experiment can add `--flow-layers 2 --steps 4`, keeping the condition LSTMs and codec while distilling a smaller Flow decoder from the original teacher. Reducing steps or depth changes predictions and requires held-out data/task evaluation. The Gaussian source alone does not establish unchanged success rate. See [post-training instructions](inverse_gaussian_few_step.md).
 
 `scripts/benchmark_latent_cwm.py` compares original/cached sampling using identical conditions and noise, reports full-model p50/p95/p99 and missed 10 ms deadlines, and separates condition/velocity/codec costs. It can load a real checkpoint and normalized recorded condition, or initialize a synthetic model for timing only. Its model latency excludes acquisition, external preprocessing/transfers and control I/O; measure those separately for a system deadline. Keep FP32 as the reference before evaluating BF16, compilation, reduced steps and trained shallower students.
 

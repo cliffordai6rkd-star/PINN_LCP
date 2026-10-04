@@ -1,4 +1,4 @@
-"""Fit an inverse Gaussian source and distill latent CARS-WM to fewer Heun steps.
+"""Independently fit an inverse source or distill latent CARS-WM Heun sampling.
 
 The existing LeRobot v3 dataset and normalization contract are reused.  This
 script never changes the base checkpoint; it writes a separate deployable one.
@@ -63,16 +63,27 @@ def heun_rollout(velocity, source, encoded, steps, *, return_queries=False):
     return (state, queries) if return_queries else state
 
 
-def make_student(base, base_payload, steps, *, source_hidden_dim, temperature, flow_layers=None):
+def make_student(base, base_payload, steps, *, source_hidden_dim, temperature, flow_layers=None,
+                 mode="source-only"):
+    if mode not in {"source-only", "distill-only", "joint"}:
+        raise ValueError("unknown post-training mode")
     flow_layers = len(base.flow_blocks) if flow_layers is None else flow_layers
     if not 1 <= flow_layers <= len(base.flow_blocks):
         raise ValueError("student flow layers must be between 1 and the teacher depth")
+    if mode == "source-only" and flow_layers != len(base.flow_blocks):
+        raise ValueError("source-only must preserve the original Flow depth")
     config = copy.deepcopy(base_payload["config"])
-    config["model"].update(flow_source_mode="conditional_gaussian",
+    source_mode = "gaussian" if mode == "distill-only" else "conditional_gaussian"
+    config["model"].update(flow_source_mode=source_mode,
                            flow_inference_steps=steps, flow_solver="heun",
-                           flow_layers=flow_layers,
-                           conditional_source_hidden_dim=source_hidden_dim,
-                           conditional_source_temperature=temperature)
+                           flow_layers=flow_layers)
+    if source_mode == "conditional_gaussian":
+        config["model"].update(conditional_source_hidden_dim=source_hidden_dim,
+                               conditional_source_temperature=temperature)
+    else:
+        for key in tuple(config["model"]):
+            if key.startswith("conditional_source_"):
+                del config["model"][key]
     # This script exports its final raw student, rather than an EMA envelope.
     if isinstance((config.get("train") or {}).get("ema"), dict):
         config["train"]["ema"]["enabled"] = False
@@ -83,7 +94,63 @@ def make_student(base, base_payload, steps, *, source_hidden_dim, temperature, f
     if unexpected or any(not key.startswith("source_model.") for key in missing):
         raise ValueError(f"base checkpoint transfer mismatch: missing={missing}, unexpected={unexpected}")
     student.set_stage("flow")
+    configure_training_stage(student, "distill" if mode == "distill-only" else "source")
     return student, config
+
+
+def resolve_training_mode(args):
+    defaults = {"source-only": (1000, 0), "distill-only": (0, 1000), "joint": (1000, 1000)}
+    source_updates, flow_updates = defaults[args.mode]
+    args.source_updates = source_updates if args.source_updates is None else args.source_updates
+    args.joint_updates = flow_updates if args.joint_updates is None else args.joint_updates
+    if min(args.source_updates, args.joint_updates) < 0:
+        raise ValueError("update counts must be nonnegative")
+    if args.mode == "source-only" and (args.source_updates < 1 or args.joint_updates != 0):
+        raise ValueError("source-only needs positive source updates and zero Flow updates")
+    if args.mode == "distill-only" and (args.source_updates != 0 or args.joint_updates < 1):
+        raise ValueError("distill-only needs zero source updates and positive Flow updates")
+    if args.mode == "joint" and (args.source_updates < 1 or args.joint_updates < 1):
+        raise ValueError("joint needs positive updates for both stages")
+    if args.mode == "source-only" and args.teacher_steps is not None:
+        raise ValueError("source-only inverts the deployment sampler; teacher steps are unused")
+    if args.mode == "distill-only" and args.temperature != 1.0:
+        raise ValueError("distill-only keeps the standard Gaussian source at temperature 1")
+    return args
+
+
+def configure_training_stage(student, stage):
+    """Enable exactly the experimental component; keep dropout disabled."""
+    if stage == "source":
+        if student.source_mode != "conditional_gaussian":
+            raise ValueError("source fitting requires a conditional Gaussian")
+        names = ("source_model",)
+    elif stage in {"distill", "joint"}:
+        if stage == "distill" and student.source_mode != "gaussian":
+            raise ValueError("independent distillation requires the standard Gaussian")
+        names = tuple(name for name in student.FLOW_MODULES
+                      if name != "source_model" or stage == "joint")
+    else:
+        raise ValueError("unknown training stage")
+    student.requires_grad_(False)
+    for name in names:
+        getattr(student, name).requires_grad_(True)
+    # eval() disables dropout without disabling gradients. Repeated velocity
+    # queries must represent the same map as the deployment sampler.
+    student.eval()
+    return names
+
+
+def flow_distillation_losses(student, teacher, encoded, teacher_encoded, source, *, steps, teacher_steps):
+    endpoint, queries = heun_rollout(student.velocity, source, encoded, steps, return_queries=True)
+    with torch.no_grad():
+        reference = heun_rollout(teacher.velocity, source.detach(), teacher_encoded, teacher_steps)
+    endpoint_loss = (endpoint-reference).float().square().mean()
+    velocity_losses = []
+    for state, time in queries:
+        with torch.no_grad():
+            target_velocity = teacher.velocity(state.detach(), time, teacher_encoded)
+        velocity_losses.append((student.velocity(state, time, encoded)-target_velocity).float().square().mean())
+    return endpoint_loss, torch.stack(velocity_losses).mean()
 
 
 def save_checkpoint(path, student, config, base_payload, args, metrics):
@@ -96,16 +163,29 @@ def save_checkpoint(path, student, config, base_payload, args, metrics):
         "normalizer": base_payload.get("normalizer"),
         "dataloader_filters": base_payload.get("dataloader_filters"),
         "inverse_gaussian_posttrain": {
+            "mode": args.mode,
             "base_checkpoint": str(args.base_checkpoint.resolve()),
-            "inverse_solver": "fixed_point_heun",
+            "inverse_solver": "fixed_point_heun" if args.mode != "distill-only" else None,
+            "solver": "heun",
+            "nfe": 2*args.steps,
+            "source_mode": student.source_mode,
             "inference_steps": args.steps,
-            "teacher_steps": args.teacher_steps,
-            "inverse_iterations": args.inverse_iterations,
+            "teacher_steps": args.teacher_steps if args.mode != "source-only" else None,
+            "teacher_nfe": 2*args.teacher_steps if args.mode != "source-only" else None,
+            "teacher_source_policy": {"source-only": None, "distill-only": "shared_standard_gaussian_epsilon",
+                                      "joint": "shared_student_source"}[args.mode],
+            "inverse_iterations": args.inverse_iterations if args.mode != "distill-only" else None,
             "source_updates": args.source_updates,
             "joint_updates": args.joint_updates,
+            "distillation_updates": args.joint_updates,
+            "batch_order_seed": args.seed,
+            "source_noise_seed": args.seed+1,
+            "main_process_augmentation_seed": args.seed+2,
+            "dropout_during_posttraining": False,
             "teacher_flow_layers": (base_payload["config"].get("model") or {}).get("flow_layers", 4),
             "student_flow_layers": len(student.flow_blocks),
-            "flow_transfer": "teacher_prefix_blocks_then_joint_distillation",
+            "flow_transfer": ("unchanged_teacher_weights" if args.mode == "source-only" else
+                              "teacher_prefix_blocks_then_distillation"),
             "metrics": metrics,
         },
     }
@@ -118,14 +198,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--mode", choices=("source-only", "distill-only", "joint"), default="source-only",
+                        help="default: source-only freezes Flow; distill-only retains N(0,I); joint explicitly combines both")
     parser.add_argument("--steps", type=int, default=4, help="deployed Heun steps")
     parser.add_argument("--flow-layers", type=int, default=None,
-                        help="optional smaller flow depth; requires joint distillation")
+                        help="optional smaller Flow depth in distill-only/joint; source-only preserves depth")
     parser.add_argument("--teacher-steps", type=int, default=None)
     parser.add_argument("--inverse-iterations", type=int, default=8)
     parser.add_argument("--maximum-cycle-rmse", type=float, default=0.05)
-    parser.add_argument("--source-updates", type=int, default=1000)
-    parser.add_argument("--joint-updates", type=int, default=1000)
+    parser.add_argument("--source-updates", type=int, default=None, help="default: 1000 in source-only/joint, 0 in distill-only")
+    parser.add_argument("--flow-updates", "--joint-updates", dest="joint_updates", type=int, default=None,
+                        help="Flow distillation updates; default: 0 in source-only, 1000 otherwise")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--source-hidden-dim", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -139,10 +222,12 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    try:
+        resolve_training_mode(args)
+    except ValueError as error:
+        parser.error(str(error))
     if min(args.steps, args.inverse_iterations, args.batch_size, args.source_hidden_dim) < 1:
         parser.error("steps, inverse iterations, batch size and source width must be positive")
-    if min(args.source_updates, args.joint_updates) < 0 or args.source_updates + args.joint_updates == 0:
-        parser.error("at least one post-training stage must have positive updates")
     if args.teacher_steps is not None and args.teacher_steps < 1:
         parser.error("teacher steps must be positive")
     if not math.isfinite(args.maximum_cycle_rmse) or args.maximum_cycle_rmse <= 0:
@@ -150,6 +235,8 @@ def main():
     if any(not math.isfinite(x) or x < 0 for x in (args.source_lr, args.flow_lr, args.kl_weight,
                                                   args.nll_weight, args.velocity_weight, args.endpoint_weight)):
         parser.error("learning rates and loss weights must be finite and nonnegative")
+    if args.mode != "source-only" and args.endpoint_weight + args.velocity_weight <= 0:
+        parser.error("Flow distillation needs a positive endpoint or velocity loss weight")
     args.teacher_steps = args.teacher_steps or None
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -158,12 +245,11 @@ def main():
         raise ValueError("this post-training path requires a Heun base checkpoint")
     if base.source_mode != "gaussian":
         raise ValueError("base checkpoint must have a standard Gaussian flow source")
-    if args.flow_layers is not None and args.flow_layers != len(base.flow_blocks) and args.joint_updates == 0:
-        raise ValueError("changing flow depth requires positive joint updates")
     args.teacher_steps = args.teacher_steps or base.flow_inference_steps
+    base.requires_grad_(False)
     student, config = make_student(base, base_payload, args.steps,
                                    source_hidden_dim=args.source_hidden_dim,
-                                   temperature=args.temperature, flow_layers=args.flow_layers)
+                                   temperature=args.temperature, flow_layers=args.flow_layers, mode=args.mode)
     student = student.to(device)
     dataset = LatentContactWorldModelDataset(base_payload["config"], compute_normalizer=False)
     saved_normalizer = base_payload.get("normalizer")
@@ -175,7 +261,13 @@ def main():
     if saved_digest != digest:
         raise ValueError("current LeRobot v3 data/split differs from the base training checkpoint")
     loader = DataLoader(Subset(dataset, indices), batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, collate_fn=dataset.batch_collate)
+                        num_workers=args.num_workers, collate_fn=dataset.batch_collate,
+                        generator=torch.Generator().manual_seed(args.seed))
+    noise_generator = torch.Generator(device=device).manual_seed(args.seed+1)
+    # Source-network initialization consumes extra RNG draws. Reset the main
+    # process augmentation stream so the independent modes see the same data.
+    # Worker streams are seeded independently by the DataLoader generator.
+    torch.manual_seed(args.seed+2)
     iterator = iter(loader)
 
     def next_batch():
@@ -187,60 +279,51 @@ def main():
             raw = next(iterator)
         return {k: v.to(device) if torch.is_tensor(v) else v for k, v in raw.items()}
 
-    # Conditions are frozen: inverse labels and source training remain stable.
-    student.requires_grad_(False)
-    student.source_model.requires_grad_(True)
-    source_optimizer = torch.optim.AdamW(student.source_model.parameters(), lr=args.source_lr)
-    metrics = {"maximum_cycle_rmse": 0.0, "train_windows": len(indices)}
-    for stage, updates in (("source", args.source_updates), ("joint", args.joint_updates)):
-        if stage == "joint":
-            for name in student.FLOW_MODULES:
-                if name != "source_model":
-                    getattr(student, name).requires_grad_(True)
-            optimizer = torch.optim.AdamW([
-                {"params": student.source_model.parameters(), "lr": args.source_lr},
-                {"params": (p for name in student.FLOW_MODULES if name != "source_model"
-                            for p in getattr(student, name).parameters()), "lr": args.flow_lr},
-            ])
-        else:
-            optimizer = source_optimizer
-        student.train()
+    stages = {"source-only": (("source", args.source_updates),),
+              "distill-only": (("distill", args.joint_updates),),
+              "joint": (("source", args.source_updates), ("joint", args.joint_updates))}[args.mode]
+    metrics = {"maximum_cycle_rmse": None if args.mode == "distill-only" else 0.0,
+               "train_windows": len(indices), "stage_trainable_modules": {}, "stage_samples_seen": {}}
+    for stage, updates in stages:
+        names = configure_training_stage(student, stage)
+        metrics["stage_trainable_modules"][stage] = list(names)
+        metrics["stage_samples_seen"][stage] = 0
+        groups = [{"params": list(getattr(student, name).parameters()),
+                   "lr": args.source_lr if name == "source_model" else args.flow_lr} for name in names]
+        optimizer = torch.optim.AdamW(groups)
         base.eval()
         for update in range(updates):
             batch = next_batch()
+            metrics["stage_samples_seen"][stage] += batch["q"].shape[0]
+            nll = kl = None
+            worst = None
             with torch.no_grad():
                 base_encoded = base.encode_conditions(batch, cache_condition_kv=True)
-                target = base.target_latent(batch).float()
-                inverse, cycle = invert_heun(base.velocity, target, base_encoded,
-                                              steps=args.steps, iterations=args.inverse_iterations)
-                if not torch.isfinite(cycle).all():
-                    raise RuntimeError("inverse solve produced a nonfinite cycle error")
-                worst = float(cycle.max())
-                metrics["maximum_cycle_rmse"] = max(metrics["maximum_cycle_rmse"], worst)
-                if worst > args.maximum_cycle_rmse:
-                    raise RuntimeError(f"inverse cycle RMSE {worst:.5f} exceeds limit; increase iterations or steps")
+                if stage != "distill":
+                    target = base.target_latent(batch).float()
+                    inverse, cycle = invert_heun(base.velocity, target, base_encoded,
+                                                steps=args.steps, iterations=args.inverse_iterations)
+                    if not torch.isfinite(cycle).all():
+                        raise RuntimeError("inverse solve produced a nonfinite cycle error")
+                    worst = float(cycle.max())
+                    metrics["maximum_cycle_rmse"] = max(metrics["maximum_cycle_rmse"], worst)
+                    if worst > args.maximum_cycle_rmse:
+                        raise RuntimeError(f"inverse cycle RMSE {worst:.5f} exceeds limit; increase iterations or steps")
             # All condition encoders are copied from the teacher and frozen.
             # Reuse their tokens, but student K/V projections must keep gradients.
             encoded = {key: value for key, value in base_encoded.items() if key != "condition_kv_cache"}
             condition = encoded["source_condition"]
-            nll = student.source_model.nll_per_sample(condition, inverse).mean()
-            kl = student.source_model.kl_per_sample(condition).mean()
-            loss = nll + args.kl_weight * kl if stage == "source" else args.nll_weight*nll + args.kl_weight*kl
-            if stage == "joint":
-                epsilon = torch.randn_like(inverse)
+            loss = condition.new_zeros(())
+            if stage != "distill":
+                nll = student.source_model.nll_per_sample(condition, inverse).mean()
+                kl = student.source_model.kl_per_sample(condition).mean()
+                loss = (1.0 if stage == "source" else args.nll_weight)*nll + args.kl_weight*kl
+            if stage != "source":
+                epsilon = torch.randn((condition.shape[0], student.future_horizon, student.latent_dim),
+                                      device=device, dtype=condition.dtype, generator=noise_generator)
                 source = student.source_from_noise(epsilon, encoded)
-                endpoint, queries = heun_rollout(student.velocity, source, encoded, args.steps,
-                                                 return_queries=True)
-                with torch.no_grad():
-                    reference = heun_rollout(base.velocity, source.detach(), base_encoded, args.teacher_steps)
-                endpoint_loss = (endpoint-reference).float().square().mean()
-                velocity_losses = []
-                for state, time in queries:
-                    with torch.no_grad():
-                        teacher_velocity = base.velocity(state.detach(), time, base_encoded)
-                    velocity_losses.append((student.velocity(state, time, encoded) -
-                                            teacher_velocity).float().square().mean())
-                velocity_loss = torch.stack(velocity_losses).mean()
+                endpoint_loss, velocity_loss = flow_distillation_losses(
+                    student, base, encoded, base_encoded, source, steps=args.steps, teacher_steps=args.teacher_steps)
                 loss = loss + args.endpoint_weight*endpoint_loss + args.velocity_weight*velocity_loss
             optimizer.zero_grad(set_to_none=True)
             if not torch.isfinite(loss):
@@ -250,7 +333,8 @@ def main():
             optimizer.step()
             if (update+1) % 100 == 0 or update+1 == updates:
                 print(json.dumps({"stage": stage, "update": update+1, "loss": float(loss.detach()),
-                                  "source_nll": float(nll.detach()), "source_kl": float(kl.detach()),
+                                  "source_nll": float(nll.detach()) if nll is not None else None,
+                                  "source_kl": float(kl.detach()) if kl is not None else None,
                                   "cycle_rmse": worst}), flush=True)
         metrics[stage+"_updates"] = updates
     student.eval()
