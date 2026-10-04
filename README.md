@@ -1,5 +1,9 @@
 # CARS-WM
 
+Latent world model: [architecture and runtime](docs/latent_contact_world_model.md).
+Independent post-training routes: [inverse conditional Gaussian / baseline distillation](docs/inverse_gaussian_few_step.md)
+and [SCFM velocity self-distillation](docs/scfm_latent_distillation.md).
+
 CARS-WM is an action-conditioned probabilistic world model for robot contact
 dynamics. It predicts the configured continuous state streams and a future
 sequence of the existing discrete contact-phase labels.

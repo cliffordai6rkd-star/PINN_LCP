@@ -312,7 +312,7 @@ def main():
                     "mode": args.compile_mode if args.compile and args.compile_backend == "inductor" else None,
                     "note": "compilation covers the pure ODE core; eager backend checks graph capture and cannot certify an Inductor speedup"},
     }
-    if payload.get("inverse_gaussian_posttrain") or model.source_mode == "conditional_gaussian":
+    if payload.get("inverse_gaussian_posttrain") or payload.get("scfm_posttrain") or model.source_mode == "conditional_gaussian":
         report["reference"] += "; this post-trained checkpoint's output is NOT the original teacher"
 
     def invoke(function, precision=args.precision):

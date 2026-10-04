@@ -1,0 +1,23 @@
+# Independent SCFM experiment: original Gaussian-source teacher required.
+# Pass checkpoint/output paths on the CLI. Existing LeRobot v3 config is inherited.
+scfm:
+  steps: 4                  # Euler, NFE=4; no step-size embedding
+  updates: 1000
+  batch_size: 32
+  learning_rate: 1.0e-5
+  teacher_min_steps: 32     # target construction grid, two adjacent Euler steps
+  teacher_max_steps: 32
+  teacher_ratio: 0.4
+  anchor_ratio: 0.0         # official Flux launch; try 0.2 as a separate ablation
+  fast_ema_decay: 0.0       # upstream code; change to 0.99 for the paper setting
+  slow_ema_decay: 0.999
+  shift_min: 1.0           # WM adaptation: uniform deployment grid
+  shift_max: 1.0           # upstream Flux training uses 2.5..4.5
+  precision: bf16          # CUDA; --precision fp32 for CPU smoke tests
+  seed: 42
+  few_shot_windows: 0      # 0=full original training split; windows != episodes
+  save_every: 100
+  validate_every: 100
+  validation_batches: 8
+  validation_samples: 8
+  reference_steps: 32      # original teacher's own solver; Heun means 64 NFE
