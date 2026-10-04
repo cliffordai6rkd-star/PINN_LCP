@@ -120,6 +120,7 @@ def validate(student, teacher, loader, settings, device, envelope):
     """
     generator = torch.Generator(device=device).manual_seed(settings.seed+10000)
     totals, confusion, windows = {}, {}, 0
+    contact_available = None
     variants = {"teacher_fine": (teacher, settings.reference_steps, teacher.flow_solver),
                 "original_coarse": (teacher, settings.steps, "euler"),
                 "scfm_coarse": (student, settings.steps, "euler")}
@@ -128,6 +129,10 @@ def validate(student, teacher, loader, settings, device, envelope):
             break
         batch = to_device(raw, device)
         prepared = teacher.prepare_batch(batch)
+        has_contact = "contact_future" in prepared
+        if contact_available is not None and contact_available != has_contact:
+            raise ValueError("inconsistent availability of validation contact labels")
+        contact_available = has_contact
         size = batch["q"].shape[0]
         legacy = hasattr(teacher, "flow_dim") and not hasattr(teacher, "latent_dim")
         dimension = teacher.flow_dim if legacy else teacher.latent_dim
@@ -142,8 +147,12 @@ def validate(student, teacher, loader, settings, device, envelope):
             metrics = distribution_metrics(
                 {key: output[key+"_pred"].float() for key in ("q", "tau")},
                 {key: prepared[key+"_future"].float() for key in ("q", "tau")},
-                output["contact_probability"].float(), prepared["contact_future"])
-            metrics.pop("contact_macro_f1")
+                output["contact_probability"].float() if has_contact else None,
+                prepared.get("contact_future"))
+            metrics.pop("contact_macro_f1", None)
+            p = output["contact_probability"].float().clamp_min(1e-8)
+            reference_p = outputs["teacher_fine"]["contact_probability"].float().clamp_min(1e-8)
+            metrics["paired_teacher_contact_kl"] = (reference_p*(reference_p.log()-p.log())).sum(-1).mean((1, 2))
             metrics["paired_teacher_flow_rmse" if legacy else "paired_teacher_latent_rmse"] = (
                 output[state_key].float()-outputs["teacher_fine"][state_key].float()
             ).square().mean(dim=(1, 2, 3)).sqrt()
@@ -156,22 +165,28 @@ def validate(student, teacher, loader, settings, device, envelope):
                     metrics[key+"_physical_energy_score"] = energy_score(samples, target)
                     metrics[key+"_physical_mean_rmse"] = (
                         samples.mean(1)-target).square().mean(dim=(1, 2)).sqrt()
+                    reference_samples = convert_scale(key, outputs["teacher_fine"][key+"_pred"].float(), envelope, inverse=True)
+                    metrics[key+"_physical_paired_teacher_rmse"] = (samples-reference_samples).square().mean((1, 2, 3)).sqrt()
             for key, values in metrics.items():
                 if not torch.isfinite(values).all():
                     raise RuntimeError(f"nonfinite validation metric: {name}.{key}")
                 totals.setdefault(name, {}).setdefault(key, 0.0)
                 totals[name][key] += float(values.sum())
-            matrix = contact_confusion_matrix(output["contact_probability"], prepared["contact_future"])
-            confusion[name] = confusion.get(name, torch.zeros_like(matrix)) + matrix
+            if has_contact:
+                matrix = contact_confusion_matrix(output["contact_probability"], prepared["contact_future"])
+                confusion[name] = confusion.get(name, torch.zeros_like(matrix)) + matrix
         windows += size
     if not windows:
         raise ValueError("no held-out windows available")
     report = {name: {key: value/windows for key, value in values.items()} for name, values in totals.items()}
     for name, (_, steps, solver) in variants.items():
-        report[name].update(contact_macro_f1=float(contact_macro_f1_from_confusion(confusion[name])),
-                            contact_confusion=confusion[name].cpu().tolist(), solver=solver, steps=steps,
+        if contact_available:
+            report[name].update(contact_macro_f1=float(contact_macro_f1_from_confusion(confusion[name])),
+                                contact_confusion=confusion[name].cpu().tolist())
+        report[name].update(solver=solver, steps=steps,
                             nfe=steps*(2 if solver == "heun" else 1))
     return {"windows": windows, "samples_per_window": settings.validation_samples,
+            "contact_labels_available": contact_available,
             "space": "normalized q/tau except explicitly physical metrics",
             "noise_policy": "fixed paired standard Gaussian", "variants": report}
 
@@ -206,6 +221,8 @@ def main(architecture="latent"):
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--data-root", type=Path, help="relocate the original LeRobot v3 data; preserve preprocessing")
     parser.add_argument("--repo-id", help="dataset repo_id at the relocated root")
+    parser.add_argument("--interpolate-vla", action="store_true", help="explicit approximate 25->100 Hz GRU pilot; no true contact labels")
+    parser.add_argument("--save-condition", type=Path, help="save one normalized held-out batch for paired latency runs")
     parser.add_argument("--updates", type=int)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--precision", choices=("fp32", "bf16"))
@@ -223,6 +240,8 @@ def main(architecture="latent"):
         parser.error(str(error))
     if args.num_workers < 0 or (args.evaluate_only and not args.resume):
         parser.error("workers must be nonnegative; evaluate-only requires --resume")
+    if args.interpolate_vla and (not legacy or not args.data_root):
+        parser.error("--interpolate-vla requires the GRU contact entry point and --data-root")
     if args.output.resolve() == args.base_checkpoint.resolve():
         parser.error("output must not overwrite the original teacher")
     if args.evaluate_only and args.output.resolve() == args.resume.resolve():
@@ -257,7 +276,13 @@ def main(architecture="latent"):
                                  lr=settings.learning_rate)
     data_config = relocate_data(teacher_payload["config"], args.data_root, args.repo_id)
     dataset_class = ContactWorldModelDataset if legacy else LatentContactWorldModelDataset
-    dataset = dataset_class(data_config, compute_normalizer=False)
+    if args.interpolate_vla:
+        from data_process.interpolated_contact_dataset import InterpolatedContactDataset
+        dataset = InterpolatedContactDataset(data_config, args.data_root)
+    else:
+        dataset = dataset_class(data_config, compute_normalizer=False)
+    provenance = copy.deepcopy(getattr(dataset, "provenance", {"type": "original_wm_dataset"}))
+    print(json.dumps({"dataset_provenance": provenance}), flush=True)
     saved = teacher_payload.get("normalizer") or {}
     if not saved.get("stats"):
         raise ValueError("original checkpoint must contain its training normalizer")
@@ -281,12 +306,19 @@ def main(architecture="latent"):
         train_indices = [train_indices[i] for i in selection[:settings.few_shot_windows].tolist()]
     val_order = torch.randperm(len(val_indices), generator=torch.Generator().manual_seed(settings.seed+10002))
     evaluated_val_indices = [val_indices[i] for i in val_order[:settings.validation_batches*settings.batch_size].tolist()]
+    if args.save_condition:
+        protected = [args.base_checkpoint, args.output] + ([args.resume] if args.resume else [])
+        if args.save_condition.resolve() in {path.resolve() for path in protected}:
+            parser.error("saved condition must not overwrite a checkpoint or evaluation output")
+        args.save_condition.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(dataset.batch_collate([dataset[evaluated_val_indices[0]]]), args.save_condition)
     val_loader = DataLoader(Subset(dataset, evaluated_val_indices), batch_size=settings.batch_size, shuffle=False,
                             collate_fn=dataset.batch_collate, num_workers=0,
                             generator=torch.Generator().manual_seed(settings.seed+10001))
     metadata = {"method": "scfm_dual_target_velocity", "upstream_commit": UPSTREAM,
                 "architecture": architecture, "dataset_config": copy.deepcopy(data_config.get("train_data") or data_config["dataloader"]),
                 "original_split_hash_verified": not legacy,
+                "dataset_provenance": provenance,
                 "upstream_url": "https://github.com/caitree/scfm", "base_checkpoint": str(args.base_checkpoint.resolve()),
                 "base_sha256": file_hash(args.base_checkpoint), "settings": settings.as_dict(),
                 "time_convention": "0=noise, 1=data; s=1-sigma_flux", "source_mode": "gaussian",
@@ -305,7 +337,7 @@ def main(architecture="latent"):
     if args.resume:
         candidate, payload = load_checkpoint(args.resume, device=device)
         previous = payload.get("scfm_posttrain") or {}
-        for key in ("method", "architecture", "base_sha256", "selected_train_indices_sha256", "val_indices_sha256",
+        for key in ("method", "architecture", "dataset_provenance", "base_sha256", "selected_train_indices_sha256", "val_indices_sha256",
                     "evaluated_val_indices_sha256", "training_device_type"):
             if previous.get(key) != metadata[key]:
                 raise ValueError(f"SCFM resume mismatch: {key}")
@@ -345,6 +377,7 @@ def main(architecture="latent"):
         raise ValueError("total updates must exceed completed updates when resuming")
     if not args.resume:
         metadata["initial_validation"] = evaluation()
+    best_score = metadata.get("best_paired_teacher_flow_rmse", float("inf"))
     for update in range(metadata["completed_updates"], settings.updates):
         batch = to_device(stream.next(), device)
         with torch.no_grad(), precision_context(device, settings.precision):
@@ -374,13 +407,27 @@ def main(architecture="latent"):
             print(json.dumps({"update": update+1, "grad_norm": float(grad_norm), **stats}), flush=True)
         if (update+1) % settings.validate_every == 0 or update+1 == settings.updates:
             metadata["last_validation"] = evaluation()
-        if (update+1) % settings.save_every == 0 or update+1 == settings.updates:
+            # Preserve the candidate best matching the original fine teacher.
+            # This is agreement on held-out conditions, not physical success.
+            key = "paired_teacher_flow_rmse" if legacy else "paired_teacher_latent_rmse"
+            score = metadata["last_validation"]["variants"]["scfm_coarse"][key]
+            improved = score < best_score
+            if improved:
+                best_score = score
+                metadata["best_paired_teacher_flow_rmse"] = score
+                metadata["best_update"] = update+1
+        else:
+            improved = False
+        if (update+1) % settings.save_every == 0 or update+1 == settings.updates or improved:
             state = {"fast": fast.state_dict(), "slow": slow.state_dict(), "optimizer": optimizer.state_dict(),
                      "noise_rng": noise_rng.get_state(), "schedule_rng": schedule_rng.get_state(),
                      "torch_rng": torch.get_rng_state(), "batch_stream": stream.state_dict(),
                      "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
             metadata["last_train"] = stats
             save_checkpoint(args.output, student, config, teacher_payload, metadata, state)
+            if improved:
+                save_checkpoint(args.output.with_name(args.output.stem+"_best"+args.output.suffix),
+                                student, config, teacher_payload, metadata, state)
     # Confirm the deployment loader can load this self-contained artifact strictly.
     restored, _ = load_checkpoint(args.output, device="cpu")
     if restored.flow_solver != "euler" or restored.flow_inference_steps != settings.steps:

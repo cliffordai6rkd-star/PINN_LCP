@@ -1,0 +1,18 @@
+# Approximate VLA interpolation experiment, independent from native WM training.
+# Pass --interpolate-vla explicitly. No measured contact labels are available.
+scfm:
+  steps: 4
+  updates: 1000
+  batch_size: 32
+  learning_rate: 1.0e-5
+  teacher_ratio: 0.4
+  anchor_ratio: 0.0
+  fast_ema_decay: 0.0
+  slow_ema_decay: 0.999
+  precision: fp32
+  seed: 42
+  save_every: 100
+  validate_every: 100
+  validation_batches: 4
+  validation_samples: 4
+  reference_steps: 32

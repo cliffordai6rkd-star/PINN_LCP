@@ -38,6 +38,30 @@ Interpolated experiments need separate provenance and cannot establish preserved
 contact dynamics or hardware success. The original WM metadata in this repo
 describes 221,805 frames, but only metadata is tracked, not its parquet data.
 
+### Authorized interpolation pilot
+
+```bash
+CUDA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=8 python scripts/posttrain_scfm_contact.py \
+  --config config/train_cfg/contact_cwm_scfm_interpolation_pilot.yaml \
+  --base-checkpoint /path/to/step_00250000.pt \
+  --data-root /path/to/insert_usb_lerobotv3 --interpolate-vla \
+  --output /path/to/student_latest.pt --save-condition /path/to/heldout_condition.pt
+```
+
+This explicit adapter anchors every window at an original observed row, linearly
+interpolates 100 Hz history/future queries within each episode, and retains the
+original future 25 Hz EE action sequence. History interpolation brackets never
+extend beyond the anchor. Full teacher causal filters are applied with one second
+of warmup (the VLA source preprocessing is unverified), then the teacher's fixed
+normalizer is reused. Recorded `action.joint - observation.joint` is interpolated
+as a delta-q proxy; it is zero in every provided source row, and cannot recover
+the true tracking error. No tau-ext/contact labels are invented. Validation
+reports distribution metrics against approximate interpolated future targets,
+paired teacher q/tau errors and contact KL; no contact F1 or robot success claim.
+Source content hashes and all these approximations are embedded in the artifact.
+The best validated teacher-agreement candidate is saved next to the latest
+checkpoint, with `_best` appended. Both remain experimental artifacts.
+
 ## Latency only
 
 ```bash
