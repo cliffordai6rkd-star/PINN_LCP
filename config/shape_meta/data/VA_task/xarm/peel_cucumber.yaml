@@ -1,0 +1,91 @@
+io:
+  input: ../xarm_ws/runs/peel_cucumber_25hzcam
+  output: ../xarm_ws/runs/visu_data/peel_cucumber_lerobotv3
+  repo_id: peel_cucumber_lerobotv3
+  max_episodes: null
+  no_videos: false
+  push_to_hub: false
+
+task: peel_cucumber
+fps: 25
+
+# One LeRobot row per recorded wrist-camera row. Both cameras are read using
+# that row's exact H5 index; no image timestamp lookup or uniform grid exists.
+master_timestamp_path: cameras/left_wrist/timestamp_us
+
+# Every numeric feature selects the newest teleop sample at or before the
+# master-camera timestamp. Reject unexpectedly stale teleop snapshots.
+master_timeline:
+  max_gap_s: 0.1
+  store_timestamps: true
+
+features:
+  observation.images.left_wrist:
+    dtype: video
+    shape: [224, 224, 3]
+    h5_path: cameras/left_wrist/frames
+    align: index
+
+  observation.images.right_wrist:
+    dtype: video
+    shape: [224, 224, 3]
+    h5_path: cameras/right_wrist/frames
+    align: index
+
+  observation.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_q_xarm
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  observation.velocity:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_dq_xarm
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  observation.torque:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_tau_xarm
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+  observation.delta_q:
+    dtype: float32
+    shape: [7]
+    sources:
+      - h5_path: teleop/right_q_cmd_xarm
+        timestamp_path: teleop/timestamp_us
+        align: previous
+      - h5_path: teleop/right_q_xarm
+        timestamp_path: teleop/timestamp_us
+        align: previous
+    combine: subtract
+
+  observation.tau_ext:
+    dtype: float32
+    shape: [1]
+    h5_path: teleop/right_tau_ext_l1_xarm
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+
+
+  # The joint command is the direct action target; it is distinct from the
+  # measured follower position used by observation.joint.
+  action.joint:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_q_xarm
+    timestamp_path: teleop/timestamp_us
+    align: previous
+
+action.eepose:
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_eepose_xarm
+    timestamp_path: teleop/timestamp_us
+    align: previous

@@ -1,0 +1,108 @@
+io:
+  input: ../xarm_ws/runs/cut
+  output: ../xarm_ws/runs/cwm/cut_lerobot_v3
+  repo_id: cut_cwm_lerobot_v3
+  max_episodes: null
+  no_videos: true
+  push_to_hub: false
+
+task: cut
+fps: 100
+# Keep entire causal timelines; exclude episodes with invalid supervision.
+# Exclusions and reasons are saved in meta/world_model_timeline.json.
+nonfinite_episode_policy: drop
+
+timeline:
+  mode: raw_lowdim_action_hold
+  state_timestamp_path: teleop/timestamp_us
+  # Sample teleop frames 0, 4, 8, ...; sampling is independent of timestamps.
+  action_anchor_mode: state_frames
+  action_fps: 25
+
+# Use the same measured joint action as the current xarm VA dataset.
+# Materialize the missing EE condition once during conversion.
+action_fk:
+  urdf_path: ../xarm_ws/gello_teleop/models/xarm7_dynamics.urdf
+  joint_key: action.joint
+  pose_key: action.ee_pose
+  base_frame: link_base
+  frame_name: link_eef
+  joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+
+features:
+  observation.joint:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_q_xarm
+    align: index
+    lowpass: false
+    # cutoff_hz: 15.0
+    # order: 2
+    
+  observation.velocity:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_dq_xarm
+
+    align: index
+    lowpass: true
+    cutoff_hz: 20.0
+    order: 1
+  observation.torque:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/right_tau_xarm
+
+    align: index
+    lowpass: true
+    cutoff_hz: 20.0
+    order: 1
+  observation.delta_q:
+    rate: state
+    dtype: float32
+    shape: [7]
+    sources:
+      - h5_path: teleop/right_q_cmd_xarm
+        align: index
+      - h5_path: teleop/right_q_xarm
+  
+        align: index
+    combine: subtract
+    lowpass: false
+    # cutoff_hz: 15.0
+    # order: 2
+
+  observation.tau_ext:
+    rate: state
+    dtype: float32
+    shape: [1]
+    h5_path: teleop/right_tau_ext_l1_xarm
+    align: index
+
+  # observation.ee_pose:
+  #   rate: state
+  #   dtype: float32
+  #   shape: [7]
+  #   h5_path: teleop/ee_pose_xarm
+  #   align: index
+  #   transform: ee_pose_matrix_to_quaternion
+  
+  action.joint:
+    rate: action
+    dtype: float32
+    shape: [7]
+    # Explicitly match the measured-joint action in the current VA config.
+    h5_path: teleop/right_q_xarm
+    align: index
+  # action.ee_pose:
+  #   rate: action
+  #   dtype: float32
+  #   shape: [7]
+  #   h5_path: teleop/eepose_xarm
+
+  #   timestamp_path: teleop/timestamp_us
+  #   resample: previous
+  #   transform: ee_pose_matrix_to_quaternion

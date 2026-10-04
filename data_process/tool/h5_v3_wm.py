@@ -1,7 +1,7 @@
 """Build a LeRobot v3 world-model dataset on raw high-rate rows.
 
-State features retain the raw 100 Hz timeline. Actions are previous expert
-snapshots at recorded 25 Hz camera anchors, held across their state rows.
+State features retain the raw high-rate timeline. Actions are sampled by
+state-frame number or at recorded camera anchors, then held across state rows.
 The training dataset recovers unique action tokens through timing.action_index.
 """
 
@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from tqdm import tqdm
 
+from data_process.action_fk import normalize_action_fk, poses_from_joint_actions
 from data_process.causal_data_filter import filter_episode_values
 from data_process.tool.h5_2_lerobotev3 import (
     H5Dataset,
@@ -45,10 +46,14 @@ GENERATED_TIMING_FEATURES = {
 }
 
 
+class NonFiniteFeatureError(ValueError):
+    """An episode cannot safely provide numeric supervision."""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Copy raw lowdim H5 rows and held 25 Hz expert actions to LeRobot v3."
+            "Copy raw lowdim H5 rows and held low-rate actions to LeRobot v3."
         )
     )
     parser.add_argument("--config", "-c", type=Path, required=True)
@@ -72,6 +77,7 @@ def normalize_wm_timeline(value: Any) -> dict[str, Any]:
         "mode",
         "state_timestamp_path",
         "action_anchor_timestamp_path",
+        "action_anchor_mode",
         "action_fps",
         "max_action_gap_s",
     }
@@ -82,14 +88,22 @@ def normalize_wm_timeline(value: Any) -> dict[str, Any]:
         raise ValueError(f"timeline.mode must be {WM_TIMELINE_MODE!r}.")
     state_timestamp_path = value.get("state_timestamp_path")
     anchor_timestamp_path = value.get("action_anchor_timestamp_path")
+    anchor_mode = str(value.get("action_anchor_mode", "recorded_camera")).lower()
+    if anchor_mode not in {"recorded_camera", "state_frames"}:
+        raise ValueError("timeline.action_anchor_mode must be 'recorded_camera' or 'state_frames'")
     if not isinstance(state_timestamp_path, str) or not state_timestamp_path:
         raise ValueError("timeline.state_timestamp_path is required.")
-    if not isinstance(anchor_timestamp_path, str) or not anchor_timestamp_path:
+    if anchor_mode == "recorded_camera" and (
+        not isinstance(anchor_timestamp_path, str) or not anchor_timestamp_path
+    ):
         raise ValueError("timeline.action_anchor_timestamp_path is required.")
+    if anchor_mode == "state_frames":
+        anchor_timestamp_path = state_timestamp_path
     return {
         "mode": mode,
         "state_timestamp_path": state_timestamp_path,
         "action_anchor_timestamp_path": anchor_timestamp_path,
+        "action_anchor_mode": anchor_mode,
         "action_fps": normalize_fps(value.get("action_fps", 25)),
         "max_action_gap_s": _positive_finite(
             value.get("max_action_gap_s", 0.02), "max_action_gap_s"
@@ -156,6 +170,12 @@ def _normalize_lowpass(raw_spec: Mapping[str, Any], feature_name: str) -> dict[s
 def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
     fps = normalize_fps(shape_meta.get("fps"))
     timeline = normalize_wm_timeline(shape_meta.get("timeline"))
+    frame_actions = timeline["action_anchor_mode"] == "state_frames"
+    if frame_actions and timeline["action_fps"] > fps:
+        raise ValueError("Frame-sampled action_fps must not exceed state fps")
+    nonfinite_policy = str(shape_meta.get("nonfinite_episode_policy", "error")).lower()
+    if nonfinite_policy not in {"error", "drop"}:
+        raise ValueError("nonfinite_episode_policy must be 'error' or 'drop'")
     raw_features = shape_meta.get("features")
     if not isinstance(raw_features, Mapping) or not raw_features:
         raise ValueError("shape_meta must contain a non-empty features mapping.")
@@ -170,13 +190,13 @@ def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
         if rate not in {"state", "action"}:
             raise ValueError(f"Feature {key!r} rate must be 'state' or 'action'.")
         sources = normalize_h5_sources(
-            key, raw_spec, dual_rate=(rate == "action")
+            key, raw_spec, dual_rate=(rate == "action" and not frame_actions)
         )
-        required_method = "index" if rate == "state" else "previous"
+        required_method = "index" if rate == "state" or frame_actions else "previous"
         if any(source["method"] != required_method for source in sources):
-            contract = "align='index'" if rate == "state" else "resample='previous'"
+            contract = "align='index'" if required_method == "index" else "resample='previous'"
             raise ValueError(f"Feature {key!r} must use {contract}.")
-        if rate == "state":
+        if rate == "state" or frame_actions:
             wrong_timestamps = {
                 source["timestamp_path"]
                 for source in sources
@@ -185,7 +205,7 @@ def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
             }
             if wrong_timestamps:
                 raise ValueError(
-                    f"State feature {key!r} must share "
+                    f"Frame-indexed feature {key!r} must share "
                     f"{timeline['state_timestamp_path']!r}."
                 )
 
@@ -215,11 +235,24 @@ def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
         for mapping in action_mappings
         for source in mapping["sources"]
     }
-    if None in action_timestamp_paths or len(action_timestamp_paths) != 1:
+    if not frame_actions and (None in action_timestamp_paths or len(action_timestamp_paths) != 1):
         raise ValueError("All action features must share one timestamp_path.")
     duplicates = sorted(set(lerobot_features) & set(GENERATED_TIMING_FEATURES))
     if duplicates:
         raise ValueError(f"Generated timing keys must not be declared: {duplicates}")
+    action_fk = normalize_action_fk(shape_meta.get("action_fk"))
+    if action_fk is not None:
+        joint_key, pose_key = action_fk["joint_key"], action_fk["pose_key"]
+        if joint_key not in {mapping["lerobot_key"] for mapping in action_mappings}:
+            raise ValueError(f"action_fk.joint_key {joint_key!r} must be an action feature")
+        if pose_key in lerobot_features:
+            if pose_key not in {mapping["lerobot_key"] for mapping in action_mappings}:
+                raise ValueError("action_fk.pose_key must be an action feature")
+        else:
+            lerobot_features[pose_key] = {
+                "dtype": "float32", "shape": (7,),
+                "names": ["x", "y", "z", "qx", "qy", "qz", "qw"],
+            }
     lerobot_features.update(GENERATED_TIMING_FEATURES)
     return {
         "task": str(shape_meta.get("task", "world_model")),
@@ -228,8 +261,12 @@ def build_wm_conversion_spec(shape_meta: Mapping[str, Any]) -> dict[str, Any]:
         "mappings": mappings,
         "state_mappings": state_mappings,
         "action_mappings": action_mappings,
-        "action_source_timestamp_path": next(iter(action_timestamp_paths)),
+        "action_source_timestamp_path": (
+            timeline["state_timestamp_path"] if frame_actions else next(iter(action_timestamp_paths))
+        ),
         "lerobot_features": lerobot_features,
+        "action_fk": action_fk,
+        "nonfinite_episode_policy": nonfinite_policy,
     }
 
 
@@ -287,9 +324,53 @@ def build_wm_episode_cache(
         raise RuntimeError("h5_v3_wm conversion requires numpy.")
     timeline = spec["timeline"]
     state_timestamp_path = timeline["state_timestamp_path"]
-    camera_timestamp_path = timeline["action_anchor_timestamp_path"]
-    dataset_paths = {state_timestamp_path, camera_timestamp_path}
+    anchor_timestamp_path = timeline["action_anchor_timestamp_path"]
+    action_fk = spec.get("action_fk")
+    mappings = []
+    fk_mappings = set()
+    by_key = {mapping["lerobot_key"]: mapping for mapping in spec["mappings"]}
+    fallback_joints = {}
+    if action_fk is not None:
+        fallback_joints[action_fk["pose_key"]] = action_fk["joint_key"]
+        # The measured observation pose uses measured state joints, rather
+        # than the low-rate, held action joints.
+        fallback_joints["observation.ee_pose"] = "observation.joint"
     for mapping in spec["mappings"]:
+        key = mapping["lerobot_key"]
+        if key in fallback_joints and any(
+            source["h5_path"] not in h5_file for source in mapping["sources"]
+        ):
+            joint_key = fallback_joints[key]
+            joint_mapping = by_key.get(joint_key)
+            if joint_mapping is None or joint_mapping["rate"] != mapping["rate"]:
+                raise ValueError(f"Missing pose {key!r} requires a matching joint feature {joint_key!r}")
+            mapping = {
+                **mapping,
+                "sources": joint_mapping["sources"],
+                "h5_paths": joint_mapping["h5_paths"],
+                "transform": joint_mapping["transform"],
+                "combine": joint_mapping["combine"],
+            }
+            fk_mappings.add(key)
+        mappings.append(mapping)
+    state_mappings = [mapping for mapping in mappings if mapping["rate"] == "state"]
+    action_mappings = [mapping for mapping in mappings if mapping["rate"] == "action"]
+
+    def sample_mapping(mapping, targets, *, indexed):
+        values = (
+            h5_dataset._sample_snapshot_mapping(mapping, targets, cache)
+            if indexed else h5_dataset._resample_mapping(mapping, targets, cache)
+        )
+        if mapping["lerobot_key"] in fk_mappings:
+            if not np.isfinite(values).all():
+                raise NonFiniteFeatureError(
+                    f"FK source for {mapping['lerobot_key']!r} contains non-finite joints in {h5_path}"
+                )
+            values = poses_from_joint_actions(values, action_fk)
+        return values
+
+    dataset_paths = {state_timestamp_path, anchor_timestamp_path}
+    for mapping in mappings:
         for source in mapping["sources"]:
             dataset_paths.add(source["h5_path"])
             if source["timestamp_path"] is not None:
@@ -299,48 +380,64 @@ def build_wm_episode_cache(
     }
 
     raw_state_timestamps = datasets[state_timestamp_path][:]
-    raw_camera_timestamps = datasets[camera_timestamp_path][:]
+    raw_anchor_timestamps = datasets[anchor_timestamp_path][:]
     raw_state_seconds = h5_dataset._timestamps_seconds(
         raw_state_timestamps, state_timestamp_path
     )
-    all_action_anchor_raw = _expert_action_anchors(
-        h5_dataset,
-        raw_camera_timestamps,
-        camera_timestamp_path,
-        int(timeline["action_fps"]),
-    )
+    frame_actions = timeline["action_anchor_mode"] == "state_frames"
+    if frame_actions:
+        # Select by frame number only. Integer arithmetic rounds cumulative
+        # frame offsets, also allowing fractional rate ratios without drift.
+        action_fps, state_fps = int(timeline["action_fps"]), int(spec["fps"])
+        count = (len(raw_state_timestamps) * action_fps + state_fps - 1) // state_fps
+        tokens = np.arange(count, dtype=np.int64)
+        action_frame_indices = (2 * tokens * state_fps + action_fps) // (2 * action_fps)
+        action_frame_indices = action_frame_indices[action_frame_indices < len(raw_state_timestamps)]
+        all_action_anchor_raw = raw_state_timestamps[action_frame_indices]
+    else:
+        all_action_anchor_raw = _expert_action_anchors(
+            h5_dataset,
+            raw_anchor_timestamps,
+            anchor_timestamp_path,
+            int(timeline["action_fps"]),
+        )
     all_action_anchor_seconds = h5_dataset._timestamps_seconds(
-        all_action_anchor_raw, camera_timestamp_path
+        all_action_anchor_raw, anchor_timestamp_path
     )
     action_source_path = spec["action_source_timestamp_path"]
     action_source_seconds = h5_dataset._timestamps_seconds(
         datasets[action_source_path][:], action_source_path
     )
-    previous_indices = np.searchsorted(
-        action_source_seconds, all_action_anchor_seconds, side="right"
-    ) - 1
-    anchor_valid = previous_indices >= 0
-    safe_previous = previous_indices.clip(0, len(action_source_seconds) - 1)
-    anchor_valid &= (
-        all_action_anchor_seconds - action_source_seconds[safe_previous]
-        <= float(timeline["max_action_gap_s"]) + 1.0e-12
-    )
+    if frame_actions:
+        anchor_valid = np.ones(len(action_frame_indices), dtype=bool)
+    else:
+        previous_indices = np.searchsorted(
+            action_source_seconds, all_action_anchor_seconds, side="right"
+        ) - 1
+        anchor_valid = previous_indices >= 0
+        safe_previous = previous_indices.clip(0, len(action_source_seconds) - 1)
+        anchor_valid &= (
+            all_action_anchor_seconds - action_source_seconds[safe_previous]
+            <= float(timeline["max_action_gap_s"]) + 1.0e-12
+        )
     action_anchor_raw = all_action_anchor_raw[anchor_valid]
     action_anchor_seconds = all_action_anchor_seconds[anchor_valid]
     if action_anchor_seconds.size == 0:
         raise ValueError(
-            f"No camera anchor has a valid previous expert action in {h5_path}."
+            f"No action anchor has a valid source action in {h5_path}."
         )
 
-    # A raw lowdim row belongs to the latest recorded camera anchor at/before
-    # it. If that camera anchor has no legal previous action, the row has no label
+    # A raw lowdim row belongs to the latest action anchor at/before
+    # it. If that anchor has no legal source action, the row has no label
     # and is excluded rather than padded or marked for downstream filtering.
-    raw_camera_index = np.searchsorted(
-        all_action_anchor_seconds, raw_state_seconds, side="right"
+    raw_anchor_index = np.searchsorted(
+        action_frame_indices if frame_actions else all_action_anchor_seconds,
+        np.arange(len(raw_state_seconds)) if frame_actions else raw_state_seconds,
+        side="right",
     ) - 1
-    state_has_label = raw_camera_index >= 0
-    safe_camera_index = raw_camera_index.clip(0, len(anchor_valid) - 1)
-    state_has_label &= anchor_valid[safe_camera_index]
+    state_has_label = raw_anchor_index >= 0
+    safe_anchor_index = raw_anchor_index.clip(0, len(anchor_valid) - 1)
+    state_has_label &= anchor_valid[safe_anchor_index]
     state_indices = np.flatnonzero(state_has_label).astype(np.int64, copy=False)
     if state_indices.size == 0:
         raise ValueError(f"No raw state row has a valid action label in {h5_path}.")
@@ -349,11 +446,11 @@ def build_wm_episode_cache(
 
     timestamp_seconds: dict[str, Any] = {
         state_timestamp_path: raw_state_seconds,
-        camera_timestamp_path: h5_dataset._timestamps_seconds(
-            raw_camera_timestamps, camera_timestamp_path
+        anchor_timestamp_path: h5_dataset._timestamps_seconds(
+            raw_anchor_timestamps, anchor_timestamp_path
         ),
     }
-    for mapping in spec["mappings"]:
+    for mapping in mappings:
         for source in mapping["sources"]:
             timestamp_path = source["timestamp_path"]
             if timestamp_path is not None and timestamp_path not in timestamp_seconds:
@@ -362,7 +459,7 @@ def build_wm_episode_cache(
                 )
             expected_rows = (
                 len(raw_state_seconds)
-                if mapping["rate"] == "state"
+                if mapping["rate"] == "state" or frame_actions
                 else len(timestamp_seconds[timestamp_path])
             )
             if len(datasets[source["h5_path"]]) != expected_rows:
@@ -381,12 +478,12 @@ def build_wm_episode_cache(
         "wm_raw_lowdim_rows": True,
         "filters": {},
     }
-    for mapping in spec["state_mappings"]:
+    for mapping in state_mappings:
         # Filter the complete raw episode before dropping unlabeled boundary
         # rows. This preserves the causal history that precedes the first
         # retained WM row.
         all_state_indices = np.arange(len(raw_state_seconds), dtype=np.int64)
-        values = h5_dataset._sample_snapshot_mapping(mapping, all_state_indices, cache)
+        values = sample_mapping(mapping, all_state_indices, indexed=True)
         if mapping.get("lowpass") is not None:
             lowpass = mapping["lowpass"]
             values = filter_episode_values(
@@ -397,23 +494,26 @@ def build_wm_episode_cache(
             cache["filters"][mapping["lerobot_key"]] = lowpass
         cache["resampled"][mapping["lerobot_key"]] = values[state_indices]
 
-    for mapping in spec["action_mappings"]:
-        for source in mapping["sources"]:
-            max_gap_s = source.get("max_gap_s")
-            if max_gap_s is None:
-                max_gap_s = mapping.get("max_gap_s")
-            if max_gap_s is None:
-                max_gap_s = timeline["max_action_gap_s"]
-            h5_dataset._validate_resample_targets(
-                timestamp_seconds[source["timestamp_path"]],
-                action_anchor_seconds,
-                "previous",
-                float(max_gap_s),
-                mapping["lerobot_key"],
-                h5_path,
-            )
-        cache["resampled"][mapping["lerobot_key"]] = (
-            h5_dataset._resample_mapping(mapping, action_anchor_seconds, cache)
+    for mapping in action_mappings:
+        if not frame_actions:
+            for source in mapping["sources"]:
+                max_gap_s = source.get("max_gap_s")
+                if max_gap_s is None:
+                    max_gap_s = mapping.get("max_gap_s")
+                if max_gap_s is None:
+                    max_gap_s = timeline["max_action_gap_s"]
+                h5_dataset._validate_resample_targets(
+                    timestamp_seconds[source["timestamp_path"]],
+                    action_anchor_seconds,
+                    "previous",
+                    float(max_gap_s),
+                    mapping["lerobot_key"],
+                    h5_path,
+                )
+        cache["resampled"][mapping["lerobot_key"]] = sample_mapping(
+            mapping,
+            action_frame_indices if frame_actions else action_anchor_seconds,
+            indexed=frame_actions,
         )
         if mapping.get("lowpass") is not None:
             lowpass = mapping["lowpass"]
@@ -428,16 +528,29 @@ def build_wm_episode_cache(
     valid_anchor_index[anchor_valid] = np.arange(
         int(anchor_valid.sum()), dtype=np.int64
     )
-    held_action_index = valid_anchor_index[raw_camera_index[state_indices]]
+    held_action_index = valid_anchor_index[raw_anchor_index[state_indices]]
     if np.any(held_action_index < 0):
         raise RuntimeError("Internal error: retained state row has no action label.")
-    for mapping in spec["action_mappings"]:
+    for mapping in action_mappings:
         key = mapping["lerobot_key"]
         cache["resampled"][key] = cache["resampled"][key][held_action_index]
 
+    for key, values in cache["resampled"].items():
+        if not np.isfinite(values).all():
+            bad_rows = int((~np.isfinite(values).reshape(len(values), -1).all(axis=1)).sum())
+            raise NonFiniteFeatureError(
+                f"WM feature {key!r} contains non-finite values in {bad_rows} rows of {h5_path}"
+            )
+    if action_fk is not None and action_fk["pose_key"] not in cache["resampled"]:
+        cache["resampled"][action_fk["pose_key"]] = poses_from_joint_actions(
+            cache["resampled"][action_fk["joint_key"]], action_fk
+        )
+
     source_path = spec["action_source_timestamp_path"]
-    selected_source_indices = h5_dataset._point_sample_indices(
-        timestamp_seconds[source_path], action_anchor_seconds, "previous"
+    selected_source_indices = (
+        action_frame_indices if frame_actions else h5_dataset._point_sample_indices(
+            timestamp_seconds[source_path], action_anchor_seconds, "previous"
+        )
     )
     source_ns = _raw_timestamps_to_ns(
         h5_dataset, datasets[source_path][:], source_path
@@ -447,7 +560,7 @@ def build_wm_episode_cache(
     )
     state_ns = raw_state_ns[state_indices]
     anchor_ns = _raw_timestamps_to_ns(
-        h5_dataset, action_anchor_raw, camera_timestamp_path
+        h5_dataset, action_anchor_raw, anchor_timestamp_path
     )
     held_anchor_ns = anchor_ns[held_action_index]
     held_source_ns = source_ns[held_action_index]
@@ -478,6 +591,7 @@ def write_wm_manifest(output_path: Path, spec: Mapping[str, Any]) -> Path:
     path = output_path / "meta" / WM_MANIFEST_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     timeline = spec["timeline"]
+    frame_actions = timeline["action_anchor_mode"] == "state_frames"
     manifest = {
         "schema_version": 3,
         "mode": WM_TIMELINE_MODE,
@@ -488,11 +602,14 @@ def write_wm_manifest(output_path: Path, spec: Mapping[str, Any]) -> Path:
             "action_anchor_timestamp_path"
         ],
         "action_fps": timeline["action_fps"],
-        "action_fps_validation": "median_camera_period_within_10_percent",
-        "action_anchor_grid": "recorded_camera_timestamps",
-        "action_sampling": "previous_expert_label",
-        "action_upsampling": "zoh_previous_camera_anchor",
-        "action_contract": "high_level_expert_camera_snapshot_v1",
+        "action_anchor_mode": timeline["action_anchor_mode"],
+        "action_fps_validation": "configured_state_frame_rate" if frame_actions else "median_camera_period_within_10_percent",
+        "action_anchor_grid": "state_frame_indices" if frame_actions else "recorded_camera_timestamps",
+        "action_sampling": "round_token_index_times_state_fps_over_action_fps" if frame_actions else "previous_expert_label",
+        "action_stride_frames": (spec["fps"] // timeline["action_fps"]
+                                 if frame_actions and spec["fps"] % timeline["action_fps"] == 0 else None),
+        "action_upsampling": "zoh_previous_state_frame_anchor" if frame_actions else "zoh_previous_camera_anchor",
+        "action_contract": "state_frame_action_snapshot_v1" if frame_actions else "high_level_expert_camera_snapshot_v1",
         "unlabeled_state_rows": "drop",
         "action_update_key": "timing.action_update",
         "feature_filters": {
@@ -500,6 +617,9 @@ def write_wm_manifest(output_path: Path, spec: Mapping[str, Any]) -> Path:
             for mapping in spec["mappings"]
             if mapping.get("lowpass") is not None
         },
+        "action_fk": spec.get("action_fk"),
+        "nonfinite_episode_policy": spec.get("nonfinite_episode_policy", "error"),
+        "excluded_episodes": spec.get("excluded_episodes", []),
     }
     path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
@@ -537,11 +657,20 @@ def run_conversion(args: argparse.Namespace) -> None:
         no_videos=config_bool(config, "no_videos", True),
     )
     episode_iter = tqdm(dataset.files(), desc="world-model episodes", unit="episode")
+    spec["excluded_episodes"] = []
+    saved_episodes = 0
     try:
         for h5_path in episode_iter:
             episode_iter.set_postfix_str(h5_path.name)
             with dataset.open_episode(h5_path) as h5_file:
-                cache = build_wm_episode_cache(dataset, h5_file, spec, h5_path)
+                try:
+                    cache = build_wm_episode_cache(dataset, h5_file, spec, h5_path)
+                except NonFiniteFeatureError as exc:
+                    if spec["nonfinite_episode_policy"] != "drop":
+                        raise
+                    spec["excluded_episodes"].append({"path": str(h5_path), "reason": str(exc)})
+                    tqdm.write(f"Excluded episode: {exc}")
+                    continue
                 try:
                     for frame_idx in tqdm(
                         range(len(cache["state_timestamps"])),
@@ -555,10 +684,14 @@ def run_conversion(args: argparse.Namespace) -> None:
                 finally:
                     dataset.clear_episode_cache(cache)
             writer.save_episode(task=spec["task"])
+            saved_episodes += 1
     finally:
         writer.finalize()
 
+    if not saved_episodes:
+        raise ValueError("No finite world-model episodes were converted")
     print(f"world-model timeline manifest: {write_wm_manifest(output_path, spec)}")
+    print(f"Converted {saved_episodes} episodes; excluded {len(spec['excluded_episodes'])} non-finite episodes")
     if config_bool(config, "push_to_hub"):
         writer.push_to_hub()
 

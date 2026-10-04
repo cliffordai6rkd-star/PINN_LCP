@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -108,6 +109,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Remove existing output before conversion. Ignored by --inspect-only.",
+    )
     parser.add_argument("--print-example-shape-meta", action="store_true")
     return parser.parse_args()
 
@@ -503,23 +509,41 @@ def run_conversion(args: argparse.Namespace) -> None:
     config = load_shape_meta(args.config)
     h5py, np, LeRobotDataset = load_conversion_deps()
     spec = build_conversion_spec(config)
+    input_path = config_path(config, "input", override=args.input)
+    output_path = config_path(config, "output", override=args.output)
+    if input_path == output_path or output_path in input_path.parents:
+        raise ValueError(
+            "Output path must not be the input path or one of its parent "
+            f"directories: {output_path}"
+        )
     h5_dataset = VAH5Dataset(
-        config_path(config, "input", override=args.input),
+        input_path,
         h5py=h5py,
         np=np,
         max_episodes=config_int(config, "max_episodes"),
     )
+    h5_files = h5_dataset.files()
+    if output_path.exists():
+        if not getattr(args, "overwrite", False):
+            raise FileExistsError(
+                f"Output already exists: {output_path}. Use --overwrite to replace it."
+            )
+        tqdm.write(f"Removing existing output: {output_path}")
+        if output_path.is_dir():
+            shutil.rmtree(output_path)
+        else:
+            output_path.unlink()
     lerobot_dataset = LeRobotV3Dataset(
         LeRobotDataset,
         repo_id=config_str(config, "repo_id", "local/va_h5_v3"),
-        root=config_path(config, "output", override=args.output),
+        root=output_path,
         fps=spec["fps"],
         features=spec["lerobot_features"],
         no_videos=config_bool(config, "no_videos"),
     )
 
     try:
-        for h5_path in tqdm(h5_dataset.files(), desc="episodes", unit="episode"):
+        for h5_path in tqdm(h5_files, desc="episodes", unit="episode"):
             with h5_dataset.open_episode(h5_path) as h5_file:
                 cache = None
                 try:

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import torch
 from tqdm.auto import tqdm
 
+from data_process.action_fk import normalize_action_fk, poses_from_joint_actions
 from data_process.causal_data_filter import (
     filter_episode_values,
     normalize_dataloader_filters,
@@ -76,6 +77,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         self.action_key = str(self.data_config.get("action_key", "")).strip()
         if not self.action_key:
             raise ValueError("dataloader.action_key is required")
+        self.action_fk = normalize_action_fk(self.data_config.get("action_fk"))
+        if self.action_fk is not None and self.action_fk["pose_key"] != self.action_key:
+            raise ValueError("dataloader.action_fk.pose_key must match dataloader.action_key")
         configured_train_data = config.get("train_data")
         if isinstance(configured_train_data, list):
             configured_train_data = {"sources": configured_train_data}
@@ -654,6 +658,13 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
 
     def _load_single_lerobot_columns(self, stats_dataset, source_dataset):
         dataset_keys = list(dict.fromkeys(self.high_keys.values()))
+        available = getattr(stats_dataset, "column_names", None)
+        needs_fk = self.action_fk is not None and (
+            available is None or self.action_key not in available
+        )
+        if needs_fk:
+            dataset_keys = [key for key in dataset_keys if key != self.action_key]
+            dataset_keys.append(self.action_fk["joint_key"])
         dataset_keys.extend((self.high_timestamp_key, self.anchor_timestamp_key))
         # These timing columns are optional for older LeRobot exports.  They
         # are included in the first read when available and silently omitted
@@ -667,13 +678,23 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             formatted = stats_dataset.with_format(
                 "torch", columns=dataset_keys, output_all_columns=False
             )
-        except KeyError:
+        except (KeyError, ValueError):
             # Permit the ingestion-time delta_q fallback above when an older
             # v3 table has no materialized observation.delta_q column.
             formatted = stats_dataset.with_format(
                 "torch", columns=None, output_all_columns=True
             )
         columns = formatted[:]
+        if self.action_key not in columns and self.action_fk is not None:
+            joint_key = self.action_fk["joint_key"]
+            if joint_key not in columns:
+                raise KeyError(f"FK fallback requires joint-action feature {joint_key!r}")
+            if int((self.config.get("model") or {}).get("action_dim", 7)) != 7:
+                raise ValueError("FK xyz + xyzw conditions require model.action_dim=7")
+            joints = self._as_tensor(columns[joint_key], dtype=torch.float64)
+            columns[self.action_key] = torch.from_numpy(
+                poses_from_joint_actions(joints.cpu().numpy(), self.action_fk)
+            )
         high_tensors = {}
         source_rows = None
         block_size = None
@@ -690,7 +711,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 # This is distinct from (and never replaces) predicted
                 # delta_q supervision.
                 if key == "delta_q":
-                    action_source = self.high_keys.get("action", self.action_key)
+                    action_source = "action.joint"
+                    if self.action_key == "action.joint":
+                        action_source = self.action_key
                     q_source = self.high_keys.get("q", "observation.joint")
                     if action_source in columns and q_source in columns:
                         columns[dataset_key] = self._as_tensor(
@@ -701,6 +724,11 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 else:
                     raise KeyError(f"dual-rate dataset is missing feature {dataset_key!r}")
             value = self._as_tensor(columns[dataset_key], dtype=torch.float32)
+            if not torch.isfinite(value).all():
+                raise ValueError(f"WM feature {dataset_key!r} contains non-finite values")
+            # LeRobot's formatter squeezes scalar [1] features to [N].
+            if value.ndim == 1:
+                value = value.unsqueeze(-1)
             if value.ndim == 2:
                 current_source_rows = int(value.shape[0])
                 current_block_size = 1

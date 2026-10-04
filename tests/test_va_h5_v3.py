@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import argparse
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
 
+from data_process.tool import VA_h5_v3 as va_converter
 from data_process.tool.VA_h5_v3 import (
     VAH5Dataset,
     build_conversion_spec,
@@ -236,3 +239,132 @@ def test_leading_camera_row_without_history_is_dropped_without_index_shift(
     assert int(first["observation.images.wrist"][0, 0, 0]) == 2
     assert int(first["observation.images.side"][0, 0, 0]) == 11
     assert float(first["action.joint"][0]) == 0.0
+
+
+@pytest.fixture
+def conversion_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    input_path, output_path = tmp_path / "input", tmp_path / "output"
+    input_path.mkdir()
+    _write_episode(input_path / "episode.h5")
+    config = _shape_meta()
+    config["io"] = {"input": str(input_path), "output": str(output_path)}
+    frames, created_roots = [], []
+
+    class FakeLeRobotDataset:
+        @classmethod
+        def create(cls, **kwargs):
+            root = kwargs["root"]
+            root.mkdir(parents=True)
+            created_roots.append(root)
+            return cls()
+
+        def add_frame(self, frame, task):
+            frames.append(frame)
+
+        def save_episode(self, task):
+            pass
+
+        def finalize(self):
+            pass
+
+    monkeypatch.setattr(va_converter, "load_shape_meta", lambda _: config)
+    monkeypatch.setattr(va_converter, "load_h5py", lambda: h5py)
+    monkeypatch.setattr(
+        va_converter, "load_conversion_deps", lambda: (h5py, np, FakeLeRobotDataset)
+    )
+    args = argparse.Namespace(
+        config=tmp_path / "config.yaml", input=None, output=None, overwrite=False
+    )
+    return args, input_path, output_path, frames, created_roots
+
+
+@pytest.mark.parametrize("flag", [[], ["--overwrite"]])
+def test_overwrite_cli_flag(flag: list[str], monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(sys, "argv", ["VA_h5_v3.py", "-c", "config.yaml", *flag])
+    assert va_converter.parse_args().overwrite is bool(flag)
+
+
+@pytest.mark.parametrize("output_kind", ["directory", "file"])
+def test_overwrite_replaces_existing_output(conversion_setup, output_kind: str):
+    args, _, output_path, frames, created_roots = conversion_setup
+    if output_kind == "directory":
+        (output_path / "nested").mkdir(parents=True)
+        (output_path / "nested" / "old.txt").write_text("old")
+    else:
+        output_path.write_text("old")
+    args.overwrite = True
+
+    va_converter.run_conversion(args)
+
+    assert created_roots == [output_path]
+    assert output_path.is_dir() and not (output_path / "nested").exists()
+    assert len(frames) == 3
+
+
+def test_existing_output_is_preserved_without_overwrite(conversion_setup):
+    args, _, output_path, _, created_roots = conversion_setup
+    output_path.mkdir()
+    marker = output_path / "old.txt"
+    marker.write_text("keep")
+    del args.overwrite  # Also preserve callers constructing older Namespaces.
+
+    with pytest.raises(FileExistsError, match="--overwrite"):
+        va_converter.run_conversion(args)
+
+    assert marker.read_text() == "keep"
+    assert created_roots == []
+
+
+def test_overwrite_uses_output_override(conversion_setup):
+    args, _, output_path, frames, created_roots = conversion_setup
+    output_path.write_text("keep configured output")
+    args.output = output_path.parent / "override"
+    args.output.mkdir()
+    marker = args.output / "old.txt"
+    marker.write_text("old")
+    args.overwrite = True
+
+    va_converter.run_conversion(args)
+
+    assert output_path.read_text() == "keep configured output"
+    assert not marker.exists() and created_roots == [args.output]
+    assert len(frames) == 3
+
+
+def test_overwrite_preserves_output_when_input_is_missing(conversion_setup):
+    args, input_path, output_path, _, created_roots = conversion_setup
+    (input_path / "episode.h5").unlink()
+    output_path.write_text("keep")
+    args.overwrite = True
+
+    with pytest.raises(FileNotFoundError):
+        va_converter.run_conversion(args)
+
+    assert output_path.read_text() == "keep"
+    assert created_roots == []
+
+
+@pytest.mark.parametrize("ancestor", [False, True])
+def test_overwrite_refuses_to_delete_input(conversion_setup, ancestor: bool):
+    args, input_path, _, _, created_roots = conversion_setup
+    args.output = input_path.parent if ancestor else input_path
+    args.overwrite = True
+
+    with pytest.raises(ValueError):
+        va_converter.run_conversion(args)
+
+    assert (input_path / "episode.h5").is_file()
+    assert created_roots == []
+
+
+def test_inspect_only_ignores_overwrite(conversion_setup, monkeypatch):
+    args, _, output_path, _, created_roots = conversion_setup
+    output_path.write_text("keep")
+    monkeypatch.setattr(
+        sys, "argv", ["VA_h5_v3.py", "-c", str(args.config), "--inspect-only", "--overwrite"]
+    )
+
+    va_converter.main()
+
+    assert output_path.read_text() == "keep"
+    assert created_roots == []

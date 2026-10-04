@@ -1,7 +1,8 @@
 """One shared robot-time grid for datasets and online request anchors.
 
 Subtract int64 nanoseconds BEFORE division. Ties round away from zero. With
-no explicit grid, quantize only the first action anchor, then use nominal R.
+no explicit grid, quantize the first action anchor, then advance by nominal R.
+Fractional ratios round cumulative token offsets to the nearest state tick.
 Never clamp d0. Check both individual intervals and accumulated clock drift.
 Explicit per-token grids can describe plans crossing scheduling windows.
 """
@@ -26,8 +27,8 @@ class RelativeTimeGrid:
     def __post_init__(self):
         if any(not math.isfinite(v) or v <= 0 for v in (self.state_rate_hz, self.action_rate_hz)):
             raise ValueError("grid rates must be finite and positive")
-        if abs(self.state_rate_hz / self.action_rate_hz - self.ratio) > 1e-9:
-            raise ValueError("action period must be an integer number of external ticks")
+        if self.action_rate_hz > self.state_rate_hz:
+            raise ValueError("action rate must not exceed the external state tick rate")
         if any(v < 0 for v in (self.action_interval_tolerance_ns,
                               self.state_interval_tolerance_ns, self.action_drift_tolerance_ns)):
             raise ValueError("grid tolerances must be nonnegative")
@@ -38,7 +39,13 @@ class RelativeTimeGrid:
 
     @property
     def ratio(self):
-        return round(self.state_rate_hz / self.action_rate_hz)
+        ratio = self.state_rate_hz / self.action_rate_hz
+        rounded = round(ratio)
+        return rounded if abs(ratio - rounded) <= 1e-9 else ratio
+
+    @property
+    def integer_action_ticks(self):
+        return isinstance(self.ratio, int)
 
     @classmethod
     def from_config(cls, config):
@@ -48,10 +55,11 @@ class RelativeTimeGrid:
                    **(data.get("relative_time_grid") or {}))
 
     def contract(self):
-        return {"schema": "relative_grid_v1", **asdict(self), "tick_ns": self.tick_ns,
+        return {"schema": "relative_grid_v1" if self.integer_action_ticks else "relative_grid_v2", **asdict(self), "tick_ns": self.tick_ns,
                 "action_ticks": self.ratio, "origin": "request_history_last_observation",
                 "rounding": "nearest_ties_away_from_zero_int64",
-                "fallback": "quantize_first_anchor_then_nominal_cadence",
+                "fallback": ("quantize_first_anchor_then_nominal_cadence" if self.integer_action_ticks
+                             else "quantize_first_anchor_then_fractional_cadence"),
                 "explicit": "per_token_grid_positions_minus_request_anchor_grid",
                 "state_stride": "retain_external_ticks", "phase_clamping": False}
 
@@ -69,7 +77,7 @@ class RelativeTimeGrid:
                 raise GridMetadataError("timing metadata must be int64 [B,T]")
         valid = torch.ones(history_ns.shape[0], dtype=torch.bool, device=history_ns.device)
         intervals = torch.diff(action_ns, dim=1)
-        period = self.ratio * self.tick_ns
+        period = round(1e9 / self.action_rate_hz)
         valid &= ((intervals > 0) & ((intervals - period).abs() <= self.action_interval_tolerance_ns)).all(1)
         offsets = torch.arange(action_ns.shape[1], device=action_ns.device) * period
         drift = action_ns - action_ns[:, :1] - offsets
@@ -120,8 +128,12 @@ class RelativeTimeGrid:
             raise GridMetadataError("history timing length differs from history horizon")
         d0 = self.quantize(action_ns[:, 0] - history_ns[:, -1])
         device = history_ns.device
+        token_indices = torch.arange(action_ns.shape[1], device=device)
+        action_offsets = (self.ratio * token_indices if self.integer_action_ticks
+                          else self.quantize(token_indices * round(1e9 / self.action_rate_hz)))
+        action_positions = d0[:, None] + action_offsets
         return {"history_grid_positions": torch.arange(1-length, 1, device=device).expand(b, -1),
-                "action_grid_positions": d0[:, None] + self.ratio * torch.arange(action_ns.shape[1], device=device),
+                "action_grid_positions": action_positions,
                 "future_grid_positions": torch.arange(1, future_horizon+1, device=device).expand(b, -1)}
 
 

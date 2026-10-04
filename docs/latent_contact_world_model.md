@@ -52,6 +52,51 @@ form history memory; action remains a separate masked memory. Default width
 is 128, history 50 at 100 Hz, future 40, action 10 at 25 Hz. The EE action is
 absolute xyz + xyzw quaternion, in the original configured coordinate frame.
 
+### Xarm erase-board data and missing EE actions
+
+From the repository root, convert using
+`python data_process/tool/h5_v3_wm.py -c config/shape_meta/swm/xarm/erase_board.yaml`.
+This config keeps every native 100 Hz state row. With
+`timeline.action_anchor_mode: state_frames` and `action_fps: 25`, action
+snapshots come from state frame numbers **0, 4, 8, 12, ...**, and each is held
+until the next selected frame. Frame numbers determine both selection and
+holding; timestamp jitter does not change selected rows, and camera clocks
+are not required. Recorded timestamps are preserved as timing metadata.
+`action.joint` uses measured
+`teleop/right_q_xarm`, as explicitly chosen for compatibility with that VA
+dataset; `observation.delta_q` still uses commanded minus measured joints.
+The single-channel external torque L1 signal remains `observation.tau_ext`.
+
+The optional `action_fk` block materializes `action.ee_pose` when it is not
+declared in the conversion features. It specifies the robot URDF, joint order,
+base frame and target frame; paths resolve from the working directory. FK
+uses raw radian joint actions before normalization and includes fixed tool
+offsets. Poses are float32 `[x,y,z,qx,qy,qz,qw]`, in metres with unit
+quaternions and `qw >= 0`. Non-finite numeric values fail conversion by
+default. This xarm config selects `nonfinite_episode_policy: drop`, excluding
+the entire invalid episode while keeping other episodes' clocks intact.
+`meta/world_model_timeline.json` records excluded paths and reasons. No invalid
+contact signal is replaced with zero. Existing declared EE actions take precedence.
+
+Both WM datasets also accept `dataloader.action_fk` for older converted
+datasets missing the configured EE action column. They compute and cache FK
+from `action.joint` once at ingestion, preserve recorded action indices and
+timestamps, and fit normalizers on the resulting EE conditions. Existing EE
+columns are kept. Missing joints, incorrect dimensions, unknown frames or a
+missing URDF produce an error. Do not substitute observation joints for a
+joint-action column with different semantics.
+
+Ready-to-run configurations are
+`config/train_cfg/pretrain/xarm/cwm_erase_board_100hz_40step.yaml` for Contact WM
+and `config/train_cfg/latent_cwm_erase_board_100hz_40step.yaml` for Latent WM.
+Each uses history 50 at 100 Hz, action 10 at nominal 25 Hz and future 40
+at 100 Hz. The current state is zero, the first future action is at `d0`,
+and subsequent action tokens are at `d0 + 4*k`. Timestamps are not fed
+directly to position encoding. Other configurations can retain the default
+`recorded_camera` anchor mode, and fractional rate ratios remain supported
+by the relative-step grid. In `state_frames` mode, fractional sampling uses
+rounded cumulative frame offsets rather than rounding a single stride.
+
 FutureEncoder is a separate deterministic, per-time MLP receiving normalized
 q/tau and three-way contact one-hot. It uses two Linear layers and SiLU, mapping
 17 to 128 to `latent_dim=128`. Each decoder uses exactly two Linear layers:
