@@ -140,6 +140,7 @@ class DeterministicWorldModelTrainer(BaseTrainer):
                 ),
             ).reshape(-1).round().to(dtype=torch.long)
             class_count = self.loss_calculator.contact_state_count
+            labels = labels[labels >= 0]
             counts = torch.bincount(labels, minlength=class_count).to(dtype=torch.float64)
             if torch.any(counts <= 0):
                 raise ValueError(

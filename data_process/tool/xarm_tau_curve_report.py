@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Export 100 Hz torque residual sidecars and camera-aligned phase review plots.
 
-Labels are provisional: a/b come from background validation residual quantiles,
-not contact ground truth. Raw H5 recordings are only opened read-only.
+Contact uses one strict threshold and a one-second alignment prefix, shared with
+WM training. Raw H5 recordings are only opened read-only.
 """
 from __future__ import annotations
 import argparse
@@ -22,49 +22,31 @@ import torch
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
 from data_process.tool.xarm_tau_offline_experiment import (
-    Regressor,infer,read_episode,save_json,predict_original,preprocess,physics_prior,metrics,
+    Regressor,infer,read_episode,save_json,predict_original,metrics,
 )
+from model.pinn_model.contact_gate import ContactGateConfig, contact_phase_labels_from_signal
 
 
-def phase_labels(t,score,low,high,precontact_s=1.,on_s=.08,off_s=.12):
-    """Band labels plus debounced hysteresis + pre-onset labels; contact wins."""
+def phase_labels(t,score,threshold=10.,precontact_s=1.,valid_mask=None):
+    """Use the same timestamp-aware contact/alignment/free rule as both WMs."""
     t,score=np.asarray(t),np.asarray(score)
-    if t.ndim!=1 or score.shape!=t.shape or not len(t) or not np.isfinite(score).all():
-        raise ValueError('Expected aligned finite one-dimensional time and score')
-    if np.any(np.diff(t)<=0) or not (0<=low<high):
-        raise ValueError('Increasing timestamps and 0 <= low < high required')
-    band=np.where(score<low,0,np.where(score>high,2,1)).astype(np.int8)
-    contact=np.zeros(len(t),dtype=bool)
-    active=False;pending=None
-    for i,s in enumerate(score):
-        threshold_met=(s<=low) if active else (s>=high)
-        if threshold_met:
-            if pending is None:pending=i
-            required=off_s if active else on_s
-            if t[i]-t[pending]>=required-1e-9:
-                active=not active
-                # Offline confirmation can backdate the transition to its onset.
-                contact[pending:i+1]=active
-                pending=None
-        else:pending=None
-        contact[i]=active
-    phases=np.where(contact,2,0).astype(np.int8)
-    onsets=np.flatnonzero(contact & ~np.r_[False,contact[:-1]])
-    for index in onsets:
-        start=np.searchsorted(t,t[index]-precontact_s)
-        phases[start:index][~contact[start:index]]=1
-    return band,phases
+    if t.ndim!=1 or score.shape!=t.shape or not len(t):
+        raise ValueError('Expected aligned non-empty one-dimensional time and score')
+    config=ContactGateConfig(contact_threshold=threshold,precontact_duration_s=precontact_s)
+    config.validate()
+    return contact_phase_labels_from_signal(score,[(0,len(t))],config,
+        timestamps_s=t,valid_mask=valid_mask)[:,0].numpy().astype(np.int8)
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint',type=Path,required=True)
     parser.add_argument('--experiment-root',type=Path,default=ROOT/'outputs/xarm_tau_offline_20261004')
-    parser.add_argument('--peel',type=Path,default=ROOT.parent/'xarm_ws/runs/peel_cucumber_25hzcam')
+    parser.add_argument('--peel',type=Path,default=ROOT.parent/'xarm_ws/runs/peel_cucumber_side_wrist_cam')
     parser.add_argument('--bg',type=Path,default=ROOT/'data/xarm_bg/bg_data')
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--low-threshold',type=float,help='Override background P95 threshold a, in summed Nm')
-    parser.add_argument('--high-threshold',type=float,help='Override background P99 threshold b, in summed Nm')
+    parser.add_argument('--contact-threshold',type=float,default=10.,help='Strict contact threshold in summed Nm')
+    parser.add_argument('--precontact-seconds',type=float,default=1.)
     args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
     for directory in ('figures','predictions'): (args.output/directory).mkdir(exist_ok=True)
     torch.set_num_threads(4)
@@ -76,18 +58,14 @@ def main():
     validation=read_episode(bgfiles[2])
     pred,target,valid=infer(model,validation,spec,norm,device)
     score=np.abs(target-pred).sum(axis=1)
-    low,high=np.percentile(score[valid],[95,99])
-    if args.low_threshold is not None:low=args.low_threshold
-    if args.high_threshold is not None:high=args.high_threshold
-    if not 0<=low<high:raise ValueError('Require 0 <= low threshold < high threshold')
-    threshold_source='background validation P95/P99' if args.low_threshold is None and args.high_threshold is None else 'user overrides (remaining defaults: background validation P95/P99)'
+    threshold=args.contact_threshold
+    ContactGateConfig(contact_threshold=threshold,precontact_duration_s=args.precontact_seconds).validate()
     calibration={'checkpoint':str(args.checkpoint.resolve()),'spec':spec,
         'score':'sum(abs(tau_matched_filter - tau_free_prediction)), seven joints, Nm',
-        'low_a':float(low),'high_b':float(high),'threshold_source':threshold_source,'quantiles':[.95,.99],
-        'purpose':'provisional visual review only; thresholds fitted to background validation, not contact truth',
-        'validation':metrics(pred[valid],target[valid]),'on_confirmation_s':.08,'off_confirmation_s':.12,'precontact_s':1.,
-        'phase_band':{'0':'free_motion','1':'intermediate_torque (user alignment heuristic)','2':'contact_candidate','-1':'insufficient_context'},
-        'phase_first':{'0':'free_motion','1':'pre_contact (one second before onset)','2':'contact_candidate','-1':'insufficient_context'}}
+        'contact_threshold':float(threshold),'comparison':'>','precontact_s':args.precontact_seconds,
+        'purpose':'review of the same single-threshold labels used by WM training',
+        'validation':metrics(pred[valid],target[valid]),
+        'phase':{'0':'free_motion','1':'alignment','2':'contact','-1':'insufficient_context'}}
     save_json(args.output/'calibration.json',calibration)
     # Archive comparison uses its own filters and then the same 5Hz target for fairness.
     old_path=ROOT.parent/'xarm_ws/model/dp/pretrained_model-20260901T082955Z-1-001/bg/epoch_003_val_tau_mse_nm2_1.386437.pt'
@@ -107,8 +85,7 @@ def main():
     axes[0].legend(ncol=3)
     axes[3].plot(validation['t'][49:],np.abs(oldtarget-oldpred).sum(1),label='Archived residual L1',alpha=.6,lw=.7)
     axes[3].plot(validation['t'],score,label='New residual L1',lw=.8)
-    axes[3].axhline(low,color='orange',ls='--',label=f'a={low:.2f}')
-    axes[3].axhline(high,color='red',ls='--',label=f'b={high:.2f}')
+    axes[3].axhline(threshold,color='red',ls='--',label=f'contact > {threshold:.2f}')
     axes[3].set_ylabel('Residual L1 [Nm]');axes[3].set_xlabel('Time [s]');axes[3].legend(ncol=4)
     fig.suptitle('Background validation: contact-free recording 0002, right arm')
     fig.tight_layout();fig.savefig(args.output/'figures/background_validation.png',dpi=150);plt.close(fig)
@@ -119,8 +96,7 @@ def main():
         episode=read_episode(path)
         pred,target,valid=infer(model,episode,spec,norm,device)
         residual=target-pred;score=np.abs(residual).sum(1)
-        band,phase=phase_labels(episode['t'],score,low,high)
-        band[~valid]=-1;phase[~valid]=-1
+        phase=phase_labels(episode['t'],score,threshold,args.precontact_seconds,valid_mask=valid)
         outside=np.any((episode['q']<bounds[0])|(episode['q']>bounds[1]),axis=1)
         q_target.append(episode['q'])
         payload={'timestamp_us':episode['timestamp_us'],'time_s':episode['t'],
@@ -128,7 +104,7 @@ def main():
                  'tau_measured_matched':target.astype(np.float32),'tau_ext_estimate':residual.astype(np.float32),
                  'tau_ext_raw_minus_prediction':(episode['tau']-pred).astype(np.float32),
                  'tau_ext_l1':score.astype(np.float32),'tau_ext_l2':np.linalg.norm(residual,axis=1).astype(np.float32),
-                 'phase_band':band,'phase_first':phase,'valid_context':valid,'outside_bg_q_bounds':outside}
+                 'phase':phase,'valid_context':valid,'outside_bg_q_bounds':outside}
         for camera,timestamps in episode['cameras'].items():
             ix=np.searchsorted(episode['timestamp_us'],timestamps,side='right')-1
             in_range=(ix>=0)&(timestamps<=episode['timestamp_us'][-1])
@@ -136,28 +112,26 @@ def main():
             camera_phase=phase[ix].copy();camera_phase[~in_range]=-1
             payload[f'{camera}_timestamp_us']=timestamps
             payload[f'{camera}_lowdim_index']=ix
-            payload[f'{camera}_phase_first']=camera_phase
+            payload[f'{camera}_phase']=camera_phase
         np.savez_compressed(args.output/'predictions'/f'{path.stem}.npz',**payload)
         fractions={str(label):float(np.mean(phase[valid]==label)) for label in (0,1,2)}
         summaries.append({'episode':number,'file':path.name,'duration_s':episode['t'][-1],
-            'score_p10_p50_p90':np.percentile(score[valid],[10,50,90]),'phase_first_fraction':fractions,
+            'score_p10_p50_p90':np.percentile(score[valid],[10,50,90]),'phase_fraction':fractions,
             'outside_bg_q_bounds_fraction':float(outside.mean())})
         fig,axes=plt.subplots(4,1,figsize=(13,9),sharex=True,gridspec_kw={'height_ratios':[2,2,2,1]})
         for j in range(7):
             axes[0].plot(episode['t'],residual[:,j],lw=.7,label=f'J{j+1}')
         axes[0].set_ylabel('Residual [Nm]');axes[0].legend(ncol=7,fontsize=8)
         axes[1].plot(episode['t'],score,label='Matched residual L1',lw=1)
-        axes[1].axhline(low,color='orange',ls='--',label=f'a={low:.2f}')
-        axes[1].axhline(high,color='red',ls='--',label=f'b={high:.2f}')
+        axes[1].axhline(threshold,color='red',ls='--',label=f'contact > {threshold:.2f}')
         axes[1].set_ylabel('L1 [Nm]');axes[1].legend(ncol=3,fontsize=8)
         axes[2].plot(episode['t'],np.linalg.norm(episode['dq'],axis=1),color='purple')
         axes[2].set_ylabel('Speed L2 [rad/s]')
-        axes[3].step(episode['t'],phase,where='post',label='FIRST-style candidate')
-        axes[3].step(episode['t'],band,where='post',alpha=.5,label='a/b band candidate')
-        axes[3].set_yticks([-1,0,1,2],['edge','free','pre / middle','contact']);axes[3].set_xlabel('100 Hz lowdim time [s]')
+        axes[3].step(episode['t'],phase,where='post',label='WM contact phase')
+        axes[3].set_yticks([-1,0,1,2],['edge','free','alignment','contact']);axes[3].set_xlabel('100 Hz lowdim time [s]')
         axes[3].legend(fontsize=8,loc='upper right')
         for ax in axes:ax.grid(alpha=.2)
-        fig.suptitle(f'Episode {number:02d} | {spec["name"]}\nProvisional thresholds; labels require video review')
+        fig.suptitle(f'Episode {number:02d} | {spec["name"]}\nContact > {threshold:g} Nm; preceding {args.precontact_seconds:g}s alignment')
         fig.tight_layout();fig.savefig(args.output/f'figures/episode_{number:02d}.png',dpi=130);plt.close(fig)
         if number in (0,10,25,47):
             with h5py.File(path,'r') as f:
@@ -184,8 +158,8 @@ def main():
 <style>body{{font:16px system-ui;max-width:1200px;margin:30px auto;padding:20px;line-height:1.6}}img{{max-width:100%}}td,th{{padding:6px 20px;text-align:left;border-bottom:1px solid #ddd}}code{{background:#eee}}</style>
 <h1>xArm 自由空间力矩与接触阶段曲线检查</h1>
 <p>模型：<code>{html.escape(spec['name'])}</code>。48 段低维数据按原始 100 Hz 时间戳输出，25 Hz 相机用时间戳关联。</p>
-<p>候选阈值 a={low:.3f}、b={high:.3f} Nm，来源：{threshold_source}。它们只是自动检查的起点，不是已验证的接触阈值。原始 H5 未修改。</p>
-<p>phase_band 按你的两阈值区间划分；phase_first 用滞回接触判断，再将接触前 1 秒标为 pre-contact。-1 表示缺少完整上下文。所有削黄瓜数据的关节 7 均超出背景数据范围；outside_bg_q_bounds 字段记录此项。</p>
+<p>与 WM 训练使用同一规则：L1 力矩残差严格大于 {threshold:.3f} Nm 为 contact，接触开始前 {args.precontact_seconds:g} 秒为 alignment，其余有效帧为 free。原始 H5 未修改。</p>
+<p>phase 字段保存三阶段标签；-1 表示缺少完整上下文，contact 标签优先。outside_bg_q_bounds 字段记录超出背景关节位置范围的帧。</p>
 <p>背景验证 RMSE：{calibration['validation']['rmse_nm']:.4f} Nm。统一 5 Hz 目标：原权重 {calibration['old_common5']['rmse_nm']:.4f}，当前模型 {calibration['new_common5']['rmse_nm']:.4f} Nm。这些是用于模型选择的验证结果，非独立测试。</p>
 <h2>背景验证</h2><img src="figures/background_validation.png"><h2>数据覆盖</h2><img src="figures/coverage.png">
 <h2>削黄瓜曲线与相机</h2>'''

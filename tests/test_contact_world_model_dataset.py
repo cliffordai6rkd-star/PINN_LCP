@@ -129,12 +129,14 @@ def test_v3_requires_action_metadata(make_dataset, missing):
         make_dataset(missing=missing)
 
 
-@pytest.mark.parametrize('name', ['cwm_insert_usb_50hz', 'cwm_all_50hz', 'contact_world_model_npu'])
-def test_training_configs_keep_eight_recorded_action_tokens(name):
+@pytest.mark.parametrize('name,horizon', [('pretrain/nero/cwm_insert_usb_100hz_40step', 10),
+                                         ('pretrain/nero/cwm_all_100hz_40step_all', 10),
+                                         ('contact_world_model_npu', 8)])
+def test_training_configs_keep_recorded_action_tokens(name, horizon):
     from pathlib import Path
     cfg = yaml.safe_load((Path(__file__).resolve().parents[1] / 'config/train_cfg' / (name+'.yaml')).read_text())
     data = cfg['dataloader']
-    assert data['action_condition_horizon'] == 8
+    assert data['action_condition_horizon'] == horizon
     assert data['expert_fps'] == 25
     assert data['high_fps'] == 100
     assert data['v3_only']

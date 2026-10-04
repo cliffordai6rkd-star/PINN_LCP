@@ -233,8 +233,7 @@ def lerobot_fixture(monkeypatch, tmp_path):
                              high_timestamp_key="timing.state_timestamp_ns",
                              anchor_timestamp_key="timing.action_anchor_timestamp_ns")
     cfg["contact_gate"].update(enabled=True, label_mode="three_phase", metric="tau_ext_l1",
-                               phase_label_mode="transition_band", consecutive_frames=1,
-                               thresholds={"tau_ext_l1": {"off": 0.5, "on": 2.0}}, class_weights="auto")
+                               contact_threshold=2.0, precontact_duration_s=0.05, class_weights="auto")
     cfg["train"].update(output_dir=str(tmp_path / "run"), val_episode_indices=[1],
                         contact_sampling={"enabled": True, "phase_weights": [1., 5., 5.],
                                           "future_phase_reduction": "max", "replacement": True},

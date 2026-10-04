@@ -22,7 +22,7 @@ import yaml
 from model.pinn_model.contact_world_model import ContactWorldModel, PREDICTED_STATE_STREAMS
 from model.pinn_model.contact_gate import (
     ContactGateConfig,
-    batched_hysteresis_three_phase_mask,
+    batched_contact_phase_mask,
 )
 from physics.nero_dynamics import load_tau_other_predictor
 from train.trainer.contact_world_model_train import ContactWorldModelTrainer
@@ -119,9 +119,7 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
                 ),
             )
         )
-        self.rollout_contact_backfill = bool(
-            rollout_contact.get("backfill", False)
-        )
+
         self.rollout_contact_temperature = float(
             rollout_contact.get("temperature", 0.05)
         )
@@ -515,19 +513,12 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         )
 
     def _rollout_contact_labels(self, signal):
-        """Apply the configured hysteresis to each predicted signal window.
-
-        Hysteresis labels are intentionally detached pseudo-labels.  The
-        differentiable physical consistency term below is what sends a
-        gradient back into the predicted state trajectory.
-        """
-
-        return batched_hysteresis_three_phase_mask(
+        """Detached single-threshold labels with the preceding alignment prefix."""
+        return batched_contact_phase_mask(
             signal.detach().to(dtype=torch.float32),
-            on_threshold=self.rollout_contact_gate.on_threshold,
-            off_threshold=self.rollout_contact_gate.off_threshold,
-            consecutive_frames=self.rollout_contact_gate.consecutive_frames,
-            backfill=self.rollout_contact_backfill,
+            contact_threshold=self.rollout_contact_gate.contact_threshold,
+            precontact_duration_s=self.rollout_contact_gate.precontact_duration_s,
+            state_rate_hz=self.rollout_contact_gate.state_rate_hz,
         )
 
     def _rollout_contact_loss(self, batch, student_out):
@@ -601,15 +592,9 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
         head_probabilities = torch.softmax(logits, dim=-1).detach().to(
             dtype=signal.dtype
         )
-        threshold_gap = signal.new_tensor(
-            max(
-                self.rollout_contact_gate.on_threshold
-                - self.rollout_contact_gate.off_threshold,
-                1.0e-6,
-            )
-        )
+        threshold = self.rollout_contact_gate.contact_threshold
         temperature = signal.new_tensor(self.rollout_contact_temperature)
-        smooth_scale = temperature / threshold_gap
+        smooth_scale = temperature / max(threshold, 1.0e-6)
         log_two = signal.new_tensor(0.6931471805599453)
 
         def smooth_hinge(value):
@@ -617,28 +602,15 @@ class ContactWorldModelOPDTrainer(ContactWorldModelTrainer):
                 torch.nn.functional.softplus(value / temperature) - log_two
             )
 
-        free_violation = smooth_hinge(
-            signal - self.rollout_contact_gate.off_threshold
-        )
-        contact_violation = smooth_hinge(
-            self.rollout_contact_gate.on_threshold - signal
-        )
-        align_violation = smooth_scale * (
-            torch.relu(
-                torch.nn.functional.softplus(
-                    (self.rollout_contact_gate.off_threshold - signal)
-                    / temperature
-                )
-                - log_two
-            )
-            + torch.relu(
-                torch.nn.functional.softplus(
-                    (signal - self.rollout_contact_gate.on_threshold)
-                    / temperature
-                )
-                - log_two
-            )
-        )
+        frames = int(self.rollout_contact_gate.precontact_duration_s * self.rollout_contact_gate.state_rate_hz)
+        upcoming = torch.nn.functional.max_pool1d(
+            torch.nn.functional.pad(signal[:, None], (0, frames), value=float('-inf')),
+            frames+1, stride=1)[:, 0]
+        # Alignment means currently below threshold with a contact in the
+        # available future prefix; it is not an intermediate torque band.
+        free_violation = smooth_hinge(upcoming - threshold)
+        contact_violation = smooth_hinge(threshold - signal)
+        align_violation = smooth_hinge(signal - threshold) + smooth_hinge(threshold - upcoming)
         physical_consistency = (
             head_probabilities[..., 0] * free_violation.square()
             + head_probabilities[..., 1] * align_violation.square()

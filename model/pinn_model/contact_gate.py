@@ -27,14 +27,20 @@ class ContactGateConfig:
     probability_threshold: float = 0.5
     positive_class_weight: float | str = "auto"
     label_cache_path: str | None = None
-    phase_label_mode: str = "transition_band"
-    precontact_frames: int | None = None
-    precontact_duration_s: float | None = None
+    contact_threshold: float = 10.0
+    precontact_duration_s: float = 1.0
     state_rate_hz: float = 100.0
 
     @classmethod
     def from_config(cls, config: Mapping):
         values = config.get("contact_gate") or {}
+        if str(values.get("label_mode", "binary")).lower() == "three_phase":
+            removed = {"phase_label_mode", "precontact_frames", "thresholds", "on_threshold",
+                       "off_threshold", "consecutive_frames", "force_on_threshold_n",
+                       "force_off_threshold_n", "signal_on_threshold", "signal_off_threshold"} & values.keys()
+            if removed:
+                raise ValueError(f"Removed dual-threshold three-phase options: {sorted(removed)}; "
+                                 "use contact_threshold and precontact_duration_s")
         metric = str(values.get("metric", "force_xyz_l2")).lower()
         threshold_sets = values.get("thresholds") or {}
         metric_thresholds = threshold_sets.get(metric) or {}
@@ -89,19 +95,8 @@ class ContactGateConfig:
                 if values.get("label_cache_path") is None
                 else str(values["label_cache_path"])
             ),
-            phase_label_mode=str(
-                values.get("phase_label_mode", "transition_band")
-            ).lower(),
-            precontact_frames=(
-                None
-                if values.get("precontact_frames") is None
-                else int(values["precontact_frames"])
-            ),
-            precontact_duration_s=(
-                None
-                if values.get("precontact_duration_s") is None
-                else float(values["precontact_duration_s"])
-            ),
+            contact_threshold=float(values.get("contact_threshold", 10.0)),
+            precontact_duration_s=float(values.get("precontact_duration_s", 1.0)),
             state_rate_hz=float(
                 (config.get("dataloader") or {}).get("high_fps", 100.0)
             ),
@@ -114,48 +109,26 @@ class ContactGateConfig:
             raise ValueError(
                 "contact_gate.label_mode must be 'binary' or 'three_phase'"
             )
-        if self.phase_label_mode not in {"transition_band", "temporal_precontact"}:
-            raise ValueError(
-                "contact_gate.phase_label_mode must be 'transition_band' or "
-                "'temporal_precontact'"
-            )
-        if self.precontact_frames is not None and self.precontact_frames < 0:
-            raise ValueError("contact_gate.precontact_frames must be non-negative")
-        if (
-            self.precontact_duration_s is not None
-            and self.precontact_duration_s < 0.0
-        ):
-            raise ValueError(
-                "contact_gate.precontact_duration_s must be non-negative"
-            )
-        if (
-            self.phase_label_mode == "temporal_precontact"
-            and self.precontact_frames is None
-            and self.precontact_duration_s is None
-        ):
-            raise ValueError(
-                "temporal_precontact requires precontact_frames or "
-                "precontact_duration_s"
-            )
+        if not math.isfinite(self.contact_threshold) or self.contact_threshold < 0:
+            raise ValueError("contact_gate.contact_threshold must be finite and non-negative")
+        if not math.isfinite(self.precontact_duration_s) or self.precontact_duration_s < 0:
+            raise ValueError("contact_gate.precontact_duration_s must be finite and non-negative")
         if not math.isfinite(self.state_rate_hz) or self.state_rate_hz <= 0.0:
             raise ValueError("dataloader.high_fps must be positive")
         if self.metric not in {"force_xyz_l2", "wrench_l2", "tau_ext_l1", "tau_ext_l2"}:
             raise ValueError(
                 "contact_gate.metric must be force_xyz_l2, wrench_l2, tau_ext_l1, or tau_ext_l2"
             )
-        off_threshold = self.off_threshold
-        on_threshold = self.on_threshold
-        if off_threshold < 0.0:
-            raise ValueError("contact_gate.off_threshold must be non-negative")
-        if on_threshold <= off_threshold:
-            raise ValueError(
-                "contact_gate.on_threshold must be greater than off_threshold"
-            )
+        if self.label_mode == "binary":
+            if self.off_threshold < 0.0:
+                raise ValueError("contact_gate.off_threshold must be non-negative")
+            if self.on_threshold <= self.off_threshold:
+                raise ValueError("contact_gate.on_threshold must be greater than off_threshold")
         if not 0.0 < self.probability_threshold < 1.0:
             raise ValueError(
                 "contact_gate.probability_threshold must be in (0, 1)"
             )
-        if self.consecutive_frames < 1:
+        if self.label_mode == "binary" and self.consecutive_frames < 1:
             raise ValueError("contact_gate.consecutive_frames must be positive")
         if self.head_hidden_dim < 1:
             raise ValueError("contact_gate.head_hidden_dim must be positive")
@@ -259,182 +232,21 @@ def contact_labels_from_wrench(
     return labels
 
 
-def hysteresis_three_phase_mask(
-    signal: torch.Tensor,
-    *,
-    on_threshold: float,
-    off_threshold: float,
-    consecutive_frames: int,
-    backfill: bool = True,
-) -> torch.Tensor:
-    """Create causal free/precontact/contact labels from a scalar signal.
-
-    State ``1`` is the rising transition band. Once ``on_threshold`` has been
-    observed for ``consecutive_frames``, the state becomes ``2`` and remains
-    contact until ``off_threshold`` is observed for the same confirmation
-    length. The confirmed transition can be backfilled because labels are
-    generated offline.
-    """
-
-    values = torch.as_tensor(signal)
-    if values.ndim != 1:
-        raise ValueError(f"hysteresis signal must have shape [T], got {values.shape}")
-    if not torch.isfinite(values).all():
-        raise ValueError("hysteresis signal must contain finite values")
-    if on_threshold <= off_threshold:
-        raise ValueError("on_threshold must be greater than off_threshold")
-    if consecutive_frames < 1:
-        raise ValueError("consecutive_frames must be positive")
-
-    labels = torch.zeros_like(values, dtype=torch.float32)
-    state = 0  # free=0, precontact=1, contact=2
-    candidate_count = 0
-    release_count = 0
-    for index in range(values.shape[0]):
-        value = float(values[index])
-        if state == 2:
-            labels[index] = 2.0
-            if value <= off_threshold:
-                release_count += 1
-            else:
-                release_count = 0
-            if release_count >= consecutive_frames:
-                state = 0
-                start = index - consecutive_frames + 1 if backfill else index
-                labels[start : index + 1] = 0.0
-                release_count = 0
-            continue
-
-        if value <= off_threshold:
-            state = 0
-            candidate_count = 0
-            labels[index] = 0.0
-            continue
-
-        # Values between the thresholds are explicitly exposed as the
-        # precontact class, rather than being collapsed into free/contact.
-        labels[index] = 1.0
-        if value >= on_threshold:
-            candidate_count += 1
-        else:
-            candidate_count = 0
-        if candidate_count >= consecutive_frames:
-            state = 2
-            start = index - consecutive_frames + 1 if backfill else index
-            labels[start : index + 1] = 2.0
-            candidate_count = 0
-
-    return labels
-
-
-@torch.no_grad()
-def batched_hysteresis_three_phase_mask(
-    signal: torch.Tensor,
-    *,
-    on_threshold: float,
-    off_threshold: float,
-    consecutive_frames: int,
-    backfill: bool = True,
-) -> torch.Tensor:
-    """Apply the three-phase state machine to independent ``[B, T]`` rows."""
-
+def batched_contact_phase_mask(signal, *, contact_threshold=10., precontact_duration_s=1., state_rate_hz=100.):
+    """Single threshold with a future alignment prefix, for uniform rollout grids."""
     values = torch.as_tensor(signal).detach()
-    if values.ndim != 2:
-        raise ValueError(
-            f"batched hysteresis signal must have shape [B, T], got {values.shape}"
-        )
-    if not torch.isfinite(values).all():
-        raise ValueError("hysteresis signal must contain finite values")
-    if on_threshold <= off_threshold:
-        raise ValueError("on_threshold must be greater than off_threshold")
-    if consecutive_frames < 1:
-        raise ValueError("consecutive_frames must be positive")
-
-    batch_size, horizon = values.shape
-    labels = torch.zeros(
-        (batch_size, horizon), device=values.device, dtype=torch.float32
-    )
-    contact = torch.zeros(batch_size, device=values.device, dtype=torch.bool)
-    candidate_count = torch.zeros(
-        batch_size, device=values.device, dtype=torch.long
-    )
-    release_count = torch.zeros_like(candidate_count)
-    zero = labels.new_zeros(())
-    one = labels.new_ones(())
-    two = one + one
-
-    # Hysteresis is sequential in time but independent across rows. Keeping
-    # only the short time loop avoids the previous B*T Python scalar loop and
-    # the device-to-host round trip without changing the state-machine rules.
-    for index in range(horizon):
-        value = values[:, index]
-        was_contact = contact
-
-        labels[:, index] = torch.where(
-            was_contact,
-            two,
-            labels[:, index],
-        )
-        release_count = torch.where(
-            was_contact,
-            torch.where(value <= off_threshold, release_count + 1, 0),
-            0,
-        )
-        released = was_contact & (release_count >= consecutive_frames)
-        contact = was_contact & ~released
-        release_count = torch.where(released, 0, release_count)
-        if backfill:
-            start = max(index - consecutive_frames + 1, 0)
-            segment = labels[:, start : index + 1]
-            labels[:, start : index + 1] = torch.where(
-                released[:, None],
-                torch.zeros_like(segment),
-                segment,
-            )
-        else:
-            labels[:, index] = torch.where(
-                released,
-                zero,
-                labels[:, index],
-            )
-
-        # A row released on this frame follows the scalar implementation's
-        # ``continue`` path and is not reconsidered as a new rising edge.
-        active = ~was_contact
-        rising = active & (value > off_threshold)
-        labels[:, index] = torch.where(
-            rising,
-            one,
-            labels[:, index],
-        )
-        candidate_count = torch.where(
-            active,
-            torch.where(
-                rising & (value >= on_threshold),
-                candidate_count + 1,
-                0,
-            ),
-            0,
-        )
-        entered = active & (candidate_count >= consecutive_frames)
-        contact = contact | entered
-        candidate_count = torch.where(entered, 0, candidate_count)
-        if backfill:
-            start = max(index - consecutive_frames + 1, 0)
-            segment = labels[:, start : index + 1]
-            labels[:, start : index + 1] = torch.where(
-                entered[:, None],
-                torch.full_like(segment, 2.0),
-                segment,
-            )
-        else:
-            labels[:, index] = torch.where(
-                entered,
-                two,
-                labels[:, index],
-            )
-
-    return labels
+    if values.ndim != 2 or not torch.isfinite(values).all():
+        raise ValueError("batched contact signal must be finite [B,T]")
+    if not math.isfinite(contact_threshold) or contact_threshold < 0:
+        raise ValueError("contact_threshold must be finite and non-negative")
+    if (not math.isfinite(precontact_duration_s) or precontact_duration_s < 0
+            or not math.isfinite(state_rate_hz) or state_rate_hz <= 0):
+        raise ValueError("invalid contact timing")
+    frames = int(math.floor(precontact_duration_s*state_rate_hz+1e-9))
+    contact = values > contact_threshold
+    padded = torch.nn.functional.pad(contact[:, None].float(), (0, frames))
+    upcoming = torch.nn.functional.max_pool1d(padded, frames+1, stride=1)[:, 0].bool()
+    return torch.where(contact, 2., upcoming.float())
 
 
 def contact_phase_labels_from_wrench(
@@ -463,50 +275,45 @@ def contact_phase_labels_from_signal(
     signal: torch.Tensor,
     episode_bounds: Sequence[tuple[int, int]],
     config: ContactGateConfig,
+    *, timestamps_s=None, valid_mask=None, max_gap_s=0.03,
 ) -> torch.Tensor:
-    """Create [T, 1] three-phase labels while resetting each episode."""
+    """Strict > threshold contact; preceding one second is alignment, contact wins.
 
-    values = torch.as_tensor(signal)
+    Labels are -1 for unknown context. Prefixes never cross episode boundaries,
+    invalid rows, or recording gaps. Actual timestamps define seconds when given.
+    """
+    values = torch.as_tensor(signal).detach().cpu()
     if values.ndim != 1:
         raise ValueError(f"signal must have shape [T], got {values.shape}")
-    labels = torch.zeros((values.shape[0], 1), dtype=torch.float32)
+    valid = torch.isfinite(values)
+    if valid_mask is not None:
+        mask = torch.as_tensor(valid_mask, dtype=torch.bool).cpu()
+        if mask.shape != values.shape:
+            raise ValueError("valid_mask must align with signal")
+        valid &= mask
+    times = (torch.arange(len(values), dtype=torch.float64)/config.state_rate_hz
+             if timestamps_s is None else torch.as_tensor(timestamps_s, dtype=torch.float64).cpu())
+    if times.shape != values.shape or not torch.isfinite(times).all():
+        raise ValueError("timestamps must be finite and align with signal")
+    labels = torch.full((len(values), 1), -1., dtype=torch.float32)
     for start, end in episode_bounds:
-        start = int(start)
-        end = int(end)
-        if start < 0 or end <= start or end > values.shape[0]:
+        start, end = int(start), int(end)
+        if not 0 <= start < end <= len(values):
             raise ValueError(f"invalid episode bounds [{start}, {end})")
-        episode_signal = values[start:end]
-        if config.phase_label_mode == "transition_band":
-            episode_labels = hysteresis_three_phase_mask(
-                episode_signal,
-                on_threshold=config.on_threshold,
-                off_threshold=config.off_threshold,
-                consecutive_frames=config.consecutive_frames,
-                backfill=True,
-            )
-        else:
-            contact = hysteresis_binary_mask(
-                episode_signal,
-                on_threshold=config.on_threshold,
-                off_threshold=config.off_threshold,
-                consecutive_frames=config.consecutive_frames,
-                backfill=True,
-            ).to(dtype=torch.bool)
-            episode_labels = torch.zeros_like(episode_signal, dtype=torch.float32)
-            episode_labels[contact] = 2.0
-            precontact_frames = config.precontact_frames
-            if precontact_frames is None:
-                state_rate_hz = float(getattr(config, "state_rate_hz", 100.0))
-                precontact_frames = int(
-                    round(float(config.precontact_duration_s or 0.0) * state_rate_hz)
-                )
-            onset = contact & ~torch.cat(
-                (torch.zeros(1, dtype=torch.bool, device=contact.device), contact[:-1])
-            )
-            for onset_index in torch.nonzero(onset, as_tuple=False).reshape(-1).tolist():
-                pre_start = max(0, int(onset_index) - int(precontact_frames))
-                episode_labels[pre_start:onset_index] = 1.0
-        labels[start:end, 0] = episode_labels
+        active = valid[start:end].numpy()
+        t = times[start:end].numpy()
+        breaks = np.r_[True, (np.diff(t) <= 0) | (np.diff(t) > max_gap_s+1e-9)]
+        segment_starts = np.flatnonzero(active & (breaks | ~np.r_[False, active[:-1]]))
+        segment_ends = np.flatnonzero(active & (np.r_[breaks[1:], True] | ~np.r_[active[1:], False]))+1
+        for lo, hi in zip(segment_starts, segment_ends):
+            contact = (values[start+lo:start+hi] > config.contact_threshold).numpy()
+            phase = np.zeros(hi-lo, dtype=np.float32)
+            onsets = np.flatnonzero(contact & ~np.r_[False, contact[:-1]])
+            for onset in onsets:
+                left = np.searchsorted(t[lo:hi], t[lo+onset]-config.precontact_duration_s-1e-9)
+                phase[left:onset] = 1.
+            phase[contact] = 2.
+            labels[start+lo:start+hi, 0] = torch.from_numpy(phase)
     return labels
 
 

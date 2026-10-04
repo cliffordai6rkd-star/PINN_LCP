@@ -129,7 +129,8 @@ def test_removed_state_pooling_config_is_rejected(value):
 
 
 @pytest.mark.parametrize('name,history_tokens', [
-    ('cwm_insert_usb_50hz', 100), ('contact_world_model_npu', 100), ('cwm_all_50hz', None),
+    ('pretrain/nero/cwm_insert_usb_100hz_40step', None),
+    ('contact_world_model_npu', 100), ('pretrain/nero/cwm_all_100hz_40step_all', None),
 ])
 def test_training_configs_temporal_history_tokens(name, history_tokens):
     from pathlib import Path
@@ -140,12 +141,13 @@ def test_training_configs_temporal_history_tokens(name, history_tokens):
         history_tokens = len(model.inputs) * model.history_horizon
     values = {key: torch.randn(1, model.external_history_horizon, model.joint_dim)
               for key in model.inputs}
-    values['action'] = torch.randn(1, 8, model.action_dim)
+    actions = model.action_condition_horizon
+    values['action'] = torch.randn(1, actions, model.action_dim)
     encoded = model.encode_conditions(values)
     assert encoded['state_tokens'].shape == (1, history_tokens, 128)
-    assert encoded['action_tokens'].shape == (1, 8, 128)
+    assert encoded['action_tokens'].shape == (1, actions, 128)
     assert 'condition_memory' not in encoded
-    assert model.action_pos_embedding.num_embeddings == 8
+    assert model.action_pos_embedding.num_embeddings == actions
     assert model.future_pos_embedding.num_embeddings == model.future_horizon
     seen = []
     def capture(module, args):
@@ -157,14 +159,14 @@ def test_training_configs_temporal_history_tokens(name, history_tokens):
         handle.remove()
     assert len(seen) == model.flow_layers
     assert all(shapes == ((1, model.future_horizon, 128),
-                          (1, history_tokens, 128), (1, 8, 128)) for shapes in seen)
+                          (1, history_tokens, 128), (1, actions, 128)) for shapes in seen)
 
 
 def test_checkpoint_contract_identifies_simplified_token_architecture():
     model = ContactWorldModel(config())
     contract = model.checkpoint_contract()
     assert model.MODEL_VERSION == "carswm_v9"
-    assert contract["schema_version"] == 10
+    assert contract["schema_version"] == 11
     assert contract["architecture"] == {
         "condition_encoder": "modality_gru_action_gru",
         "state_token": "all_gru_temporal_outputs_modality_major",

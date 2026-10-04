@@ -177,7 +177,7 @@ def test_task_configs_preserve_workspace_baselines():
     root=Path(__file__).resolve().parents[1]/'config/train_cfg'
     for source,dest in [('cwm_insert_usb_100hz_40step.yaml','latent_cwm_insert_usb_100hz_40step.yaml'),
                         ('cwm_peel_cucumber_40step.yaml','latent_cwm_peel_cucumber_40step.yaml')]:
-        original=yaml.safe_load((root/'pretrain'/source).read_text());derived=yaml.safe_load((root/dest).read_text())
+        original=yaml.safe_load((root/'pretrain'/'nero'/source).read_text());derived=yaml.safe_load((root/dest).read_text())
         for key in ('train_data','action_contract','contact_gate'): assert original[key]==derived[key]
         for key in ('batch_size','lr','weight_decay','scheduler','amp','device','split_mode','val_ratio','seed','contact_sampling','ema'):
             assert original['train'][key]==derived['train'][key]

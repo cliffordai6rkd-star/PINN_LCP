@@ -4,8 +4,8 @@ train_data:
   format: lerobot_v3
   sources:
   - name: erase_board
-    repo_id: erase_board_cwm_lerobot_v3
-    root: ../xarm_ws/runs/cwm/erase_board_cwm_lerobot_v3
+    repo_id: erase_board_25hzcam_cwm_lerobot_v3
+    root: ../xarm_ws/runs/cwm/erase_board_25hzcam_cwm_lerobot_v3
 action_contract:
   semantic: va_measured_joint_snapshot_fk
   type: absolute_ee_pose
@@ -15,6 +15,13 @@ action_contract:
   quaternion_sign: canonical_w_nonnegative
   absolute_or_relative: absolute
 dataloader:
+  tau_ext_generation:
+    enabled: true
+    checkpoint: outputs/xarm_tau_offline_20261004/deployment/model.pt
+    cache_dir: outputs/cache/wm_tau_labels
+    device: cpu
+    threads: 2
+    force_rebuild: false
   backend: lerobot
   v3_only: true
   high_fps: 100
@@ -80,13 +87,8 @@ contact_gate:
   label_mode: three_phase
   metric: tau_ext_l1
   tau_ext_source: tau_measured_minus_tau_free
-  phase_label_mode: transition_band
-  precontact_duration_s: 0.1
-  thresholds:
-    tau_ext_l1:
-      'off': 0.4
-      'on': 1.5
-  consecutive_frames: 5
+  precontact_duration_s: 1.0
+  contact_threshold: 10.0
   class_weights:
   - 1.0
   - 1.0
@@ -234,3 +236,6 @@ train:
     - flow-matching
     mode: online
     log_every_steps: 10
+
+loss:
+  free_dynamics_weight: 0.1

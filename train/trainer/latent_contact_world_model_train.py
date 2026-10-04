@@ -135,6 +135,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
             "raw_valid_indices_sha256": hashlib.sha256(torch.tensor(self.dataset.valid_indices).numpy().tobytes()).hexdigest(),
             "train_windows": len(self.train_dataset), "val_windows": len(self.val_dataset),
             "grid_audit": {k:v for k,v in self.dataset.grid_audit.items() if k != "episodes"},
+            "tau_label_contract": (self.dataset.tau_label_report or {}).get("label_contract_sha256"),
         }
         if self.dataset_on_device:
             self.dataset.to_device(self.device)

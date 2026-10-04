@@ -17,11 +17,8 @@ def test_temporal_precontact_labels_only_offline_prefix():
         enabled=True,
         label_mode="three_phase",
         metric="tau_ext_l1",
-        signal_on_threshold=3.0,
-        signal_off_threshold=1.0,
-        consecutive_frames=2,
-        phase_label_mode="temporal_precontact",
-        precontact_frames=3,
+        contact_threshold=3.0,
+        precontact_duration_s=0.03,
     )
     signal = torch.tensor([0.0, 0.0, 0.0, 0.0, 3.5, 3.5, 4.0, 0.5, 0.5])
     labels = contact_phase_labels_from_signal(signal, [(0, len(signal))], config)

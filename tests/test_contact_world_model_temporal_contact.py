@@ -99,13 +99,13 @@ def test_contact_runs_once_per_complete_trajectory_outside_integrator(student):
     handle = model.contact_temporal.register_forward_pre_hook(lambda module, args: calls.append(args[0].shape))
     encoded = model.encode_conditions(values)
     source = torch.randn(2, model.future_horizon, model.flow_dim)
-    model.integrate_flow(source, encoded, steps=3)
+    model.integrate_flow(source, encoded, steps=4 if student else 3)
     assert calls == []
     forward = model(values, flow_time=0.4, source_noise=source)
     assert len(calls) == 1
-    prediction = model.predict(values, steps=3, source_noise=source)
+    prediction = model.predict(values, steps=4 if student else 3, source_noise=source)
     assert len(calls) == 2
-    samples = model.sample(values, num_samples=3, steps=2)
+    samples = model.sample(values, num_samples=3, steps=4 if student else 2)
     assert len(calls) == 5
     handle.remove()
     for out in (forward, prediction):

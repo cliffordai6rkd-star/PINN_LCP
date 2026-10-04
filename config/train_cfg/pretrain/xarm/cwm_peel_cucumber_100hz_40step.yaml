@@ -1,21 +1,27 @@
-# Derived from config/train_cfg/pretrain/cwm_peel_cucumber_40step.yaml (workspace version); original is unchanged.
-# Explicit cadence policy: report and drop invalid windows before episode split.
+# Xarm: 10 action snapshots sampled every 4 state frames condition 40 future states.
 wm_v3_only: true
 train_data:
   format: lerobot_v3
   sources:
   - name: peel_cucumber
-    repo_id: peel_cucumber_lerobot_v3
-    root: data/swm/peel_cucumber_lerobot_v3
+    repo_id: peel_cucumber_cwm_lerobot_v3
+    root: ../xarm_ws/runs/cwm/peel_cucumber_cwm_lerobot_v3
 action_contract:
-  semantic: expert_policy_action_target
+  semantic: va_measured_joint_snapshot_fk
   type: absolute_ee_pose
-  coordinate_frame: link7
+  coordinate_frame: link_base
   representation: xyz_quaternion
   quaternion_order: xyzw
   quaternion_sign: canonical_w_nonnegative
   absolute_or_relative: absolute
 dataloader:
+  tau_ext_generation:
+    enabled: true
+    checkpoint: outputs/xarm_tau_offline_20261004/deployment/model.pt
+    cache_dir: outputs/cache/wm_tau_labels
+    device: cpu
+    threads: 2
+    force_rebuild: false
   backend: lerobot
   v3_only: true
   high_fps: 100
@@ -40,33 +46,19 @@ dataloader:
     temporal_jitter: 0
     cached_policy_action_probability: 0.0
   filters:
-    q:
-      enabled: true
-      source_already_filtered: true
-      operations:
-      - type: lowpass
-        cutoff_hz: 15.0
-        order: 1
     dq:
       enabled: true
-      source_already_filtered: false
-      operations:
-      - type: lowpass
-        cutoff_hz: 15.0
-        order: 1
-    delta_q:
-      enabled: true
       source_already_filtered: true
       operations:
       - type: lowpass
-        cutoff_hz: 15.0
+        cutoff_hz: 20.0
         order: 1
     tau:
       enabled: true
-      source_already_filtered: false
+      source_already_filtered: true
       operations:
       - type: lowpass
-        cutoff_hz: 15.0
+        cutoff_hz: 20.0
         order: 1
   filter_timestamp_unit: ns
   normalize_mode: gaussian
@@ -76,18 +68,27 @@ dataloader:
   - delta_q
   - tau
   - action
-  grid_invalid_window_policy: drop
-  relative_time_grid:
-    action_interval_tolerance_ns: 4000000
-    state_interval_tolerance_ns: 4000000
-    action_drift_tolerance_ns: 5000000
+  action_fk:
+    urdf_path: ../xarm_ws/gello_teleop/models/xarm7_dynamics.urdf
+    joint_key: action.joint
+    pose_key: action.ee_pose
+    base_frame: link_base
+    frame_name: link_eef
+    joint_names:
+    - joint1
+    - joint2
+    - joint3
+    - joint4
+    - joint5
+    - joint6
+    - joint7
 contact_gate:
   enabled: true
   label_mode: three_phase
   metric: tau_ext_l1
   tau_ext_source: tau_measured_minus_tau_free
   precontact_duration_s: 1.0
-  contact_threshold: 1.5
+  contact_threshold: 10.0
   class_weights:
   - 1.0
   - 1.0
@@ -105,21 +106,19 @@ model:
   action_dim: 7
   contact_state_count: 3
   hidden_dim: 128
+  state_layers: 2
+  action_layers: 2
   dropout: 0.01
   flow_layers: 4
   flow_attention_heads: 4
   flow_ffn_multiplier: 4
-  flow_inference_steps: 16
+  flow_inference_steps: 32
   flow_solver: heun
   flow_source_mode: gaussian
-  family: latent_carswm_lstm_v1
-  lstm_layers: 2
-  pretrained_taufree_path: null
-  latent_dim: 128
-  future_encoder_layers: 2
-  decoder_layers: 2
-  decoder_hidden_dim: 128
-  temporal_position_encoding: relative_grid_sinusoidal
+  contact_head_hidden_dim: 64
+  runtime_checks: false
+  use_action_padding_mask: false
+  emit_contact_probabilities: false
 train:
   device: cuda:0
   downsample: false
@@ -131,7 +130,7 @@ train:
   val_num_workers: 0
   val_prefetch_factor: 1
   val_persistent_workers: false
-  max_optimizer_steps: 250000
+  max_optimizer_steps: 400000
   num_epochs: 1000000
   checkpoint_every_steps: 50000
   val_ratio: 0.05
@@ -161,11 +160,6 @@ train:
   - tau_future
   - contact_future
   - importance_weight
-  - contact
-  - history_valid_mask
-  - history_grid_positions
-  - action_grid_positions
-  - future_grid_positions
   amp:
     enabled: true
     dtype: bfloat16
@@ -175,7 +169,7 @@ train:
     feedback_reconditioned: false
     replace_val_loss: false
     replace_val_loss_metric: feedback_u32_energy_score
-    steps: 16
+    steps: 64
     solver: heun
     source_seed: 1234
     max_batches: 0
@@ -203,9 +197,9 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir: outputs/latent_carswm_lstm_grid/peel_cucumber
+  output_dir: outputs/cwm_teacher_policy/peel_cucumber_100hz_40step
   monitor_key: val_loss
-  top_k: 5
+  top_k: 8
   save_latest_checkpoint: true
   contact_sampling:
     enabled: true
@@ -233,7 +227,7 @@ train:
   wandb:
     enabled: true
     project: contact-world-model
-    name: q-dq-deltaq-tau-direct-action-three-phase-contact
+    name: cwm_peel_cucumber_100hz_40step
     group: contact-world-model
     tags:
     - q-dq-deltaq-tau
@@ -242,12 +236,6 @@ train:
     - flow-matching
     mode: online
     log_every_steps: 10
-  stage: all
-  recovery_every_steps: 1000
-codec:
-  checkpoint_path: null
-  max_optimizer_steps: 10000
-  latent_std_floor: 0.0001
-  contact_weight: 1.0
+
 loss:
-  lambda_free: 0.1
+  free_dynamics_weight: 0.1

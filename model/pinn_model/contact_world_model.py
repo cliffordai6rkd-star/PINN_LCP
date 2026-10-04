@@ -434,11 +434,8 @@ class ContactWorldModel(nn.Module):
         data_config = self._config.get("dataloader") or {}
         action_config = self._config.get("action_contract") or {}
         contact_config = self._config.get("contact_gate") or {}
-        thresholds = (contact_config.get("thresholds") or {}).get(
-            str(contact_config.get("metric", "tau_ext_l1")).lower(), {}
-        )
         return {
-            "schema_version": 10,
+            "schema_version": 11,
             "model_version": self.MODEL_VERSION,
             "state_contract": "robot_state_streams_v1",
             "architecture": {
@@ -513,27 +510,19 @@ class ContactWorldModel(nn.Module):
             },
             "contact": {
                 "classes": (
-                    ["free", "precontact_or_transition", "contact"]
+                    ["free", "alignment", "contact"]
                     if self.contact_state_count == 3
                     else [f"phase_{index}" for index in range(self.contact_state_count)]
                 ),
                 "label_mode": str(contact_config.get("label_mode", "three_phase")),
-                "phase_label_mode": str(
-                    contact_config.get("phase_label_mode", "transition_band")
-                ),
+                "phase_rule": "strict_threshold_temporal_precontact",
                 "tau_ext_source": str(
                     contact_config.get("tau_ext_source", "tau_measured_minus_tau_free")
                 ),
                 "norm": str(contact_config.get("metric", "tau_ext_l1")),
-                "off_threshold": thresholds.get(
-                    "off", thresholds.get(False, contact_config.get("off_threshold"))
-                ),
-                "on_threshold": thresholds.get(
-                    "on", thresholds.get(True, contact_config.get("on_threshold"))
-                ),
-                "hysteresis_frames": int(contact_config.get("consecutive_frames", 3)),
-                "precontact_frames": contact_config.get("precontact_frames"),
-                "precontact_duration_s": contact_config.get("precontact_duration_s"),
+                "contact_threshold": float(contact_config.get("contact_threshold", 10.0)),
+                "precontact_duration_s": float(contact_config.get("precontact_duration_s", 1.0)),
+                "comparison": ">",
             },
         }
 

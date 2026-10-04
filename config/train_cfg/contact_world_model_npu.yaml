@@ -73,17 +73,9 @@ contact_gate:
   label_mode: three_phase
   metric: tau_ext_l1
   tau_ext_source: tau_measured_minus_tau_free
-  phase_label_mode: transition_band
-  precontact_duration_s: 0.1
-  # Selected from the H5 tau_ext statistics and validated with 5-frame
-  # hysteresis: free <= off, rising transition in between, contact >= on.
-  # Units follow metric: N for force_xyz_l2, N.m for tau_ext_l1. Selecting
-  # contact_gate.metric automatically selects the matching threshold pair.
-  thresholds:
-    tau_ext_l1: {"off": 0.6, "on": 3}
-  consecutive_frames: 5
+  precontact_duration_s: 1.0
+  contact_threshold: 3
   class_weights: [1.0, 1.0, 1.0]
-  # max_class_weight: 3.0
 
 model:
   inputs: [q,

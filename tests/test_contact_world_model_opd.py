@@ -33,13 +33,13 @@ def test_opd_reuses_source_and_relabels_teacher_on_student_history():
     trainer.rollout_contact_enabled = False
     trainer._sample_source_noise = lambda value: torch.zeros(1, 3, 8)
     calls = []
-    original = trainer.teacher.predict
+    original = trainer.teacher.predict_differentiable
 
     def predict(value, **kwargs):
         calls.append(value["q"][:, -1:].clone())
         return original(value, **kwargs)
 
-    trainer.teacher.predict = predict
+    trainer.teacher.predict_differentiable = predict
     value = batch()
     loss, _ = trainer._rollout_distill(value, rollout_steps=2, sampled_depth=2)
     assert torch.isfinite(loss)
@@ -57,7 +57,7 @@ def test_opd_teacher_and_student_share_source_noise():
     trainer.loss_calculator = ContactWorldModelLoss(config)
     source = torch.randn(1, 3, 8)
     seen = {}
-    original_teacher = trainer.teacher.predict
+    original_teacher = trainer.teacher.predict_differentiable
     original_student = trainer.model.predict_differentiable
 
     def teacher(value, **kwargs):
@@ -68,7 +68,7 @@ def test_opd_teacher_and_student_share_source_noise():
         seen["student"] = kwargs["source_noise"]
         return original_student(value, **kwargs)
 
-    trainer.teacher.predict = teacher
+    trainer.teacher.predict_differentiable = teacher
     trainer.model.predict_differentiable = student
     loss, output = trainer._endpoint_distill(batch(), source_noise=source)
     assert torch.isfinite(loss)

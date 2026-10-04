@@ -2,7 +2,7 @@
 
 The viewer is intentionally independent of the WM dataset/trainer. It reads
 one raw H5 episode at a time, shows both cameras, and logs the two candidate
-contact signals with the three-phase hysteresis label.
+contact signals with the shared single-threshold temporal phase label.
 """
 
 from __future__ import annotations
@@ -30,15 +30,14 @@ def parse_args():
         default=None,
         help="Zero-based sorted file index; omit to select interactively.",
     )
-    parser.add_argument("--off", type=float, default=None)
-    parser.add_argument("--on", type=float, default=None)
+    parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--precontact-seconds", type=float, default=1.)
     parser.add_argument(
         "--metric",
         choices=("force_xyz_l2", "tau_ext_l1"),
         default="force_xyz_l2",
-        help="Signal used for the displayed three-phase hysteresis label.",
+        help="Signal used for the displayed contact/alignment/free label.",
     )
-    parser.add_argument("--consecutive", type=int, default=5)
     parser.add_argument(
         "--no-spawn",
         action="store_true",
@@ -47,34 +46,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def _phase_labels(signal, off, on, consecutive):
-    if off < 0.0 or on <= off or consecutive < 1:
-        raise ValueError("require 0 <= off < on and consecutive >= 1")
-    labels = np.zeros(signal.shape[0], dtype=np.int8)
-    state = 0
-    high_count = 0
-    low_count = 0
-    for i, value in enumerate(signal):
-        if state == 2:
-            labels[i] = 2
-            low_count = low_count + 1 if value <= off else 0
-            if low_count >= consecutive:
-                state = 0
-                labels[i - consecutive + 1 : i + 1] = 0
-                low_count = 0
-            continue
-        if value <= off:
-            state = 0
-            high_count = 0
-            labels[i] = 0
-            continue
-        labels[i] = 1
-        high_count = high_count + 1 if value >= on else 0
-        if high_count >= consecutive:
-            state = 2
-            labels[i - consecutive + 1 : i + 1] = 2
-            high_count = 0
-    return labels
+def _phase_labels(signal, timestamps_s, threshold, precontact_s=1.):
+    from model.pinn_model.contact_gate import ContactGateConfig, contact_phase_labels_from_signal
+    config = ContactGateConfig(contact_threshold=threshold, precontact_duration_s=precontact_s)
+    config.validate()
+    return contact_phase_labels_from_signal(signal, [(0, len(signal))], config,
+        timestamps_s=timestamps_s)[:, 0].numpy().astype(np.int8)
 
 
 def _camera_index(camera_timestamps, state_timestamp):
@@ -104,7 +81,7 @@ def _blueprint():
     )
 
 
-def _log_episode(path: Path, metric: str, off: float, on: float, consecutive: int):
+def _log_episode(path: Path, metric: str, threshold: float, precontact_s: float):
     import h5py
     import rerun as rr
 
@@ -120,7 +97,7 @@ def _log_episode(path: Path, metric: str, off: float, on: float, consecutive: in
         tau_l1 = np.abs(tau_ext).sum(axis=1)
         force_xyz_l2 = np.linalg.norm(wrench[:, :3], axis=1)
         selected_signal = force_xyz_l2 if metric == "force_xyz_l2" else tau_l1
-        phase = _phase_labels(selected_signal, off, on, consecutive)
+        phase = _phase_labels(selected_signal, (state_ts-state_ts[0])*1e-9, threshold, precontact_s)
 
         for idx, timestamp in enumerate(state_ts):
             rr.set_time("idx", sequence=int(idx))
@@ -137,8 +114,7 @@ def _log_episode(path: Path, metric: str, off: float, on: float, consecutive: in
             rr.log("signals/force_xyz_l2", rr.Scalars(float(force_xyz_l2[idx])))
             rr.log("signals/selected_metric", rr.Scalars(float(selected_signal[idx])))
             rr.log("signals/phase", rr.Scalars(float(phase[idx])))
-            rr.log("signals/threshold/off", rr.Scalars(float(off)))
-            rr.log("signals/threshold/on", rr.Scalars(float(on)))
+            rr.log("signals/threshold/contact", rr.Scalars(float(threshold)))
             for ch, name in enumerate(("fx", "fy", "fz")):
                 rr.log(f"signals/wrench/{name}", rr.Scalars(float(wrench[idx, ch])))
 
@@ -152,7 +128,7 @@ def _run_one(path: Path, args):
         spawn=not args.no_spawn,
         default_blueprint=_blueprint(),
     )
-    _log_episode(path, args.metric, args.off, args.on, args.consecutive)
+    _log_episode(path, args.metric, args.threshold, args.precontact_seconds)
     if not args.no_spawn:
         input(f"{path.name} 已播放，回车返回 episode 选择，输入 q 退出: ")
     rr.disconnect()
@@ -160,13 +136,8 @@ def _run_one(path: Path, args):
 
 def main():
     args = parse_args()
-    defaults = {
-        "force_xyz_l2": (0.3, 1.5),
-        "tau_ext_l1": (0.15, 0.75),
-    }
-    default_off, default_on = defaults[args.metric]
-    args.off = default_off if args.off is None else args.off
-    args.on = default_on if args.on is None else args.on
+    defaults = {"force_xyz_l2": 1.5, "tau_ext_l1": 0.75}
+    args.threshold = defaults[args.metric] if args.threshold is None else args.threshold
     files = sorted(args.data_dir.glob("episode_*.h5"))
     files.extend(sorted(args.data_dir.glob("episode_*.hdf5")))
     files = sorted(set(files))

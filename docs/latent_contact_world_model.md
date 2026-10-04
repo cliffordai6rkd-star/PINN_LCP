@@ -2,7 +2,100 @@
 
 Independent family/version `latent_carswm_lstm_v1`, branch
 `feat/latent-carswm-lstm-grid`. The original WM model, trainer, configuration
-files and checkpoint formats keep their existing behavior. No registry is needed.
+files keep separate architecture and training stages. Both WM families now share
+the single-threshold contact-label preparation described below. No registry is needed.
+
+## xArm：训练启动时生成 tau_ext 和三阶段标签
+
+Contact WM 与 Latent WM 均通过 `ContactWorldModelDataset` 在加载 episode 后、
+归一化和训练集采样前调用 `data_process/wm_tau_labels.py`。不需要在 WM Parquet
+预先保存 `observation.tau_ext`；启用后旧字段即使存在也不参与标注。
+
+冻结的力矩教师权重位于
+`outputs/xarm_tau_offline_20261004/deployment/model.pt`，包含已验证的辨识动力学、
+摩擦系数、URDF、归一化统计和 BiLSTM 参数。它是用于离线标注的教师，配置在
+`dataloader.tau_ext_generation.checkpoint`。Latent 的
+`model.pretrained_taufree_path` 仍是单向运动编码器迁移接口，不能填入这个双向模型。
+`outputs/` 不进入 Git；迁移到其他机器时需要一起复制该权重（本机已放好）。
+
+标注使用 q/dq/delta_q 和实测 tau。数据先按时间戳对齐 100 Hz，再做四阶 5 Hz
+零相位 Butterworth 滤波、降采样至 50 Hz。动力学先验加上残差网络输出得到
+`tau_free`，插值回原时间戳后计算 `tau_ext=tau_matched_filter-tau_free`。
+教师输入不含实测 tau；实测值只参与相减。
+
+当前 WM 导出中 dq/tau 已有 20 Hz 因果低通。标注分支依据
+`meta/world_model_timeline.json` 的可逆 one-pole cascade 元数据，在私有副本上还原，
+再应用教师的训练预处理。原 WM 观测及 H5/Parquet 保持原样。未知滤波契约会报错。
+教师按独立 episode/连续片段推理；片段首尾 1 秒、无效数据和跨断流上下文标为未知。
+
+三阶段规则统一为：
+
+- `sum(abs(tau_ext[J1:J7])) > 10 Nm`：contact，标签 2。
+- 每段接触开始前 1 秒：alignment，标签 1；已有 contact 优先，前缀不跨 episode/断流。
+- 其他有效位置：free，标签 0。等于阈值不算 contact。
+- 上下文未知：标签 -1；包含未知未来标签的训练窗口排除，未知历史不能参加 free 辅助任务。
+
+双阈值滞回和幅值过渡带的三阶段实现已删除。旧的 `thresholds`、`on_threshold`、
+`off_threshold`、`consecutive_frames`、`phase_label_mode`、`precontact_frames` 配置会报错，
+需改为 `contact_threshold` 和 `precontact_duration_s`。其他机器人预设迁移为单阈值时，
+保留各自旧 on 阈值的数值；xArm 预设统一为 10 Nm。
+曲线报告和接触信号检查工具也调用同一标注函数；新的 xArm 报告只输出 `phase`，
+不再生成 `phase_band`/`phase_first` 两套标签。已有历史 HTML 不会自动重写。
+
+```yaml
+dataloader:
+  tau_ext_generation:
+    enabled: true
+    checkpoint: outputs/xarm_tau_offline_20261004/deployment/model.pt
+    cache_dir: outputs/cache/wm_tau_labels
+    device: cpu
+    threads: 2
+    force_rebuild: false
+contact_gate:
+  enabled: true
+  label_mode: three_phase
+  metric: tau_ext_l1
+  contact_threshold: 10.0
+  precontact_duration_s: 1.0
+  class_weights: [1.0, 1.0, 1.0]
+train:
+  contact_sampling:
+    enabled: true
+    phase_weights: [1.0, 5.0, 5.0]  # free / alignment / contact
+    future_phase_reduction: max
+    replacement: true
+```
+
+采样权重作用在预测窗口的最高阶段，表示每个窗口的相对抽样权重，不是固定阶段比例。
+训练器保留现有 importance correction。free 辅助任务要求完整历史均有效且全部为 free，
+用共享运动编码器的 q/dq/delta_q 特征回归当前实测 tau，目标在 WM 的归一化空间中。
+Contact WM 使用 `loss.free_dynamics_weight: 0.1`；Latent WM 在 Flow 阶段使用
+`loss.lambda_free: 0.1`，codec 阶段继续训练未来状态/接触重建。
+
+已配置好的入口（从仓库根目录运行）：
+
+```bash
+python -m train.trainer.contact_world_model_train \
+  --config config/train_cfg/pretrain/xarm/cwm_erase_board_100hz_40step.yaml
+python -m train.trainer.latent_contact_world_model_train \
+  --config config/train_cfg/latent_cwm_erase_board_100hz_40step.yaml
+
+python -m train.trainer.contact_world_model_train \
+  --config config/train_cfg/pretrain/xarm/cwm_peel_cucumber_100hz_40step.yaml
+python -m train.trainer.latent_contact_world_model_train \
+  --config config/train_cfg/latent_cwm_xarm_peel_cucumber_100hz_40step.yaml
+```
+
+擦板预设读取 `../xarm_ws/runs/cwm/erase_board_25hzcam_cwm_lerobot_v3`；
+削黄瓜读取 `../xarm_ws/runs/cwm/peel_cucumber_cwm_lerobot_v3`。换数据修改 `train_data.sources`。
+启动后会先显示 `prepare WM tau_ext labels`。推理缓存按输入数组、时间戳、滤波契约、
+权重与代码哈希标识，两个模型共享缓存；改变接触阈值只重做阶段标注。
+`tau_label_report.json` 保存缓存命中、逐 episode 阶段计数和标注契约。
+恢复训练会校验标注契约；旧三阶段 WM checkpoint 的语义契约已变更，应重新训练。
+
+短步训练验证：`python scripts/smoke_wm_tau_labels.py`，在 CPU 上取两个真实 episode，
+每段最多 128 个窗口，Contact WM 训练 2 步，Latent WM 的 codec/Flow 各训练 2 步。
+结果写入 `outputs/wm_tau_label_integration/smoke`，不覆盖正式训练目录。
 
 ## Entry points and budgets
 

@@ -74,6 +74,12 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
     def __init__(self, config, normalizer=None, compute_normalizer=False):
         self.config = config
         self.data_config = config.get("dataloader") or {}
+        self.tau_generation_config = self.data_config.get("tau_ext_generation") or {}
+        self.generate_tau_ext = bool(self.tau_generation_config.get("enabled", False))
+        self.tau_label_report = None
+        self.contact_gate_config = ContactGateConfig.from_config(config)
+        if self.generate_tau_ext and not self.contact_gate_config.enabled:
+            raise ValueError("tau_ext_generation requires contact_gate.enabled=true")
         self.action_key = str(self.data_config.get("action_key", "")).strip()
         if not self.action_key:
             raise ValueError("dataloader.action_key is required")
@@ -108,6 +114,8 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             if source_format == "h5_v3":
                 configured_v3_fields = self.train_data_config.get("v3_fields") or {}
                 expected_v3_fields = {**V3_STATE_FIELDS, "action": self.action_key}
+                if self.generate_tau_ext:
+                    expected_v3_fields.pop("tau_ext")
                 missing_v3 = sorted(set(expected_v3_fields) - set(configured_v3_fields))
                 if missing_v3:
                     raise ValueError(
@@ -299,6 +307,10 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             self.h5_high_fields.setdefault("tau_ext", "teleop/tau_ext_cal")
         if configured_high_keys.get("tau_ext") is not None:
             self.h5_high_fields.setdefault("tau_ext", "teleop/tau_ext_cal")
+        if self.generate_tau_ext:
+            # Ignore any old placeholder or previously recorded torque residual.
+            self.high_keys.pop("tau_ext", None)
+            self.h5_high_fields.pop("tau_ext", None)
         self._validate_config()
 
         if self.backend == "h5":
@@ -320,11 +332,20 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             self.data_config,
             {key: key for key in self.high_keys},
         )
+        self.tau_label_valid = None
+        if self.generate_tau_ext:
+            from data_process.wm_tau_labels import generate_tau_labels
+            generated, self.tau_label_report = generate_tau_labels(self)
+            self.high_tensors["tau_ext"] = generated["tau_ext"]
+            self.tau_label_valid = generated["valid_context"]
         self._apply_v3_filters()
         self._build_action_tables()
         self.dataset = SimpleNamespace(meta=SimpleNamespace(episodes=self.episodes))
-        self.contact_gate_config = ContactGateConfig.from_config(config)
         self._build_contact_labels()
+        self.contact_valid = torch.isfinite(self.contact[:, 0]) & (self.contact[:, 0] >= 0)
+        if self.generate_tau_ext:
+            from data_process.wm_tau_labels import write_label_report
+            write_label_report(self)
 
         self.valid_indices = []
         self.raw_idx_to_episode_start = {}
@@ -364,6 +385,8 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             "action_indices",
             "action_anchor_timestamps",
             "contact",
+            "contact_valid",
+            "tau_label_valid",
         ):
             value = getattr(self, name, None)
             if torch.is_tensor(value):
@@ -711,6 +734,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 # This is distinct from (and never replaces) predicted
                 # delta_q supervision.
                 if key == "delta_q":
+                    if self.generate_tau_ext:
+                        raise KeyError("Torque labeling requires recorded observation.delta_q; "
+                                       "measured action.joint is not q_cmd")
                     action_source = "action.joint"
                     if self.action_key == "action.joint":
                         action_source = self.action_key
@@ -1368,7 +1394,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             else:
                 signal = tau_ext.abs().sum(dim=-1)
             self.contact = contact_phase_labels_from_signal(
-                signal, bounds, self.contact_gate_config
+                signal, bounds, self.contact_gate_config,
+                timestamps_s=(self.high_timestamps-self.high_timestamps[0]).to(torch.float64)*1e-9,
+                valid_mask=self.tau_label_valid,
             )
         else:
             self.contact = torch.zeros(
@@ -1535,6 +1563,8 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         }
 
     def _build_valid_indices(self):
+        invalid_prefix = torch.cat((torch.zeros(1, dtype=torch.long),
+                                   (~self.contact_valid).long().cumsum(0)))
         for episode in self.episodes:
             start = int(episode["dataset_from_index"])
             end = int(episode["dataset_to_index"])
@@ -1553,6 +1583,8 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 anchor_start += self.history_horizon - 1
             last = end - self.future_horizon - 1
             for high_idx in range(anchor_start, max(anchor_start, last + 1)):
+                if invalid_prefix[high_idx+self.future_horizon+1] != invalid_prefix[high_idx+1]:
+                    continue  # Never train CE/codec/sampling on unknown teacher context.
                 try:
                     self._action_for_anchor(high_idx, episode)
                     if self.action_rollout_horizon:
@@ -1682,6 +1714,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
         # contact labeling is disabled, zero placeholder labels are invalid.
         history_valid_mask = (history >= start) & self.contact_gate_config.enabled
         history = history.clamp_min(start)
+        history_valid_mask &= self.contact_valid.index_select(0, history)
         future = torch.arange(
             high_idx + 1,
             high_idx + self.future_horizon + 1,

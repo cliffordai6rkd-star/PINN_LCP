@@ -895,6 +895,9 @@ class BaseTrainer:
     def _model_checkpoint_metadata(self):
         contract = getattr(self.model, "checkpoint_contract", None)
         metadata = {"carswm_contract": contract()} if callable(contract) else {}
+        report = getattr(getattr(self, "dataset", None), "tau_label_report", None)
+        if report:
+            metadata["tau_label_contract"] = report["label_contract_sha256"]
         extra = getattr(self, "checkpoint_metadata", None)
         if isinstance(extra, dict):
             metadata.update(copy.deepcopy(extra))
@@ -940,6 +943,9 @@ class BaseTrainer:
             raise ValueError(
                 f"resume checkpoint must contain a mapping: {checkpoint_path}"
             )
+        report = getattr(getattr(self, "dataset", None), "tau_label_report", None) or {}
+        if checkpoint.get("tau_label_contract") != report.get("label_contract_sha256"):
+            raise ValueError("resume torque-label checkpoint/data/phase contract mismatch")
         expected_model_version = getattr(self.model, "MODEL_VERSION", None)
         if expected_model_version is not None and checkpoint.get("model_version") != expected_model_version:
             raise ValueError(

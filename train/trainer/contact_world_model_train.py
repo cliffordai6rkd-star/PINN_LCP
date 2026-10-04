@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -327,6 +328,7 @@ class ContactWorldModelTrainer(BaseTrainer):
                 ),
             ).reshape(-1).round().to(dtype=torch.long)
             class_count = self.loss_calculator.contact_state_count
+            labels = labels[labels >= 0]
             counts = torch.bincount(labels, minlength=class_count).to(dtype=torch.float64)
             if torch.any(counts <= 0):
                 raise ValueError(
@@ -392,7 +394,7 @@ class ContactWorldModelTrainer(BaseTrainer):
             else:
                 raise ValueError("train.contact_sampling.phase_weights must be a list or 'auto'")
         phase_weights = [float(value) for value in phase_weights]
-        if len(phase_weights) != class_count or any(value < 0 for value in phase_weights):
+        if len(phase_weights) != class_count or any(not math.isfinite(value) or value < 0 for value in phase_weights):
             raise ValueError(
                 "train.contact_sampling.phase_weights must match "
                 "model.contact_state_count and contain non-negative values"

@@ -1,27 +1,26 @@
-"""Plot one episode's contact signal with three thresholded phase regions.
+"""Plot one episode's contact signal with contact/alignment/free phase regions.
 
 Example::
 
     python data_process/tool/visualize_contact_phase.py \
         --h5 /path/to/episode_0001.h5 \
-        --config config/train_cfg/contact_world_model.yaml
+        --config config/train_cfg/pretrain/xarm/cwm_erase_board_100hz_40step.yaml
 
-The default metric is ``tau_ext_l1`` and the default thresholds are read from
-``contact_gate.thresholds`` in the YAML config.  The plot uses the same
-three-state hysteresis rule as the Contact World Model label generator:
-``free motion`` (0), ``alignment`` (1), and ``contact`` (2).
+The default metric is tau_ext_l1. Contact is strictly above contact_threshold;
+the preceding precontact_duration_s is alignment, with contact taking priority.
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 import torch
 import yaml
 
-from model.pinn_model.contact_gate import ContactGateConfig, hysteresis_three_phase_mask
+from model.pinn_model.contact_gate import ContactGateConfig, contact_phase_labels_from_signal
 
 
 PHASE_NAMES = ("free motion", "alignment", "contact")
@@ -35,15 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--h5", type=Path, required=True, help="Episode .h5/.hdf5 file")
     parser.add_argument(
         "--config", type=Path, default=None,
-        help="Optional training YAML; supplies metric, thresholds and high_fps",
+        help="Optional training YAML; supplies metric, contact threshold and timing",
     )
     parser.add_argument(
         "--metric", choices=("tau_ext_l1", "tau_ext_l2", "force_xyz_l2", "wrench_l2"),
         default=None,
     )
-    parser.add_argument("--off", type=float, default=None, help="Release threshold")
-    parser.add_argument("--on", type=float, default=None, help="Contact threshold")
-    parser.add_argument("--consecutive", type=int, default=None, help="Confirmation frames")
+    parser.add_argument("--threshold", type=float, default=None, help="Strict contact threshold")
+    parser.add_argument("--precontact-seconds", type=float, default=None, help="Alignment prefix in seconds")
     parser.add_argument("--timestamp-path", default="teleop/timestamp_us")
     parser.add_argument(
         "--timestamp-unit", choices=("s", "ms", "us", "ns"), default="us",
@@ -105,17 +103,12 @@ def main() -> None:
         raise FileNotFoundError(args.h5)
     config = _load_config(args.config)
     contact_config = ContactGateConfig.from_config(config)
-    metric = args.metric or contact_config.metric
-    off = contact_config.off_threshold if args.off is None else float(args.off)
-    on = contact_config.on_threshold if args.on is None else float(args.on)
-    consecutive = (
-        contact_config.consecutive_frames
-        if args.consecutive is None else int(args.consecutive)
-    )
-    if not 0.0 <= off < on:
-        raise ValueError(f"require 0 <= off < on, got off={off}, on={on}")
-    if consecutive < 1:
-        raise ValueError("--consecutive must be at least 1")
+    metric = args.metric or (contact_config.metric if args.config else 'tau_ext_l1')
+    contact_config = replace(contact_config,
+        contact_threshold=contact_config.contact_threshold if args.threshold is None else args.threshold,
+        precontact_duration_s=contact_config.precontact_duration_s if args.precontact_seconds is None else args.precontact_seconds)
+    contact_config.validate()
+    threshold = contact_config.contact_threshold
     import h5py
 
     with h5py.File(args.h5, "r") as h5:
@@ -132,13 +125,10 @@ def main() -> None:
     time_s = (timestamps - timestamps[0]) * timestamp_scale
     if not np.isfinite(signal).all() or not np.isfinite(time_s).all():
         raise ValueError("signal and timestamps must be finite")
-    labels = hysteresis_three_phase_mask(
-        torch.from_numpy(signal.astype(np.float32)),
-        on_threshold=on,
-        off_threshold=off,
-        consecutive_frames=consecutive,
-        backfill=True,
-    ).numpy().astype(np.int8)
+    labels = contact_phase_labels_from_signal(
+        torch.from_numpy(signal.astype(np.float32)), [(0, len(signal))], contact_config,
+        timestamps_s=time_s,
+    )[:, 0].numpy().astype(np.int8)
 
     fig, (ax, phase_ax) = plt.subplots(
         2, 1, figsize=(12, 5.2), sharex=True,
@@ -148,8 +138,7 @@ def main() -> None:
         ax.axvspan(left, right, color=PHASE_COLORS[phase], alpha=0.30, lw=0)
         phase_ax.axvspan(left, right, color=PHASE_COLORS[phase], alpha=0.95, lw=0)
     ax.plot(time_s, signal, color="#303030", lw=1.1, label=metric)
-    ax.axhline(on, color="#c44e52", ls="--", lw=1.0, label=f"on = {on:g}")
-    ax.axhline(off, color="#4c72b0", ls="--", lw=1.0, label=f"off = {off:g}")
+    ax.axhline(threshold, color="#c44e52", ls="--", lw=1.0, label=f"contact > {threshold:g}")
     ax.set_ylabel(metric)
     ax.grid(True, axis="y", alpha=0.22)
     ax.set_xlim(float(time_s[0]), float(time_s[-1]))
@@ -160,8 +149,7 @@ def main() -> None:
     phase_ax.tick_params(axis="x", length=3)
     legend = [
         Line2D([], [], color="#303030", lw=1.1, label=metric),
-        Line2D([], [], color="#c44e52", ls="--", lw=1.0, label=f"on = {on:g}"),
-        Line2D([], [], color="#4c72b0", ls="--", lw=1.0, label=f"off = {off:g}"),
+        Line2D([], [], color="#c44e52", ls="--", lw=1.0, label=f"contact > {threshold:g}"),
         *[Patch(facecolor=color, alpha=0.65, label=name) for name, color in zip(PHASE_NAMES, PHASE_COLORS)],
     ]
     ax.legend(handles=legend, loc="upper left", ncol=3, framealpha=0.9)

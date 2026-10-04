@@ -88,13 +88,8 @@ contact_gate:
   label_mode: three_phase
   metric: tau_ext_l1
   tau_ext_source: tau_measured_minus_tau_free
-  phase_label_mode: transition_band
-  precontact_duration_s: 0.1
-  thresholds:
-    tau_ext_l1:
-      'off': 0.6
-      'on': 3
-  consecutive_frames: 5
+  precontact_duration_s: 1.0
+  contact_threshold: 3
   class_weights:
   - 1.0
   - 1.0
