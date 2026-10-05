@@ -1,0 +1,143 @@
+{
+    "codebase_version": "v3.0",
+    "robot_type": null,
+    "total_episodes": 145,
+    "total_frames": 50454,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 500,
+    "fps": 25,
+    "splits": {
+        "train": "0:145"
+    },
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "features": {
+        "observation.images.wrist": {
+            "dtype": "video",
+            "shape": [
+                192,
+                256,
+                3
+            ],
+            "info": {
+                "video.height": 192,
+                "video.width": 256,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 25,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "observation.images.side": {
+            "dtype": "video",
+            "shape": [
+                192,
+                256,
+                3
+            ],
+            "info": {
+                "video.height": 192,
+                "video.width": 256,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 25,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "observation.joint": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "observation.velocity": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "observation.torque": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "observation.delta_q": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "observation.tau_ext": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "observation.ee_pose": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "action.joint": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "action.ee_pose": {
+            "dtype": "float32",
+            "shape": [
+                7
+            ]
+        },
+        "timing.master_timestamp_ns": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ]
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    }
+}

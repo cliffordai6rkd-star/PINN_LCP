@@ -1,0 +1,54 @@
+{
+  "schema_version": 3,
+  "mode": "raw_lowdim_action_hold",
+  "row_sampling": "action_labeled_raw_state_index",
+  "nominal_lerobot_fps": 100,
+  "state_timestamp_path": "teleop/timestamp_us",
+  "action_anchor_timestamp_path": "teleop/timestamp_us",
+  "action_fps": 25,
+  "action_anchor_mode": "state_frames",
+  "action_fps_validation": "configured_state_frame_rate",
+  "action_anchor_grid": "state_frame_indices",
+  "action_sampling": "round_token_index_times_state_fps_over_action_fps",
+  "action_stride_frames": 4,
+  "action_upsampling": "zoh_previous_state_frame_anchor",
+  "action_contract": "state_frame_action_snapshot_v1",
+  "unlabeled_state_rows": "drop",
+  "action_update_key": "timing.action_update",
+  "feature_filters": {
+    "observation.velocity": {
+      "enabled": true,
+      "cutoff_hz": 20.0,
+      "order": 1,
+      "causal": true,
+      "history_only": true,
+      "contract": "causal_variable_dt_one_pole_cascade_v1"
+    },
+    "observation.torque": {
+      "enabled": true,
+      "cutoff_hz": 20.0,
+      "order": 1,
+      "causal": true,
+      "history_only": true,
+      "contract": "causal_variable_dt_one_pole_cascade_v1"
+    }
+  },
+  "action_fk": {
+    "joint_key": "action.joint",
+    "pose_key": "action.ee_pose",
+    "base_frame": "link_base",
+    "frame_name": "link_eef",
+    "urdf_path": "../xarm_ws/gello_teleop/models/xarm7_dynamics.urdf",
+    "joint_names": [
+      "joint1",
+      "joint2",
+      "joint3",
+      "joint4",
+      "joint5",
+      "joint6",
+      "joint7"
+    ]
+  },
+  "nonfinite_episode_policy": "drop",
+  "excluded_episodes": []
+}
