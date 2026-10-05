@@ -198,7 +198,7 @@ def save_checkpoint(path, student, config, teacher_payload, metadata, training_s
                "dataloader_filters": teacher_payload.get("dataloader_filters"),
                "latent_training": teacher_payload.get("latent_training"),
                "scfm_posttrain": copy.deepcopy(metadata), "scfm_training_state": training_state}
-    for key in ("sample_rate_hz", "derived_target_config"):
+    for key in ("sample_rate_hz", "derived_target_config", "tau_label_contract"):
         if key in teacher_payload:
             payload[key] = copy.deepcopy(teacher_payload[key])
     temporary = path.with_suffix(path.suffix+".tmp")
@@ -222,6 +222,7 @@ def main(architecture="latent"):
     parser.add_argument("--data-root", type=Path, help="relocate the original LeRobot v3 data; preserve preprocessing")
     parser.add_argument("--repo-id", help="dataset repo_id at the relocated root")
     parser.add_argument("--interpolate-vla", action="store_true", help="explicit approximate 25->100 Hz GRU pilot; no true contact labels")
+    parser.add_argument("--unlabeled-native", action="store_true", help="GRU-only native q/tau supervision while contact label assets are unavailable")
     parser.add_argument("--save-condition", type=Path, help="save one normalized held-out batch for paired latency runs")
     parser.add_argument("--updates", type=int)
     parser.add_argument("--steps", type=int)
@@ -242,6 +243,8 @@ def main(architecture="latent"):
         parser.error("workers must be nonnegative; evaluate-only requires --resume")
     if args.interpolate_vla and (not legacy or not args.data_root):
         parser.error("--interpolate-vla requires the GRU contact entry point and --data-root")
+    if args.unlabeled_native and (not legacy or args.interpolate_vla):
+        parser.error("--unlabeled-native is GRU-only and cannot be combined with interpolation")
     if args.output.resolve() == args.base_checkpoint.resolve():
         parser.error("output must not overwrite the original teacher")
     if args.evaluate_only and args.output.resolve() == args.resume.resolve():
@@ -279,6 +282,9 @@ def main(architecture="latent"):
     if args.interpolate_vla:
         from data_process.interpolated_contact_dataset import InterpolatedContactDataset
         dataset = InterpolatedContactDataset(data_config, args.data_root)
+    elif args.unlabeled_native:
+        from data_process.native_continuous_contact_dataset import NativeContinuousContactDataset
+        dataset = NativeContinuousContactDataset(data_config, compute_normalizer=False)
     else:
         dataset = dataset_class(data_config, compute_normalizer=False)
     provenance = copy.deepcopy(getattr(dataset, "provenance", {"type": "original_wm_dataset"}))

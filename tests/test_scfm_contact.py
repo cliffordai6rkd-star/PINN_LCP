@@ -5,7 +5,7 @@ import pytest
 import torch
 import yaml
 
-from model.pinn_model.contact_scfm import load_contact_checkpoint, make_contact_student
+from model.pinn_model.contact_scfm import SCFMContactWorldModel, load_contact_checkpoint, make_contact_student
 from model.pinn_model.contact_world_model import ContactWorldModel
 from model.pinn_model.scfm_distillation import (
     SCFMSettings, frozen_snapshot, sample_schedule, scfm_loss, update_flow_ema,
@@ -109,3 +109,25 @@ def test_relocation_updates_source_without_changing_original(tmp_path):
     relocated = script.relocate_data(cfg, tmp_path, "new")
     assert relocated["train_data"]["sources"][0] == {"root": str(tmp_path), "repo_id": "new"}
     assert cfg["train_data"]["sources"][0]["root"] == "old"
+
+
+def test_schema11_preserves_new_contact_semantics_and_rejects_mismatch(tmp_path):
+    cfg = config()
+    cfg["contact_gate"] = {"enabled": True, "label_mode": "three_phase", "metric": "tau_ext_l1",
+                           "contact_threshold": 11.7, "precontact_duration_s": 1.0}
+    model = SCFMContactWorldModel(cfg)
+    contract = model.checkpoint_contract()
+    assert contract["schema_version"] == 11
+    assert contract["contact"]["classes"] == ["free", "alignment", "contact"]
+    assert contract["contact"]["comparison"] == ">"
+    payload = {"model_version": model.MODEL_VERSION, "config": cfg,
+               "carswm_contract": contract, "model": model.state_dict()}
+    path = tmp_path/"schema11.pt";torch.save(payload, path)
+    restored, cp = load_contact_checkpoint(path)
+    student, _ = make_contact_student(restored, cp, 4)
+    assert student.checkpoint_contract()["contact"] == contract["contact"]
+    assert student.checkpoint_contract()["schema_version"] == 11
+    payload["carswm_contract"]["contact"]["contact_threshold"] = 10.
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="contract mismatch"):
+        load_contact_checkpoint(path)

@@ -75,3 +75,38 @@ with GPU synchronization. It excludes acquisition, normalization, transfer and
 robot control. Synthetic conditions give runtime costs, not quality or success
 rates. The script also measures 4-step Heun and 4-step Euler with/without per-call
 condition K/V caching. This cache is rebuilt for every changed condition.
+
+## xArm schema 11 checkpoints
+
+The GRU adapter validates both schema 10 and schema 11 explicitly. Schema 11
+uses the upstream strict torque threshold and temporal alignment labels; weights
+and architecture are unchanged. The original threshold and contact semantics
+are preserved in the exported contract. Source `tau_label_contract` is retained.
+
+The 2026-10-05 erase-board archive contains GRU and latent/LSTM WM teachers.
+Both configs use the native `erase_board_25hzcam_cwm_lerobot_v3` dataset (100 Hz
+states / 25 Hz FK action snapshots). The 25 Hz three-camera dataset is a VLA
+export and is not the training input of either archived WM. Actual state timestamp
+median interval is 9.999 ms and recorded delta-q is nonzero.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=8 python scripts/posttrain_scfm_contact.py \
+  --config config/train_cfg/contact_cwm_scfm_xarm_native.yaml \
+  --base-checkpoint /path/to/contact_wm/checkpoints/step_00250000.pt \
+  --data-root /path/to/erase_board_25hzcam_cwm_lerobot_v3 \
+  --unlabeled-native --output /path/to/student_latest.pt
+```
+
+`--unlabeled-native` disables only dataset contact labeling. It preserves the
+model's contact head, label contract, original normalizer, state/action alignment
+and preprocessing. Real q/tau futures suffice for direct-state GRU SCFM. Original
+offline-label validity exclusions cannot be reproduced without the missing
+cache, so their absence is recorded; reconstructed train/validation episodes
+are still kept separate. Contact F1 is not reported; contact KL measures teacher
+agreement. No free/contact labels are invented. This flag is rejected for latent
+SCFM, whose frozen future encoder also takes contact one-hot targets.
+
+To reproduce latent SCFM on the original window set, supply the offline torque
+teacher or `wm_tau_labels` cache. The original archive's label report identifies
+teacher SHA256 `d71489f15c391da3f669d34130e9d55c4dd030c9aab737ebe3973acab854bb61`
+and label contract `91032c76bf9f801a91c06041c99c89d853c76cc7f4e68a5afed2bedad78f885b`.
