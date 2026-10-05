@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import signal
 import sys
+import tempfile
 import time
 
 import yaml
@@ -39,6 +41,12 @@ def sha256(path):
 
 
 def report(root):
+    with (root / "report.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _report(root)
+
+
+def _report(root):
     training, evaluation = [], []
     for family in FAMILIES:
         path = root / family / "timing.json"
@@ -59,8 +67,11 @@ def report(root):
                                **entry["metrics"]})
     for name, rows in (("training_times.csv", training), ("evaluation_results.csv", evaluation)):
         path = root / name
-        temporary = path.with_suffix(".csv.tmp")
-        with temporary.open("w", newline="") as stream:
+        # Unique temporary files also coexist safely with an already-running
+        # launcher from before parallel support was added.
+        with tempfile.NamedTemporaryFile(mode="w", newline="", dir=root,
+                                         prefix=name + ".", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
             fields = list(dict.fromkeys(key for row in rows for key in row))
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
@@ -178,7 +189,8 @@ def run(args):
     record = json.loads(path.read_text())
     if record["config_sha256"] != sha256(out / "config.yaml"):
         raise RuntimeError("Saved run config was edited; use a new WM_RUN_ROOT")
-    if record["status"] == "complete":
+    refresh = getattr(args, "refresh_evaluation", False)
+    if record["status"] == "complete" and not refresh:
         print(f"Already complete: {args.family}", flush=True)
         return
     record.pop("error", None)
@@ -188,6 +200,8 @@ def run(args):
     if checkpoint.exists():
         train["resume_from"] = str(out)
     already_trained = bool(record.get("training_completed_at"))
+    if refresh and not already_trained:
+        raise RuntimeError("Evaluation refresh requires completed training")
     if already_trained and not checkpoint.exists():
         raise RuntimeError("Completed training has no latest checkpoint")
     if already_trained:
@@ -231,7 +245,19 @@ def run(args):
         else:
             trainer = cls(config)
             trainer.setup()
+        if getattr(args, "defer_evaluation", False):
+            record["status"] = "trained"
+            save()
+            print(f"Training complete; evaluation deferred: {args.family}", flush=True)
+            return
+        if refresh:
+            record.setdefault("previous_evaluations", []).append(dict(
+                archived_at=now(), reason="refresh after concurrent training has ended",
+                evaluations=record["evaluations"],
+            ))
+            record["evaluations"] = []
         record["status"] = "evaluating"
+        record["evaluation_context"] = os.environ.get("WM_EVALUATION_CONTEXT", "sequential_launcher")
         record["checkpoint"] = str(checkpoint)
         checkpoint_hash = sha256(checkpoint)
         if record["evaluations"] and record.get("checkpoint_sha256") != checkpoint_hash:
@@ -267,12 +293,22 @@ def main():
     parser.add_argument("--family", choices=FAMILIES)
     parser.add_argument("--contact-config", type=Path)
     parser.add_argument("--latent-config", type=Path)
+    parser.add_argument("--defer-evaluation", action="store_true",
+                        help="Train only; the launcher evaluates after both training jobs exit")
+    parser.add_argument("--refresh-evaluation", action="store_true",
+                        help="Re-evaluate completed training without optimizer updates")
     args = parser.parse_args()
     args.root = args.root.resolve()
     if args.command == "prepare":
         prepare(args)
     elif args.command == "run":
-        run(args)
+        if args.family is None:
+            parser.error("run requires --family")
+        with (args.root / args.family / "run.lock").open("a") as lock:
+            # A sequential launcher can safely wait for a separately launched
+            # parallel worker, then evaluate/skip it instead of training twice.
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            run(args)
     else:
         print(json.dumps(report(args.root), indent=2))
         print(f"Results: {args.root / 'training_times.csv'}; {args.root / 'evaluation_results.csv'}")

@@ -114,6 +114,14 @@ tail -f "$WM_RUN_ROOT/contact_wm/train.log"
 .conda-env/bin/python scripts/xarm_wm_flow_sweep.py report "$WM_RUN_ROOT"
 ```
 
+To train both models concurrently when CPU, RAM, and GPU memory permit, set
+`export WM_PARALLEL=1` before launching. The launcher waits for both training
+jobs to finish, then evaluates them sequentially so the final sampling-time
+comparison does not include competing training kernels. Per-model locks
+prevent duplicate training, and timing reports support concurrent writers.
+Training durations in this mode include contention for the shared GPU and
+should not be compared directly with durations from isolated training.
+
 Both models train for **250,000 optimizer updates**, saving every **50,000**.
 Latent WM additionally trains its codec for 10,000 updates before Flow;
 its reported training time includes this stage. The action condition remains

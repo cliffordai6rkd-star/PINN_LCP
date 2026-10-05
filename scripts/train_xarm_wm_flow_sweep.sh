@@ -23,6 +23,26 @@ if [[ "${WM_PREPARE_ONLY:-0}" == 1 ]]; then
   exit 0
 fi
 
+if [[ "${WM_PARALLEL:-0}" == 1 ]]; then
+  task_pids=()
+  for task_family in contact_wm latent_wm; do
+    echo "$(date --iso-8601=seconds) training $task_family in parallel"
+    "$task_python" -u "$task_helper" run "$task_run_root" --family "$task_family" \
+      --defer-evaluation >> "$task_run_root/$task_family/train.log" 2>&1 &
+    task_pids+=("$!")
+  done
+  task_failed=0
+  for task_pid in "${task_pids[@]}"; do
+    wait "$task_pid" || task_failed=1
+  done
+  if [[ "$task_failed" == 1 ]]; then
+    "$task_python" "$task_helper" report "$task_run_root"
+    echo "A parallel training job failed; inspect the model logs." >&2
+    exit 1
+  fi
+  export WM_EVALUATION_CONTEXT=isolated_after_parallel_training
+fi
+
 for task_family in contact_wm latent_wm; do
   echo "$(date --iso-8601=seconds) starting $task_family; log: $task_run_root/$task_family/train.log"
   if "$task_python" -u "$task_helper" run "$task_run_root" --family "$task_family" \
