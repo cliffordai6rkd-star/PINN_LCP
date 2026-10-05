@@ -122,6 +122,19 @@ prevent duplicate training, and timing reports support concurrent writers.
 Training durations in this mode include contention for the shared GPU and
 should not be compared directly with durations from isolated training.
 
+For the downloaded xArm peel-cucumber dataset, use the matching configs
+(copied from the completed erase-board run, with only task paths/names changed):
+
+```bash
+export CONTACT_CONFIG=config/train_cfg/pretrain/xarm/cwm_peel_cucumber_100hz_40step.yaml
+export LATENT_CONFIG=config/train_cfg/latent_cwm_xarm_peel_cucumber_100hz_40step.yaml
+export WM_PARALLEL=1
+export WM_RUN_ROOT="outputs/xarm_wm_flow_sweep/peel_cucumber_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$WM_RUN_ROOT"
+nohup bash scripts/train_xarm_wm_flow_sweep.sh \
+  > "$WM_RUN_ROOT/launcher.log" 2>&1 < /dev/null &
+```
+
 Both models train for **250,000 optimizer updates**, saving every **50,000**.
 Latent WM additionally trains its codec for 10,000 updates before Flow;
 its reported training time includes this stage. The action condition remains

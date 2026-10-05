@@ -1,11 +1,12 @@
-# Xarm: 10 action snapshots sampled every 4 state frames condition 40 future states.
+# xArm peel cucumber: same settings as the completed erase-board run.
+# 8 native 25 Hz actions condition 32 future state frames at 100 Hz.
 wm_v3_only: true
 train_data:
   format: lerobot_v3
   sources:
   - name: peel_cucumber
-    repo_id: peel_cucumber_cwm_lerobot_v3
-    root: ../xarm_ws/runs/cwm/peel_cucumber_cwm_lerobot_v3
+    repo_id: peel_cucumber_25hz_3cam_lerobot_v3
+    root: data/xram_cwm/peel_cucumber_25hz_3cam_lerobot_v3-20261005T023204Z-1-001/peel_cucumber_25hz_3cam_lerobot_v3
 action_contract:
   semantic: va_measured_joint_snapshot_fk
   type: absolute_ee_pose
@@ -17,7 +18,7 @@ action_contract:
 dataloader:
   tau_ext_generation:
     enabled: true
-    checkpoint: outputs/xarm_tau_offline_20261004/deployment/model.pt
+    checkpoint: outputs/tau_free_sequence/xarm_offline_teacher/model.pt
     cache_dir: outputs/cache/wm_tau_labels
     device: cpu
     threads: 2
@@ -26,8 +27,8 @@ dataloader:
   v3_only: true
   high_fps: 100
   state_history_horizon: 50
-  prediction_horizon: 40
-  action_condition_horizon: 10
+  prediction_horizon: 32
+  action_condition_horizon: 8
   action_start_offset: 1
   action_condition_mode: direct
   action_key: action.ee_pose
@@ -69,7 +70,7 @@ dataloader:
   - tau
   - action
   action_fk:
-    urdf_path: ../xarm_ws/gello_teleop/models/xarm7_dynamics.urdf
+    urdf_path: ../../xarm_ws/gello_teleop/models/xarm7_dynamics.urdf
     joint_key: action.joint
     pose_key: action.ee_pose
     base_frame: link_base
@@ -88,7 +89,7 @@ contact_gate:
   metric: tau_ext_l1
   tau_ext_source: tau_measured_minus_tau_free
   precontact_duration_s: 1.0
-  contact_threshold: 10.0
+  contact_threshold: 11.705677733654019
   class_weights:
   - 1.0
   - 1.0
@@ -130,7 +131,7 @@ train:
   val_num_workers: 0
   val_prefetch_factor: 1
   val_persistent_workers: false
-  max_optimizer_steps: 400000
+  max_optimizer_steps: 250000
   num_epochs: 1000000
   checkpoint_every_steps: 50000
   val_ratio: 0.05
@@ -169,7 +170,7 @@ train:
     feedback_reconditioned: false
     replace_val_loss: false
     replace_val_loss_metric: feedback_u32_energy_score
-    steps: 64
+    steps: 32
     solver: heun
     source_seed: 1234
     max_batches: 0
@@ -197,7 +198,8 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir: outputs/cwm_teacher_policy/peel_cucumber_100hz_40step
+    flow_steps: 32
+  output_dir: outputs/contact_wm/peel_cucumber_100hz_32step
   monitor_key: val_loss
   top_k: 8
   save_latest_checkpoint: true
@@ -227,7 +229,7 @@ train:
   wandb:
     enabled: true
     project: contact-world-model
-    name: cwm_peel_cucumber_100hz_40step
+    name: contact_wm_peel_cucumber_100hz_32step
     group: contact-world-model
     tags:
     - q-dq-deltaq-tau
@@ -236,6 +238,5 @@ train:
     - flow-matching
     mode: online
     log_every_steps: 10
-
 loss:
   free_dynamics_weight: 0.1

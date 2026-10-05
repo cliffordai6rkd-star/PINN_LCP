@@ -1,11 +1,12 @@
-# Xarm: 10 action snapshots sampled every 4 state frames condition 40 future states.
+# xArm peel cucumber: same settings as the completed erase-board run.
+# 8 native 25 Hz actions condition 32 future state frames at 100 Hz.
 wm_v3_only: true
 train_data:
   format: lerobot_v3
   sources:
   - name: peel_cucumber
-    repo_id: peel_cucumber_cwm_lerobot_v3
-    root: ../xarm_ws/runs/cwm/peel_cucumber_cwm_lerobot_v3
+    repo_id: peel_cucumber_25hz_3cam_lerobot_v3
+    root: data/xram_cwm/peel_cucumber_25hz_3cam_lerobot_v3-20261005T023204Z-1-001/peel_cucumber_25hz_3cam_lerobot_v3
 action_contract:
   semantic: va_measured_joint_snapshot_fk
   type: absolute_ee_pose
@@ -17,7 +18,7 @@ action_contract:
 dataloader:
   tau_ext_generation:
     enabled: true
-    checkpoint: outputs/xarm_tau_offline_20261004/deployment/model.pt
+    checkpoint: outputs/tau_free_sequence/xarm_offline_teacher/model.pt
     cache_dir: outputs/cache/wm_tau_labels
     device: cpu
     threads: 2
@@ -26,8 +27,8 @@ dataloader:
   v3_only: true
   high_fps: 100
   state_history_horizon: 50
-  prediction_horizon: 40
-  action_condition_horizon: 10
+  prediction_horizon: 32
+  action_condition_horizon: 8
   action_start_offset: 1
   action_condition_mode: direct
   action_key: action.ee_pose
@@ -74,7 +75,7 @@ dataloader:
     state_interval_tolerance_ns: 4000000
     action_drift_tolerance_ns: 5000000
   action_fk:
-    urdf_path: ../xarm_ws/gello_teleop/models/xarm7_dynamics.urdf
+    urdf_path: ../../xarm_ws/gello_teleop/models/xarm7_dynamics.urdf
     joint_key: action.joint
     pose_key: action.ee_pose
     base_frame: link_base
@@ -93,7 +94,7 @@ contact_gate:
   metric: tau_ext_l1
   tau_ext_source: tau_measured_minus_tau_free
   precontact_duration_s: 1.0
-  contact_threshold: 10.0
+  contact_threshold: 11.705677733654019
   class_weights:
   - 1.0
   - 1.0
@@ -209,7 +210,8 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir: outputs/latent_carswm_lstm_grid/xarm_peel_cucumber_100hz_40step
+    flow_steps: 16
+  output_dir: outputs/latent_wm/peel_cucumber_100hz_32step
   monitor_key: val_loss
   top_k: 5
   save_latest_checkpoint: true
@@ -239,7 +241,7 @@ train:
   wandb:
     enabled: true
     project: contact-world-model
-    name: latent_cwm_xarm_peel_cucumber_100hz_40step
+    name: latent_wm_peel_cucumber_100hz_32step
     group: contact-world-model
     tags:
     - q-dq-deltaq-tau
