@@ -33,10 +33,10 @@ mlruns/
 
 # Local datasets and converted artifacts
 data/
-*.h5
-*.hdf5
-*.parquet
-*.mp4
+# *.h5
+# *.hdf5
+# *.parquet
+# *.mp4
 
 # Plots and generated reports
 loss_epoch.png
