@@ -32,7 +32,7 @@ runs/
 mlruns/
 
 # Local datasets and converted artifacts
-data/train_episode/
+data/
 *.h5
 *.hdf5
 *.parquet
