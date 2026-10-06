@@ -293,6 +293,9 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 f"{configured_action!r} != {self.action_key!r}"
             )
         self.high_keys["action"] = self.action_key
+        tau_valid_key = self.data_config.get("tau_label_valid_key")
+        if tau_valid_key:
+            self.high_keys["tau_label_valid"] = str(tau_valid_key)
         self.h5_high_fields.setdefault(
             "action", self.data_config.get("h5_action_field", "teleop/q_cmd")
         )
@@ -333,6 +336,29 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
             {key: key for key in self.high_keys},
         )
         self.tau_label_valid = None
+        if "tau_label_valid" in self.high_tensors:
+            mask = self.high_tensors["tau_label_valid"]
+            if mask.shape != (len(self.high_timestamps), 1) or ((mask != 0) & (mask != 1)).any():
+                raise ValueError("stored tau_label_valid must contain aligned binary [N,1] values")
+            self.tau_label_valid = mask[:, 0].bool()
+            if self.backend == "lerobot" and not self.generate_tau_ext:
+                import hashlib
+                import json
+                sources = []
+                for source in self.lerobot_source_specs:
+                    manifest_path = Path(source["root"])/"meta/world_model_timeline.json"
+                    if manifest_path.is_file():
+                        manifest = json.loads(manifest_path.read_text())
+                        if manifest.get("label_contract_sha256"):
+                            sources.append({"root": str(source["root"]),
+                                "export_label_contract_sha256": manifest["label_contract_sha256"],
+                                "teacher": manifest.get("torque_labels")})
+                if sources:
+                    contract = {"sources": sources, "metric": self.contact_gate_config.metric,
+                                "contact_threshold": self.contact_gate_config.contact_threshold,
+                                "precontact_duration_s": self.contact_gate_config.precontact_duration_s}
+                    self.tau_label_report = {"kind": "precomputed_torque_labels", **contract,
+                        "label_contract_sha256": hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()}
         if self.generate_tau_ext:
             from data_process.wm_tau_labels import generate_tau_labels
             generated, self.tau_label_report = generate_tau_labels(self)
@@ -1768,7 +1794,7 @@ class ContactWorldModelDataset(torch.utils.data.Dataset):
                 device=sample_device,
             )
         for key, values in self.high_tensors.items():
-            if key in {"action", "tau_ext"}:
+            if key in {"action", "tau_ext", "tau_label_valid"}:
                 continue
             sample[key] = values.index_select(0, history)
             sample[f"{key}_future"] = values.index_select(0, future)

@@ -15,6 +15,11 @@ class LatentContactWorldModelLoss:
         self.codec_contact_weight = float((config.get("codec") or {}).get("contact_weight", 1.0))
         self.contact_class_weights = (config.get("contact_gate") or {}).get("class_weights", [1.,1.,1.])
         self.contact_class_weights_is_auto = self.contact_class_weights == "auto"
+        sft = config.get("sft") or {}
+        self.sft_fm_weight = float(sft.get("lambda_fm", 1.0))
+        self.sft_reconstruction_weight = float(sft.get("lambda_reconstruction", 1.0))
+        if any(not math.isfinite(v) or v <= 0 for v in (self.sft_fm_weight, self.sft_reconstruction_weight)):
+            raise ValueError("SFT FM and reconstruction weights must be finite and positive")
         if any(not math.isfinite(v) or v < 0 for v in (self.lambda_free, self.codec_contact_weight)):
             raise ValueError("loss weights must be finite and nonnegative")
 
@@ -58,4 +63,16 @@ class LatentContactWorldModelLoss:
                        "free_auxiliary_contribution":(self.lambda_free*free).detach()}
 
     def __call__(self, out, batch):
+        if "reconstruction" in out:
+            return self.sft_loss(out, batch)
         return self.flow_loss(out, batch) if "flow_velocity_pred" in out else self.codec_loss(out, batch)
+
+    def sft_loss(self, out, batch):
+        flow, metrics = self.flow_loss(out, batch)
+        reconstruction, rec_metrics = self.codec_loss(out["reconstruction"], out.get("_prepared_batch", batch))
+        total = self.sft_fm_weight*flow+self.sft_reconstruction_weight*reconstruction
+        metrics.update({"sft_reconstruction_loss": reconstruction.detach(),
+                        "sft_reconstruction_contribution": (self.sft_reconstruction_weight*reconstruction).detach(),
+                        **{key.replace("codec_", "sft_"): value for key, value in rec_metrics.items() if key != "total_loss"},
+                        "total_loss": total.detach()})
+        return total, metrics

@@ -17,7 +17,7 @@ from model.pinn_model.latent_pretrained import convert_scale
 @torch.no_grad()
 def infer_physical(model, physical, *, num_samples=8, seed=1234):
     physical = {k:v.to(model.latent_mean.device) if torch.is_tensor(v) else v for k,v in physical.items()}
-    positions = model.grid.positions(history_ns=physical.get("history_timestamp_ns"),
+    positions = {} if model.learned_positions else model.grid.positions(history_ns=physical.get("history_timestamp_ns"),
         action_ns=physical.get("action_chunk_timestamp_ns"), future_horizon=model.external_future_horizon,
         history_horizon=model.external_history_horizon, action_start_offset=model.action_start_offset,
         history_valid=physical.get("history_real_mask"), action_indices=physical.get("action_chunk_index"),
@@ -34,7 +34,9 @@ def infer_physical(model, physical, *, num_samples=8, seed=1234):
     output = model.sample(batch, num_samples=num_samples, source_noise=noise)
     output.update({key:convert_scale(key,output[key+"_pred"].float(),model.wm_normalizer,inverse=True)
                    for key in ("q","tau")})
-    output["future_grid_positions"] = model.prepare_batch(batch)["future_grid_positions"]
+    output["future_grid_positions"] = (torch.arange(1, model.external_future_horizon+1, device=model.latent_mean.device)
+        .expand(physical["q"].shape[0], -1)[:, ::model.temporal_stride]
+        if model.learned_positions else model.prepare_batch(batch)["future_grid_positions"])
     # Keep the request anchor; inference completion does not redefine time zero.
     output["request_anchor_ns"] = physical["history_timestamp_ns"][:,-1] if "history_timestamp_ns" in physical else None
     output["request_anchor_grid_position"] = (physical["explicit_grid"]["anchor_grid_position"].to(model.latent_mean.device)

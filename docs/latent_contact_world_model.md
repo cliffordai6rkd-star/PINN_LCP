@@ -1,5 +1,263 @@
 # Latent LSTM CARS-WM
 
+## v2：条件 codec 与跨机械臂 SFT
+
+新网络通过 `model.family: latent_carswm_lstm_v2` 启用。现有 v1 配置和
+checkpoint 仍可加载；v1 的无条件 codec 不能直接作为 v2 的预训练权重，
+需要使用下述 v2 配置重新预训练。两版使用同一个独立 trainer 和离线推理入口。
+
+修改目标是让已知的当前状态直接参与物理量解码，为 latent 表达未来变化提供
+结构上的便利，再检验 Nero 多任务预训练是否提高目标机械臂的数据效率。
+状态旁路、冻结坐标和相同 latent 维数都不能证明 latent 已与机械臂动力学解耦。
+目前迁移要求相同关节数量和输入排列，不支持异构关节数量或自动关节语义对齐。
+
+### 网络分工
+
+```mermaid
+flowchart LR
+  H[历史 q / dq / delta_q / tau] --> C[三路条件 LSTM]
+  A[高层 action] --> C
+  C --> G[Latent Flow]
+  N[高斯噪声] --> G
+  H --> P[当前状态 MLP]
+  G --> Z[未来 latent]
+  Z --> D[条件 Decoder]
+  P --> D
+  H --> Q[当前 q]
+  D --> R[预测关节变化]
+  R --> O[未来 q]
+  Q --> O
+  D --> T[未来实测 tau / 接触概率]
+```
+
+保留原有 motion/tau/action 三路两层 LSTM 和完整 Flow 积分。新训练配置使用
+`model.temporal_position_encoding: contact_wm_learned_index`，与 `contact_wm`
+相同：历史 token 保持从旧到新的排列，共享可学习的 recency 索引
+`[L-1,...,0]`；action 与未来分别使用 `[0,...,K-1]`、`[0,...,H-1]` 的
+可学习位置表。三个训练任务统一为 100 Hz 的 50 帧历史、32 帧未来，
+25 Hz 的 8 个 native action。SFT 更新历史/action 位置表，冻结 Flow 使用
+的未来位置表。旧 `relative_grid_sinusoidal` 配置仍可加载；两种位置编码
+不混用 checkpoint。新索引编码不需要旧时间网格的量化及额外窗口筛选，
+状态/action 的选择仍沿用 `contact_wm` 的原始时间戳和 native action 契约。
+局部状态取历史最后一帧 `s_t=[q_t,dq_t,delta_q_t,tau_t]`；其中 `delta_q`
+仍表示跟踪误差，`tau_t` 仍是实测关节力矩。
+
+默认七关节、`latent_dim=128`、`local_state_dim=64` 时：
+
+```text
+P_decoder: s_t [B,28] -> Linear(28,128) -> SiLU -> Linear(128,64)
+E: [q_future-q_t, tau_future, contact_one_hot, P_codec(s_t)]
+   [B,H,81] -> Linear(81,128) -> SiLU -> Linear(128,128)
+D: [raw_latent, P_decoder(s_t)] [B,H,192]
+   -> 各自两层 MLP -> predicted_q_change(7), tau(7), contact_logits(3)
+q_pred = q_t + predicted_q_change
+```
+
+关节相减和残差相加均发生在同一套 WM 归一化尺度中，输出再统一反归一化。
+预测变化量以当前姿态为锚，不是相邻预测帧之间的增量。局部特征沿未来时间轴
+和采样轴广播，`decode(raw_latent, batch)` 支持 `[B,H,D]` 和 `[B,S,H,D]`；
+v2 必须传入观测历史。`sample()` / `predict()` 自动传入历史，不需要未来标签。
+
+### 固定目标 latent 的坐标
+
+codec 训练时，未来 Encoder 和 Decoder 共用可训练的 `local_state_encoder`。
+codec 完成后，`snapshot_target_encoder()` 把它复制到冻结的
+`target_state_encoder`，同时保存 `codec_normalizer`。以后 FM 目标始终使用
+`future_encoder + target_state_encoder + codec_normalizer + latent_mean/std`。
+
+SFT 可以更新 Decoder 使用的 `local_state_encoder`，但不能更新上述目标路径。
+目标数据先从目标 WM 尺度还原为物理量，再转入预训练 codec 的尺度，然后
+计算相对 q 和局部特征。Decoder 则继续读取目标 WM 尺度，学习目标机械臂的
+输出接口。两个 normalizer 都保存在 checkpoint 中；目标统计量仍只由目标
+训练 episode 拟合。SFT 支持 gaussian、limit 或未归一化的数据，拒绝有截断
+信息损失的 quantile 输入。
+
+### 三个训练阶段
+
+| 阶段 | 更新的模块 | 固定的模块 | 损失 |
+| --- | --- | --- | --- |
+| codec | 未来 Encoder、局部状态 MLP、三个 Decoder | 条件 LSTM、Flow | q/tau 重建 MSE + 接触 CE |
+| flow | 条件 LSTM、Flow、可选 free-tau 辅助头 | 整套 codec、目标状态快照、latent 统计量 | latent FM + 可选 free 辅助损失 |
+| sft / frozen | 条件 LSTM、Decoder 局部状态 MLP、三个 Decoder、可选辅助头 | Flow、未来 Encoder、目标状态快照、latent 统计量 | 目标域 FM + 真实 latent 重建 |
+| sft / adapter | 同上，加低秩速度适配器 | 同上，Flow 基础参数保持固定 | 同上 |
+
+SFT 默认 `lambda_fm=1`、`lambda_reconstruction=1`。重建使用冻结 Encoder
+产生的真实目标 latent，不把随机生成的多种未来都用 MSE 拉向同一条录制轨迹。
+冻结 Flow 使用参数 `requires_grad=False`，仍保留计算图，让 FM 梯度经过
+Flow 回传到条件 LSTM。`sft.train_motion_encoder` 默认 true；如果配置了 NEXT
+运动编码器，SFT 可以更新它，输入仍经过嵌入的 NEXT normalizer 转换。设为
+false 则冻结 motion LSTM，无论其初始化来自 NEXT 还是从头训练。
+
+`sft.flow_mode: adapter` 使用零初始化的低秩速度残差：
+`v = v_base + W_up W_down flow_features`。默认 rank=8，128 维隐藏特征和
+128 维 latent 时仅增加 2048 个可训练参数。它不是逐层 LoRA；它保留基础
+Flow 权重，在输出速度场上增加可训练修正。codec/flow 预训练阶段适配器冻结
+且输出为零；SFT 初始速度场与预训练一致。
+
+### 配置与运行
+
+新增配置位于 `config/train_cfg/latent_wm/`：
+
+- `nero_pretrain_all.yaml`：四个 Nero 数据源共用一个 codec 和 Flow；读取
+  `data/nero_data/` 下四个新的 100 Hz WM LeRobot v3 数据集。
+- `xarm_peel_cucumber_sft.yaml` / `xarm_erase_board_sft.yaml`：读取当前
+  `data/xarm_co_v3/` 数据及已有离线力矩教师，默认冻结 Flow、训练目标接口。
+
+新配置继承当前 xArm 的加载器滤波设置，Nero 使用同样的设置；原始源中已
+施加的滤波仍由各自元数据描述。归一化转换不能消除滤波差异。迁移允许 action
+坐标系及语义从 Nero 改为 xArm 的声明，保存原/目标契约供检查；相同维数不
+表示不同坐标系或 action 语义已经对齐，这部分需要条件接口通过目标数据学习。
+
+Nero 数据由 `scripts/prepare_nero_wm_data.py` 从 `../nero_ws/runs/` 的
+`insert_usb`、`push_button`、`cuccumber_peeling`、`wipe_board` 原始 H5 转换。
+100 Hz 状态保留原始帧和时间戳；25 Hz action 使用真实腕部相机时间戳，采样
+该时刻已下发的命令，再保持到后续状态帧。保存每帧真实 `observation.q_cmd`，
+`delta_q=q_cmd-q_follower`，与 held `action.joint` 分开。新导出不增加低通滤波，
+WM 输入滤波由训练加载器执行。当前速度记录已经修正为关节坐标，不再翻转符号。
+
+冻结力矩教师固定为
+`outputs/tau_free_sequence/nero/epoch_124_val_tau_mse_nm2_0.005756.pt` 的 `model`
+快照，使用其完整网络和归一化参数，不沿用 H5 中旧的残差字段。每个独立
+episode/连续段取原始状态的偶数帧构成 50 Hz、25 帧的真实历史，教师预测
+再对齐至原始 100 Hz 时间戳。`tau_ext=tau_measured-tau_free`。本次 Nero 标注
+使用 L1 阈值 1 Nm；严格大于阈值为 contact，每段 contact 起点前
+1 秒为 alignment，contact 优先，episode/断流/未知区间截断标注。
+
+保存 `observation.tau_free`、`observation.tau_ext`、`observation.contact_phase`
+和 `observation.tau_label_valid`。教师最初约 0.48 秒没有完整历史，phase=-1、
+valid=0；不是 free。设置 `dataloader.tau_label_valid_key` 后，两种 WM 加载器
+都会排除未知未来，未知历史也不能用于 free 辅助监督。新预训练配置已设置
+该字段；预计算教师和标签契约纳入训练 checkpoint 的数据契约。
+
+每个数据集的 `meta/wm_validation.json` 记录逐行验证结果，
+`meta/torque_label_report.json` 记录教师 SHA256、标注规则及各轨迹类别数量。
+转换先写入暂存目录，四个任务全部验证成功后再替换；原视觉 v3 目录移动到
+独立备份目录。可从项目根目录重建：
+
+```bash
+.conda-env/bin/python -m scripts.prepare_nero_wm_data --replace
+```
+
+已有 `tau_ext` 的数据可以通过
+`.conda-env/bin/python -m scripts.relabel_nero_contact --threshold 1` 重新标注。
+该工具保留力矩教师输出和所有非标签列，更新接触标签、episode/global 统计、
+数据契约，并备份之前的标签版本。xArm 保持教师标定的 11.705677733654019 Nm。
+
+### 一次启动三个训练任务
+
+入口是 `scripts/train_latent_wm_pretrain_sft.sh`。Nero 预训练是一个进程内部
+顺序执行 codec 和 Flow，结束并核对最终 checkpoint 后，两项 xArm SFT
+同时启动，各自加载同一个固定的预训练 EMA 快照。
+
+| 任务/阶段 | 实际/有效 batch | 峰值学习率 | optimizer 更新步数 |
+| --- | --- | --- | --- |
+| Nero codec | 256 | 3e-4 | 20,000 |
+| Nero Flow | 256 | 1e-4 | 250,000 |
+| xArm 削黄瓜 SFT | 128 | 3e-5 | 50,000 |
+| xArm 擦板 SFT | 128 | 3e-5 | 50,000 |
+
+梯度累积为 1。共同设置：AdamW、weight decay 1e-4、梯度裁剪 1.0、BF16，
+500 步 warmup 后 cosine 降到 1e-6。codec 的 `codec.lr` 独立于 Flow 的
+`train.lr`，阶段切换会重建 optimizer/scheduler。验证按 episode 划分 5%，
+seed=42；三阶段采样权重固定 `[1,5,5]`，对应 free/alignment/contact。
+两项 SFT 的 FM 与真实 latent 重建系数均为 1，严格冻结 Flow、目标未来
+Encoder、目标状态快照与 latent 统计量；不启用低秩适配实验。
+
+```bash
+# 只检查数据、生成实际配置及参数计划，不运行训练
+bash scripts/train_latent_wm_pretrain_sft.sh --dry-run
+
+# 一个 Nero 预训练进程完成后，两个 SFT 进程并行；默认都使用 cuda:0
+bash scripts/train_latent_wm_pretrain_sft.sh
+
+# 如需把两个 SFT 也按顺序执行
+SFT_PARALLEL=0 bash scripts/train_latent_wm_pretrain_sft.sh
+
+# 有多张 GPU 时，可以分别指定
+PRETRAIN_DEVICE=cuda:0 PEEL_DEVICE=cuda:0 ERASE_DEVICE=cuda:1 \
+  bash scripts/train_latent_wm_pretrain_sft.sh
+```
+
+默认根目录是 `outputs/latent_wm_v2/nero_pretrain_xarm_sft`；可通过
+`LATENT_RUN_ROOT` 修改。目录包含实际 YAML 配置、`pipeline_plan.json`、
+`nero_all/`、`xarm_peel_cucumber/`、`xarm_erase_board/`，每项任务各有
+`train.log`、`status.json` 和 checkpoint。共享预训练权重在
+`shared/pretrained_for_sft.pt`，其 SHA256 记录在同名 JSON 中。
+
+脚本核对完成状态、optimizer 步数、codec 状态、位置编码、最终验证和
+checkpoint 配置，确认预训练完成后才启动 SFT。已经完成的任务验证后跳过，
+未完成的任务自动 `--resume`；同一个 run root 的参数变化会被拒绝，避免
+混合实验。失败或中断会给其余训练子进程发送 TERM，让 trainer 保存恢复点。
+`flock` 防止重复启动。默认单卡也启动两个 SFT 进程，实际吞吐应根据运行
+日志判断；需要不同设备或较小 batch 时可调整脚本环境变量。
+
+可用环境变量为 `PYTHON`、`LATENT_RUN_ROOT`、`PRETRAIN_DEVICE`、
+`PEEL_DEVICE`、`ERASE_DEVICE`、`PRETRAIN_BATCH_SIZE`、`SFT_BATCH_SIZE`、
+`CODEC_STEPS`、`PRETRAIN_STEPS`、`SFT_STEPS`、`SFT_PARALLEL`、`WANDB_MODE`。
+步数缩小时 warmup 自动缩短；正常预算仍使用表中的 500 步。设置
+`WANDB_MODE=offline` 或 `disabled` 可进行本地运行。
+
+从项目根目录运行：
+
+```bash
+# 全部 Nero：条件 codec -> Flow
+.conda-env/bin/python -m train.trainer.latent_contact_world_model_train \
+  --config config/train_cfg/latent_wm/nero_pretrain_all.yaml
+
+# xArm 目标任务：默认冻结 Flow
+.conda-env/bin/python -m train.trainer.latent_contact_world_model_train \
+  --config config/train_cfg/latent_wm/xarm_peel_cucumber_sft.yaml
+
+# 同一预训练模型，允许低秩速度修正
+.conda-env/bin/python -m train.trainer.latent_contact_world_model_train \
+  --config config/train_cfg/latent_wm/xarm_peel_cucumber_sft.yaml \
+  --flow-adaptation adapter \
+  --output-dir outputs/latent_wm_v2/xarm_peel_cucumber_sft_adapter
+
+# 同一目标数据和新网络，从头训练 codec + Flow 的对照
+.conda-env/bin/python -m train.trainer.latent_contact_world_model_train \
+  --config config/train_cfg/latent_wm/xarm_peel_cucumber_sft.yaml --stage all \
+  --output-dir outputs/latent_wm_v2/xarm_peel_cucumber_scratch
+```
+
+`--pretrained-checkpoint /path/to/checkpoint.pt` 可替换预训练来源。SFT 初始化
+只加载模型、codec 和统计量，重置 optimizer、EMA、目标训练步数；`--resume`
+则严格恢复目标数据划分、归一化、SFT 模式/损失、optimizer、EMA、RNG 和
+batch 游标，不再打开原预训练权重或原 NEXT 文件。新的输出目录为
+`outputs/latent_wm_v2/`。预算是起始实验设置，不是收敛保证；比较时应报告
+codec、预训练 Flow 和目标 SFT 各自训练预算。
+
+### 迁移诊断
+
+SFT 启动保存 `sft_initial_reconstruction.json`，先查看固定 Nero Encoder
+在目标数据上的信息保留情况。训练记录同时包含 `latent_fm_loss`、
+`sft_reconstruction_loss`、`sft_q_mse`、`sft_tau_mse` 及接触重建项。
+源/目标模型契约和选用的 raw/EMA 快照记录在 `transfer.json`。
+
+新配置设置 `probabilistic_validation.per_task_max_batches: 2`，按数据源
+分别分配积分采样预算，覆盖所有有验证窗口的任务；这个设置覆盖全局
+`max_batches`。FM 和 codec 重建仍遍历全部验证数据。验证同时输出
+`task_<source_index>_*` 物理误差、接触分类及窗口数。现有 contact-phase
+采样和 importance correction 保留；当前没有新增任务上下文 token 或按任务
+等量采样，未观测到的环境差异仍可能体现为条件分布中的多种未来。
+
+`latent_ablation: true` 额外固定观测历史和局部状态，分别把标准化 latent
+置零（raw latent 替换为均值）及在 batch 窗口间循环打乱，再通过同一个
+Decoder 解码。比较 `q_physical_rmse` / `tau_physical_rmse` 与
+`latent_zero_*` / `latent_shuffled_*`，以及对应 contact CE；只有一个窗口
+时跳过打乱项。性能没有明显变化时，应检查 Decoder 是否过度依赖状态旁路。
+这些诊断覆盖积分采样的验证子集；需要自然分布上的完整验证时，设置
+`per_task_max_batches: 0`、`max_batches: 0`。
+
+测试覆盖条件 codec 梯度、残差尺度、冻结 Flow 后的梯度回传、目标 latent
+稳定性、不同 normalizer 的坐标转换、低秩更新、无未来标签采样、跨 horizon
+迁移、两种 SFT 模式的真实 CPU optimizer 更新及精确断点恢复。另有 CUDA
+BF16 测试覆盖默认 128 维网络的 codec/Flow/SFT 前向、反向、冻结参数及
+仅条件采样，无 CUDA 时跳过。它们验证实现行为，不能替代真实 Nero/xArm
+训练和迁移效果的对照实验。
+
+## v1：已有实现与兼容入口
+
 Independent family/version `latent_carswm_lstm_v1`, branch
 `feat/latent-carswm-lstm-grid`. The original WM model, trainer, configuration
 files keep separate architecture and training stages. Both WM families now share

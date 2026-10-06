@@ -18,6 +18,17 @@ class LatentContactWorldModelDataset(ContactWorldModelDataset):
         super().__init__(config, normalizer=normalizer, compute_normalizer=False)
         self.sample_rate_hz = float(self.high_fps)
         self.grid = RelativeTimeGrid.from_config(config)
+        self.learned_positions = (config.get("model") or {}).get("temporal_position_encoding") == "contact_wm_learned_index"
+        if self.learned_positions:
+            # Native action/state selection remains the Contact WM contract.
+            # Learned sequence indices do not require quantized timestamp PE.
+            self.grid_audit = {"policy": "contact_wm_learned_index", "original_windows": len(self.valid_indices),
+                "retained_windows": len(self.valid_indices), "invalid_windows": 0, "episodes": [],
+                "contract": {"position_encoding": "contact_wm_learned_index", "state_rate_hz": self.high_fps,
+                             "action_rate_hz": self.expert_fps, "timestamp_selection": "native_contact_wm"}}
+            if compute_normalizer:
+                self.fit_normalizer(range(len(self)))
+            return
         policy = self.data_config.get("grid_invalid_window_policy", "error")
         if policy not in {"error", "drop"}:
             raise ValueError("grid_invalid_window_policy must be error or drop")
@@ -66,6 +77,8 @@ class LatentContactWorldModelDataset(ContactWorldModelDataset):
 
     def _build_sample(self, high_idx):
         sample = super()._build_sample(high_idx)
+        if self.learned_positions:
+            return sample
         # History validity in the original dataset also encodes contact-label
         # availability; grid padding validity is only about actual rows.
         episode = self._episode_for_index(high_idx)

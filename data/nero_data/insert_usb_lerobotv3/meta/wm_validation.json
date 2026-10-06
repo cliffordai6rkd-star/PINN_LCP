@@ -1,0 +1,16 @@
+{
+  "episodes": 200,
+  "frames": 221805,
+  "fps": 100,
+  "action_fps": 25,
+  "phase_counts": {
+    "-1": 9071,
+    "0": 9713,
+    "1": 94921,
+    "2": 108100
+  },
+  "label_contract_sha256": "c8f4901d0f9f600bce30e5a1a5593148ace079315f140d445480740edaa81f50",
+  "validation": "all_rows_passed",
+  "contact_threshold": 1.0,
+  "relabel_validation": "all_rows_passed_other_columns_unchanged"
+}

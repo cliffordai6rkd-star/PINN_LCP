@@ -1,0 +1,114 @@
+{
+  "schema_version": 3,
+  "mode": "raw_lowdim_action_hold",
+  "row_sampling": "action_labeled_raw_state_index",
+  "nominal_lerobot_fps": 100,
+  "state_timestamp_path": "teleop/timestamp_us",
+  "action_anchor_timestamp_path": "cameras/wrist/timestamp_us",
+  "action_fps": 25,
+  "action_anchor_mode": "recorded_camera",
+  "action_fps_validation": "median_camera_period_within_10_percent",
+  "action_anchor_grid": "recorded_camera_timestamps",
+  "action_sampling": "previous_expert_label",
+  "action_stride_frames": null,
+  "action_upsampling": "zoh_previous_camera_anchor",
+  "action_contract": "high_level_expert_camera_snapshot_v1",
+  "unlabeled_state_rows": "drop",
+  "action_update_key": "timing.action_update",
+  "feature_filters": {},
+  "action_fk": null,
+  "nonfinite_episode_policy": "error",
+  "excluded_episodes": [],
+  "torque_labels": {
+    "checkpoint": "/mnt/code/lcx/PINN/outputs/tau_free_sequence/nero/epoch_124_val_tau_mse_nm2_0.005756.pt",
+    "checkpoint_sha256": "035084df420f3c7a435ffbed06f536638870280d872013ce8bb51619278c9df5",
+    "snapshot": "model",
+    "model": {
+      "architecture": "lstm",
+      "inputs": [
+        "q",
+        "dq",
+        "delta_q"
+      ],
+      "target_key": "tau",
+      "output_dim": 7,
+      "history_mode": "stateless_sliding_window"
+    },
+    "sample_rate_hz": 50.0,
+    "history_horizon": 25,
+    "history_mode": "stateless_sliding_window",
+    "normalization": {
+      "eps": 1e-06,
+      "normalize_mode": "gaussian",
+      "normalize_lowdim_keys": [
+        "q",
+        "dq",
+        "delta_q",
+        "tau"
+      ]
+    },
+    "filters": {
+      "q": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "dq": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "delta_q": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "tau": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      }
+    },
+    "input_sampling": "every_second_raw_100hz_frame_episode_local",
+    "prediction_alignment": "linear_50hz_to_raw_timestamps_with_last_prediction_held_at_tail",
+    "residual": "tau_measured_minus_tau_free",
+    "warmup": "invalid_until_first_complete_history",
+    "velocity": "recorded_sign_corrected_velocity_no_additional_sign_flip"
+  },
+  "contact_labels": {
+    "metric": "sum_abs_tau_ext_nm",
+    "contact_threshold": 1.0,
+    "comparison": ">",
+    "alignment": "one_second_preceding_each_contact_onset_contact_takes_priority",
+    "precontact_duration_s": 1.0,
+    "classes": {
+      "-1": "unknown_context",
+      "0": "free",
+      "1": "alignment",
+      "2": "contact"
+    }
+  },
+  "tau_label_valid_key": "observation.tau_label_valid",
+  "contact_phase_key": "observation.contact_phase",
+  "label_contract_sha256": "951610277a7f844c58d978b29a0e98b181e796a7ebe308a3328756afa656af83"
+}

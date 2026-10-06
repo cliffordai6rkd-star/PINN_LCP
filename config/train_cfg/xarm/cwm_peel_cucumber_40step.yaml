@@ -11,7 +11,7 @@ train_data:
   sources:
     - name: peel_cucumber
       repo_id: peel_cucumber_lerobot_v3
-      root: ../../../data/xarm_co_v3/peel_cucumber_v3
+      root: data/xarm_co_v3/peel_cucumber_v3
 
 action_contract:
   semantic: expert_policy_action_target
@@ -23,6 +23,13 @@ action_contract:
   absolute_or_relative: absolute
 
 dataloader:
+  tau_ext_generation:
+    enabled: true
+    checkpoint: outputs/tau_free_sequence/xarm_offline_teacher/model.pt
+    cache_dir: outputs/cache/wm_tau_labels
+    device: cpu
+    threads: 2
+    force_rebuild: false
   backend: lerobot
   v3_only: true
 
@@ -53,9 +60,10 @@ dataloader:
     cached_policy_action_probability: 0.0
 
   filters:
-    q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 1}]}
+    # Export metadata records filtering only for dq/tau; q/delta_q are raw.
+    q: {enabled: true, source_already_filtered: false, operations: [{type: lowpass, cutoff_hz: 15.0, order: 1}]}
     dq: {enabled: true, source_already_filtered: false, operations: [{type: lowpass, cutoff_hz: 15.0, order: 1}]}
-    delta_q: {enabled: true, source_already_filtered: true, operations: [{type: lowpass, cutoff_hz: 15.0, order: 1}]}
+    delta_q: {enabled: true, source_already_filtered: false, operations: [{type: lowpass, cutoff_hz: 15.0, order: 1}]}
     tau: {enabled: true, source_already_filtered: false, operations: [{type: lowpass, cutoff_hz: 15.0, order: 1}]}
   filter_timestamp_unit: ns
 
@@ -68,7 +76,8 @@ contact_gate:
   metric: tau_ext_l1
   tau_ext_source: tau_measured_minus_tau_free
   precontact_duration_s: 1.0
-  contact_threshold: 1.5
+  # Calibrated L1 threshold of the configured frozen torque teacher.
+  contact_threshold: 11.705677733654019
   class_weights: [1.0, 1.0, 1.0]
 
 model:
@@ -196,7 +205,7 @@ train:
     denormalize_for_plot: true
     wrist_joint_index: 5
     plot_ranges: {}
-  output_dir:  outputs/cwm_teacher_policy/xarm_peel_cucumber_40step
+  output_dir:  outputs/xarm/singletask/xarm_peel_cucumber_40step
   monitor_key: val_loss
   top_k: 8
   save_latest_checkpoint: true

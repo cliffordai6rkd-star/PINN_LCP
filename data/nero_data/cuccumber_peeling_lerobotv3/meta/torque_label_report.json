@@ -1,0 +1,1911 @@
+{
+  "task": "cucumber_peeling",
+  "source": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling",
+  "teacher": {
+    "checkpoint": "/mnt/code/lcx/PINN/outputs/tau_free_sequence/nero/epoch_124_val_tau_mse_nm2_0.005756.pt",
+    "checkpoint_sha256": "035084df420f3c7a435ffbed06f536638870280d872013ce8bb51619278c9df5",
+    "snapshot": "model",
+    "model": {
+      "architecture": "lstm",
+      "inputs": [
+        "q",
+        "dq",
+        "delta_q"
+      ],
+      "target_key": "tau",
+      "output_dim": 7,
+      "history_mode": "stateless_sliding_window"
+    },
+    "sample_rate_hz": 50.0,
+    "history_horizon": 25,
+    "history_mode": "stateless_sliding_window",
+    "normalization": {
+      "eps": 1e-06,
+      "normalize_mode": "gaussian",
+      "normalize_lowdim_keys": [
+        "q",
+        "dq",
+        "delta_q",
+        "tau"
+      ]
+    },
+    "filters": {
+      "q": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "dq": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "delta_q": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "tau": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      }
+    },
+    "input_sampling": "every_second_raw_100hz_frame_episode_local",
+    "prediction_alignment": "linear_50hz_to_raw_timestamps_with_last_prediction_held_at_tail",
+    "residual": "tau_measured_minus_tau_free",
+    "warmup": "invalid_until_first_complete_history",
+    "velocity": "recorded_sign_corrected_velocity_no_additional_sign_flip"
+  },
+  "state_fps": 100,
+  "action_fps": 25,
+  "phase_rule": {
+    "metric": "sum_abs_tau_ext_nm",
+    "contact_threshold": 1.0,
+    "comparison": ">",
+    "alignment": "one_second_preceding_each_contact_onset_contact_takes_priority",
+    "precontact_duration_s": 1.0,
+    "classes": {
+      "-1": "unknown_context",
+      "0": "free",
+      "1": "alignment",
+      "2": "contact"
+    }
+  },
+  "episodes": [
+    {
+      "episode_index": 0,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0001_20260822_191853.h5",
+      "raw_rows": 1230,
+      "retained_rows": 1228,
+      "phase_counts": {
+        "-1": 46,
+        "0": 331,
+        "1": 420,
+        "2": 431
+      },
+      "label_sha256": "ef95957ee30187959f070e1cc8ee854339651d9cd0a0720884246316a43cbdf9"
+    },
+    {
+      "episode_index": 1,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0006_20260822_192251.h5",
+      "raw_rows": 1238,
+      "retained_rows": 1236,
+      "phase_counts": {
+        "-1": 46,
+        "0": 510,
+        "1": 261,
+        "2": 419
+      },
+      "label_sha256": "9b81d4e2cd0513769cc65b2be6afd1b270210a36d3c39bb53c56b42ed64c5414"
+    },
+    {
+      "episode_index": 2,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0007_20260822_192316.h5",
+      "raw_rows": 1263,
+      "retained_rows": 1261,
+      "phase_counts": {
+        "-1": 46,
+        "0": 481,
+        "1": 230,
+        "2": 504
+      },
+      "label_sha256": "c33e749dca1e2a9a06f10532678c4347d5603b2c4fcef913b45f4fb48c0c548b"
+    },
+    {
+      "episode_index": 3,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0008_20260822_192417.h5",
+      "raw_rows": 1313,
+      "retained_rows": 1310,
+      "phase_counts": {
+        "-1": 45,
+        "0": 327,
+        "1": 295,
+        "2": 643
+      },
+      "label_sha256": "85440a6a8b067bfa724d6864f9bb5a894d2bf774678f6fd5107620414f7461e2"
+    },
+    {
+      "episode_index": 4,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0012_20260822_192626.h5",
+      "raw_rows": 1276,
+      "retained_rows": 1275,
+      "phase_counts": {
+        "-1": 47,
+        "0": 321,
+        "1": 274,
+        "2": 633
+      },
+      "label_sha256": "100de8fcb0e408ec48d3b1b2f63a94b89c8cf072273d79e63abdddbcf4bcb356"
+    },
+    {
+      "episode_index": 5,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0013_20260822_192651.h5",
+      "raw_rows": 1536,
+      "retained_rows": 1532,
+      "phase_counts": {
+        "-1": 44,
+        "0": 165,
+        "1": 535,
+        "2": 788
+      },
+      "label_sha256": "90b3adb776b1bbc82457203a31d7db11f1addb229336738fc45b8f5defabb9de"
+    },
+    {
+      "episode_index": 6,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0014_20260822_192714.h5",
+      "raw_rows": 1100,
+      "retained_rows": 1096,
+      "phase_counts": {
+        "-1": 44,
+        "0": 257,
+        "1": 423,
+        "2": 372
+      },
+      "label_sha256": "d1295d4b1fdc4fecb516e2859d8a2f18715961d13c30a2de6608bc546bbb2615"
+    },
+    {
+      "episode_index": 7,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0015_20260822_192739.h5",
+      "raw_rows": 1278,
+      "retained_rows": 1274,
+      "phase_counts": {
+        "-1": 44,
+        "0": 285,
+        "1": 518,
+        "2": 427
+      },
+      "label_sha256": "c1a9bcd08e71438343689788cff24145eb6488dbff28b6802bfcf299f28e12e1"
+    },
+    {
+      "episode_index": 8,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0016_20260822_193001.h5",
+      "raw_rows": 1254,
+      "retained_rows": 1252,
+      "phase_counts": {
+        "-1": 46,
+        "0": 406,
+        "1": 536,
+        "2": 264
+      },
+      "label_sha256": "63e5694f56bb6943b53b8ee4326129aef96a6c4cec8cb73843ecda332daf56c8"
+    },
+    {
+      "episode_index": 9,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0017_20260822_193029.h5",
+      "raw_rows": 1295,
+      "retained_rows": 1293,
+      "phase_counts": {
+        "-1": 46,
+        "0": 426,
+        "1": 565,
+        "2": 256
+      },
+      "label_sha256": "5fd899f78e23e525b3037c76e9c6f90b4ceb56524d62955442bec5c36095ad96"
+    },
+    {
+      "episode_index": 10,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0018_20260822_193049.h5",
+      "raw_rows": 1247,
+      "retained_rows": 1246,
+      "phase_counts": {
+        "-1": 47,
+        "0": 491,
+        "1": 353,
+        "2": 355
+      },
+      "label_sha256": "2c1ed00ca258971b84cb807ab311464cc944c0701c37b2d1ce4f40020e968e64"
+    },
+    {
+      "episode_index": 11,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0019_20260822_193111.h5",
+      "raw_rows": 1264,
+      "retained_rows": 1262,
+      "phase_counts": {
+        "-1": 46,
+        "0": 640,
+        "1": 426,
+        "2": 150
+      },
+      "label_sha256": "0f5df7d94c9addbda82ba3eb1dd703edc8d54a5f1bf74dddaf6b8598834eaee3"
+    },
+    {
+      "episode_index": 12,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0020_20260822_193141.h5",
+      "raw_rows": 1082,
+      "retained_rows": 1080,
+      "phase_counts": {
+        "-1": 46,
+        "0": 435,
+        "1": 535,
+        "2": 64
+      },
+      "label_sha256": "b26b31c7ab21e792efc9a15cc6d7f892392c31f6927e6794a34234a62e61535b"
+    },
+    {
+      "episode_index": 13,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0021_20260822_193220.h5",
+      "raw_rows": 1377,
+      "retained_rows": 1373,
+      "phase_counts": {
+        "-1": 44,
+        "0": 270,
+        "1": 713,
+        "2": 346
+      },
+      "label_sha256": "2580b8ee4dd4d94cb400bcd679b58df9d88b131598cd8b57aa234cf417f7e122"
+    },
+    {
+      "episode_index": 14,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0022_20260822_193239.h5",
+      "raw_rows": 959,
+      "retained_rows": 955,
+      "phase_counts": {
+        "-1": 44,
+        "0": 402,
+        "1": 259,
+        "2": 250
+      },
+      "label_sha256": "1a1ccac0ca715b605c8c4060da8fb3bf47570ffe5b9e6f8c7b08d8611f780005"
+    },
+    {
+      "episode_index": 15,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0023_20260822_193258.h5",
+      "raw_rows": 1260,
+      "retained_rows": 1259,
+      "phase_counts": {
+        "-1": 47,
+        "0": 456,
+        "1": 452,
+        "2": 304
+      },
+      "label_sha256": "57c93fadd36890f12e8946cd34ea3248f7cb1921c6a210af1d322b521cc54996"
+    },
+    {
+      "episode_index": 16,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0024_20260822_193351.h5",
+      "raw_rows": 1308,
+      "retained_rows": 1306,
+      "phase_counts": {
+        "-1": 46,
+        "0": 490,
+        "1": 409,
+        "2": 361
+      },
+      "label_sha256": "c78c8586e694946a2b9394b14e01ec8c9ce26601f15bde89dc513f53f41071be"
+    },
+    {
+      "episode_index": 17,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0025_20260822_193418.h5",
+      "raw_rows": 1213,
+      "retained_rows": 1212,
+      "phase_counts": {
+        "-1": 47,
+        "0": 460,
+        "1": 470,
+        "2": 235
+      },
+      "label_sha256": "46f2d299182bfa447e8845eb5b7e8303a66ea2b3364c09e20b035c8e30406106"
+    },
+    {
+      "episode_index": 18,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0026_20260822_193458.h5",
+      "raw_rows": 1282,
+      "retained_rows": 1281,
+      "phase_counts": {
+        "-1": 47,
+        "0": 667,
+        "1": 222,
+        "2": 345
+      },
+      "label_sha256": "e36752ec250b5cbe97378c01e7d5b7f693ca87091117a064c247dbb3b97ff65e"
+    },
+    {
+      "episode_index": 19,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0027_20260822_193519.h5",
+      "raw_rows": 1369,
+      "retained_rows": 1367,
+      "phase_counts": {
+        "-1": 46,
+        "0": 443,
+        "1": 490,
+        "2": 388
+      },
+      "label_sha256": "737d127e8c8662c8237669c828752a5b5166873ba7054b231e0f0713b6ea718d"
+    },
+    {
+      "episode_index": 20,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0028_20260822_193541.h5",
+      "raw_rows": 1301,
+      "retained_rows": 1298,
+      "phase_counts": {
+        "-1": 45,
+        "0": 248,
+        "1": 626,
+        "2": 379
+      },
+      "label_sha256": "b9acb5babb5c7349ca557db49cd9c217d27900a8c92ec326635fed53bf80883e"
+    },
+    {
+      "episode_index": 21,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0029_20260822_193559.h5",
+      "raw_rows": 1092,
+      "retained_rows": 1090,
+      "phase_counts": {
+        "-1": 46,
+        "0": 412,
+        "1": 323,
+        "2": 309
+      },
+      "label_sha256": "5e1d605936dd4d718bde8653c11da69a4121516a3a7c432994488cdf077fe284"
+    },
+    {
+      "episode_index": 22,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0030_20260822_193620.h5",
+      "raw_rows": 1061,
+      "retained_rows": 1060,
+      "phase_counts": {
+        "-1": 47,
+        "0": 206,
+        "1": 544,
+        "2": 263
+      },
+      "label_sha256": "e29f40f3b376d31a48bad68f3f33087b6cc617ffd454719fbef31d84f3397295"
+    },
+    {
+      "episode_index": 23,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0031_20260822_193638.h5",
+      "raw_rows": 1134,
+      "retained_rows": 1130,
+      "phase_counts": {
+        "-1": 44,
+        "0": 230,
+        "1": 619,
+        "2": 237
+      },
+      "label_sha256": "0208fdbc54be665ad066a9358a40b43b628ab1054beeb1a688693d14e4bc2d25"
+    },
+    {
+      "episode_index": 24,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0032_20260822_193703.h5",
+      "raw_rows": 997,
+      "retained_rows": 995,
+      "phase_counts": {
+        "-1": 46,
+        "0": 309,
+        "1": 384,
+        "2": 256
+      },
+      "label_sha256": "5d7d5dd17ccaf490b77ef441360c00330014913001865be9ff7d218bbd19a6f8"
+    },
+    {
+      "episode_index": 25,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0033_20260822_193722.h5",
+      "raw_rows": 1060,
+      "retained_rows": 1056,
+      "phase_counts": {
+        "-1": 44,
+        "0": 339,
+        "1": 392,
+        "2": 281
+      },
+      "label_sha256": "fc2b279dae50316ec5b3f677892ab55cd6519c5d57d0b20a6ff6f413043c28f9"
+    },
+    {
+      "episode_index": 26,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0034_20260822_193810.h5",
+      "raw_rows": 1080,
+      "retained_rows": 1077,
+      "phase_counts": {
+        "-1": 45,
+        "0": 339,
+        "1": 397,
+        "2": 296
+      },
+      "label_sha256": "e153ba0f4722384ef894629ed1f909f2e2ff673e6b2991ffd1e051e4a10df21e"
+    },
+    {
+      "episode_index": 27,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0035_20260822_193830.h5",
+      "raw_rows": 1121,
+      "retained_rows": 1119,
+      "phase_counts": {
+        "-1": 46,
+        "0": 248,
+        "1": 526,
+        "2": 299
+      },
+      "label_sha256": "0acd919311222525f8a9b26466d192492e15a9770a0fff956c53fdfba1bcfa36"
+    },
+    {
+      "episode_index": 28,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0036_20260822_193848.h5",
+      "raw_rows": 1059,
+      "retained_rows": 1057,
+      "phase_counts": {
+        "-1": 46,
+        "0": 352,
+        "1": 413,
+        "2": 246
+      },
+      "label_sha256": "f7b28c0205f764cda87f8bcbe7b9d2d131172a6f066d090d42a9e3cdbf694af4"
+    },
+    {
+      "episode_index": 29,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0037_20260822_193930.h5",
+      "raw_rows": 983,
+      "retained_rows": 979,
+      "phase_counts": {
+        "-1": 44,
+        "0": 363,
+        "1": 307,
+        "2": 265
+      },
+      "label_sha256": "5b5532bfb7deb2dbaeefe4cfdd46a0cd05199158fd4617a93b8f9404f9fa4359"
+    },
+    {
+      "episode_index": 30,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0038_20260822_193947.h5",
+      "raw_rows": 1077,
+      "retained_rows": 1073,
+      "phase_counts": {
+        "-1": 44,
+        "0": 376,
+        "1": 365,
+        "2": 288
+      },
+      "label_sha256": "64abf19ab25a855e774a6f709a54d40a130fe34f7f32fa00a686325a7b12d3bb"
+    },
+    {
+      "episode_index": 31,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0039_20260822_194048.h5",
+      "raw_rows": 1066,
+      "retained_rows": 1065,
+      "phase_counts": {
+        "-1": 47,
+        "0": 289,
+        "1": 482,
+        "2": 247
+      },
+      "label_sha256": "1698095d15f75e947c770caaa852de90d6653ddbab674d1a7401baf2493320fb"
+    },
+    {
+      "episode_index": 32,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0040_20260822_194314.h5",
+      "raw_rows": 1385,
+      "retained_rows": 1384,
+      "phase_counts": {
+        "-1": 47,
+        "0": 210,
+        "1": 453,
+        "2": 674
+      },
+      "label_sha256": "1eae1bcae62bfd0278604e22fce5acd87cbb3a5473666ad119622b278366d132"
+    },
+    {
+      "episode_index": 33,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0041_20260822_194430.h5",
+      "raw_rows": 1456,
+      "retained_rows": 1452,
+      "phase_counts": {
+        "-1": 44,
+        "0": 281,
+        "1": 498,
+        "2": 629
+      },
+      "label_sha256": "8716cb1a817377e717e00d03d516738c888fac3afa3ca9d9e44cef3dece006f0"
+    },
+    {
+      "episode_index": 34,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0042_20260822_194458.h5",
+      "raw_rows": 1378,
+      "retained_rows": 1374,
+      "phase_counts": {
+        "-1": 44,
+        "0": 325,
+        "1": 410,
+        "2": 595
+      },
+      "label_sha256": "9bb535c2a67f22837d6b2852a2dc0fadee85d2adf56dbfa863436d9f23e7222f"
+    },
+    {
+      "episode_index": 35,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0043_20260822_194525.h5",
+      "raw_rows": 1363,
+      "retained_rows": 1359,
+      "phase_counts": {
+        "-1": 44,
+        "0": 209,
+        "1": 477,
+        "2": 629
+      },
+      "label_sha256": "0b2e16ce14e2a553b4822c0fb4119d9703f9825f6c861e263ec69b80490da697"
+    },
+    {
+      "episode_index": 36,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0044_20260822_194554.h5",
+      "raw_rows": 1296,
+      "retained_rows": 1293,
+      "phase_counts": {
+        "-1": 45,
+        "0": 181,
+        "1": 449,
+        "2": 618
+      },
+      "label_sha256": "657029beced397d31bfbf664e840e3bd3a099f6f696a317d06194abf567bf996"
+    },
+    {
+      "episode_index": 37,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0045_20260822_194627.h5",
+      "raw_rows": 1370,
+      "retained_rows": 1368,
+      "phase_counts": {
+        "-1": 46,
+        "0": 279,
+        "1": 418,
+        "2": 625
+      },
+      "label_sha256": "845116931e8994f70d45d50a726a410256e3aeb3b53682fcaf5b24f219df17b8"
+    },
+    {
+      "episode_index": 38,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0046_20260822_194838.h5",
+      "raw_rows": 1408,
+      "retained_rows": 1405,
+      "phase_counts": {
+        "-1": 45,
+        "0": 340,
+        "1": 345,
+        "2": 675
+      },
+      "label_sha256": "f7255dba735b100e94b98562e3a7c590ff2247722cb9e43d372f9cd722b90139"
+    },
+    {
+      "episode_index": 39,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0047_20260822_194905.h5",
+      "raw_rows": 1226,
+      "retained_rows": 1222,
+      "phase_counts": {
+        "-1": 44,
+        "0": 430,
+        "1": 312,
+        "2": 436
+      },
+      "label_sha256": "7dd1df9b6805d88c2f349b1ef7a2c35841d523c2773ed2a469d9d245a370f041"
+    },
+    {
+      "episode_index": 40,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0048_20260822_194955.h5",
+      "raw_rows": 1500,
+      "retained_rows": 1498,
+      "phase_counts": {
+        "-1": 46,
+        "0": 412,
+        "1": 249,
+        "2": 791
+      },
+      "label_sha256": "b7c8369268c2fc8620ce24bf53018b4bdcedd4eceb430a0a61a3b00c80d9a447"
+    },
+    {
+      "episode_index": 41,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0049_20260822_195028.h5",
+      "raw_rows": 1193,
+      "retained_rows": 1189,
+      "phase_counts": {
+        "-1": 44,
+        "0": 262,
+        "1": 358,
+        "2": 525
+      },
+      "label_sha256": "4428dff072060b3baf9be6ad1e377fcfc82ace03349c0b7bca22560780e4b715"
+    },
+    {
+      "episode_index": 42,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0050_20260822_195057.h5",
+      "raw_rows": 1370,
+      "retained_rows": 1369,
+      "phase_counts": {
+        "-1": 47,
+        "0": 424,
+        "1": 215,
+        "2": 683
+      },
+      "label_sha256": "5d9ea708f4aa2d91c07dab7598990b36a0cc0e5cd10c618a9bab153a41b926dc"
+    },
+    {
+      "episode_index": 43,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0051_20260822_195246.h5",
+      "raw_rows": 1279,
+      "retained_rows": 1277,
+      "phase_counts": {
+        "-1": 46,
+        "0": 240,
+        "1": 385,
+        "2": 606
+      },
+      "label_sha256": "29a00f7b002d376961159065aa2fe89ee85f95a328f9c92c32ffc9af435e9841"
+    },
+    {
+      "episode_index": 44,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0052_20260822_195311.h5",
+      "raw_rows": 1264,
+      "retained_rows": 1261,
+      "phase_counts": {
+        "-1": 45,
+        "0": 360,
+        "1": 302,
+        "2": 554
+      },
+      "label_sha256": "f7e1ac4e8a6433088020adb6b36f040fb6739509d063475b21faf1d0b94accfe"
+    },
+    {
+      "episode_index": 45,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0053_20260822_195338.h5",
+      "raw_rows": 1119,
+      "retained_rows": 1116,
+      "phase_counts": {
+        "-1": 45,
+        "0": 439,
+        "1": 275,
+        "2": 357
+      },
+      "label_sha256": "a45d9d0f2a6ac272eb562a23847b690f02967597e05d06b9fb0cf51c03b48517"
+    },
+    {
+      "episode_index": 46,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0054_20260822_195403.h5",
+      "raw_rows": 1394,
+      "retained_rows": 1393,
+      "phase_counts": {
+        "-1": 47,
+        "0": 336,
+        "1": 334,
+        "2": 676
+      },
+      "label_sha256": "1beabb0566be9b65a36640ea1e8076be6d4d15400792244358d324cb14455bd0"
+    },
+    {
+      "episode_index": 47,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0055_20260822_195541.h5",
+      "raw_rows": 1332,
+      "retained_rows": 1328,
+      "phase_counts": {
+        "-1": 44,
+        "0": 383,
+        "1": 216,
+        "2": 685
+      },
+      "label_sha256": "8cee867c7d86c1dc5fdf345ab30f497440ada280665f4a117a374e1089dc89e2"
+    },
+    {
+      "episode_index": 48,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0056_20260822_195613.h5",
+      "raw_rows": 1427,
+      "retained_rows": 1426,
+      "phase_counts": {
+        "-1": 47,
+        "0": 230,
+        "1": 429,
+        "2": 720
+      },
+      "label_sha256": "32c2c69ec7210453b20536a7f634296cafd4831460e896892eabc535d97ae180"
+    },
+    {
+      "episode_index": 49,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0057_20260822_195639.h5",
+      "raw_rows": 1428,
+      "retained_rows": 1424,
+      "phase_counts": {
+        "-1": 44,
+        "0": 347,
+        "1": 381,
+        "2": 652
+      },
+      "label_sha256": "3b19ce57be3e39a2c21ee1684ffe31bc1ba391548837741a9d5cdb3200d64eda"
+    },
+    {
+      "episode_index": 50,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0058_20260822_195705.h5",
+      "raw_rows": 1343,
+      "retained_rows": 1342,
+      "phase_counts": {
+        "-1": 47,
+        "0": 184,
+        "1": 476,
+        "2": 635
+      },
+      "label_sha256": "dbd6a39765d39321c90a770c3618e0f232a4f22a2bc78f141c7d39d306e5bd43"
+    },
+    {
+      "episode_index": 51,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0059_20260822_195736.h5",
+      "raw_rows": 1275,
+      "retained_rows": 1271,
+      "phase_counts": {
+        "-1": 44,
+        "0": 350,
+        "1": 316,
+        "2": 561
+      },
+      "label_sha256": "646d3dacb041821bf79647206842e73172d41adf775aadce63af0c1099a76725"
+    },
+    {
+      "episode_index": 52,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0060_20260822_195759.h5",
+      "raw_rows": 1198,
+      "retained_rows": 1196,
+      "phase_counts": {
+        "-1": 46,
+        "0": 173,
+        "1": 498,
+        "2": 479
+      },
+      "label_sha256": "8a6621b148ad29e91f06ecc2712c08517e0cff8784ac859d02a3f05fc38a491d"
+    },
+    {
+      "episode_index": 53,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0061_20260822_195910.h5",
+      "raw_rows": 1334,
+      "retained_rows": 1332,
+      "phase_counts": {
+        "-1": 46,
+        "0": 302,
+        "1": 314,
+        "2": 670
+      },
+      "label_sha256": "8ce60454cff16a2c8ddd48e56a516734f9c5cb01160e859ffb184f6c16335227"
+    },
+    {
+      "episode_index": 54,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0062_20260822_195934.h5",
+      "raw_rows": 1351,
+      "retained_rows": 1350,
+      "phase_counts": {
+        "-1": 47,
+        "0": 322,
+        "1": 280,
+        "2": 701
+      },
+      "label_sha256": "82bd2ed1d10e4e842ac1b815dfff4374a9a096f301385f4e0d733a2c3614c580"
+    },
+    {
+      "episode_index": 55,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0063_20260822_195958.h5",
+      "raw_rows": 1389,
+      "retained_rows": 1386,
+      "phase_counts": {
+        "-1": 45,
+        "0": 268,
+        "1": 444,
+        "2": 629
+      },
+      "label_sha256": "9431b86f233e56b32e0b9697f9577a310c31b9c2f77a8ea87dd4b6e9fc5c7efe"
+    },
+    {
+      "episode_index": 56,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0064_20260822_200043.h5",
+      "raw_rows": 1333,
+      "retained_rows": 1330,
+      "phase_counts": {
+        "-1": 45,
+        "0": 321,
+        "1": 293,
+        "2": 671
+      },
+      "label_sha256": "535a17b651bd901cf39912dc56604bd86ebef82f674a3634aab7b24f071956d8"
+    },
+    {
+      "episode_index": 57,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0065_20260822_200111.h5",
+      "raw_rows": 1477,
+      "retained_rows": 1475,
+      "phase_counts": {
+        "-1": 46,
+        "0": 230,
+        "1": 474,
+        "2": 725
+      },
+      "label_sha256": "027b74a81635804232336f9d040f11e6e655a1affc611fcb9aa851b70cee700c"
+    },
+    {
+      "episode_index": 58,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0066_20260822_200136.h5",
+      "raw_rows": 1337,
+      "retained_rows": 1334,
+      "phase_counts": {
+        "-1": 45,
+        "0": 368,
+        "1": 310,
+        "2": 611
+      },
+      "label_sha256": "b637ad2360cab1ef46fc35d035fb65e07dda2b91a7562b04fc216eff957a01d8"
+    },
+    {
+      "episode_index": 59,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0067_20260822_200204.h5",
+      "raw_rows": 1354,
+      "retained_rows": 1350,
+      "phase_counts": {
+        "-1": 44,
+        "0": 298,
+        "1": 437,
+        "2": 571
+      },
+      "label_sha256": "6c97d72367efdbfed5f096f70f07b7a83c091dd1d06078b09b50baebc0b9a94f"
+    },
+    {
+      "episode_index": 60,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0068_20260823_191257.h5",
+      "raw_rows": 1354,
+      "retained_rows": 1353,
+      "phase_counts": {
+        "-1": 47,
+        "0": 224,
+        "1": 412,
+        "2": 670
+      },
+      "label_sha256": "1c61aa1c9fc6a1ab2eb388f0564d2d8d131823a2d94ea4afe26b91e277281dab"
+    },
+    {
+      "episode_index": 61,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0069_20260823_191324.h5",
+      "raw_rows": 1291,
+      "retained_rows": 1287,
+      "phase_counts": {
+        "-1": 44,
+        "0": 387,
+        "1": 471,
+        "2": 385
+      },
+      "label_sha256": "1f2c4762ca1e05ae0a80da79f70a75e32107628b9cc5364baffb0c4c852df5b5"
+    },
+    {
+      "episode_index": 62,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0070_20260823_191350.h5",
+      "raw_rows": 1397,
+      "retained_rows": 1395,
+      "phase_counts": {
+        "-1": 46,
+        "0": 275,
+        "1": 453,
+        "2": 621
+      },
+      "label_sha256": "a8c017ed5b1d5928ee0d9505b35c292d0da18870370e5533287892ef1911fb3a"
+    },
+    {
+      "episode_index": 63,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0071_20260823_191416.h5",
+      "raw_rows": 1424,
+      "retained_rows": 1422,
+      "phase_counts": {
+        "-1": 46,
+        "0": 232,
+        "1": 446,
+        "2": 698
+      },
+      "label_sha256": "20598387d5dc1f063cd94b74da159e554ff9ab9ea887561a855c658bf0aa9be6"
+    },
+    {
+      "episode_index": 64,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0072_20260823_191439.h5",
+      "raw_rows": 1240,
+      "retained_rows": 1238,
+      "phase_counts": {
+        "-1": 46,
+        "0": 143,
+        "1": 570,
+        "2": 479
+      },
+      "label_sha256": "9b0a1e818da0ffc28e4cc4fd10180505598f1636189bc85bf4126f2eebad9550"
+    },
+    {
+      "episode_index": 65,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0073_20260823_191503.h5",
+      "raw_rows": 1385,
+      "retained_rows": 1382,
+      "phase_counts": {
+        "-1": 45,
+        "0": 536,
+        "1": 218,
+        "2": 583
+      },
+      "label_sha256": "cbcaee7c0fb1b1ace769071872d2ef0ac3175debbd9879f59d598835e50c3555"
+    },
+    {
+      "episode_index": 66,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0074_20260823_191526.h5",
+      "raw_rows": 1185,
+      "retained_rows": 1182,
+      "phase_counts": {
+        "-1": 45,
+        "0": 250,
+        "1": 459,
+        "2": 428
+      },
+      "label_sha256": "7c43a8db4a69872458da92cc56f7ae1c52e895c6e298292adc87da995ed5efae"
+    },
+    {
+      "episode_index": 67,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0075_20260823_191551.h5",
+      "raw_rows": 1357,
+      "retained_rows": 1356,
+      "phase_counts": {
+        "-1": 47,
+        "0": 539,
+        "1": 247,
+        "2": 523
+      },
+      "label_sha256": "cbf63d8213ef5fcac3dde0a6ef46442724f99db55e409cecdce8060e78c9ca7a"
+    },
+    {
+      "episode_index": 68,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0076_20260823_191652.h5",
+      "raw_rows": 1440,
+      "retained_rows": 1439,
+      "phase_counts": {
+        "-1": 47,
+        "0": 232,
+        "1": 495,
+        "2": 665
+      },
+      "label_sha256": "6e30c9b0e5801937823bccef200f28180a72e9893407f434b4d2fe489e89109c"
+    },
+    {
+      "episode_index": 69,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0077_20260823_191715.h5",
+      "raw_rows": 1407,
+      "retained_rows": 1405,
+      "phase_counts": {
+        "-1": 46,
+        "0": 93,
+        "1": 668,
+        "2": 598
+      },
+      "label_sha256": "5c3a3639523dea1111a18ad285e45cf2182c4c7312bd5d77bc438c3238bdbb47"
+    },
+    {
+      "episode_index": 70,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0078_20260823_191740.h5",
+      "raw_rows": 1511,
+      "retained_rows": 1509,
+      "phase_counts": {
+        "-1": 46,
+        "0": 230,
+        "1": 536,
+        "2": 697
+      },
+      "label_sha256": "c805f31da10f3c0b4f28d91c9542d3928e80fe97c03602caace4032c8c04392e"
+    },
+    {
+      "episode_index": 71,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0079_20260823_191805.h5",
+      "raw_rows": 1512,
+      "retained_rows": 1509,
+      "phase_counts": {
+        "-1": 45,
+        "0": 304,
+        "1": 499,
+        "2": 661
+      },
+      "label_sha256": "6527c26894534aaea53597317445685a23f2c8d210360b5af828d7cb0aa16f36"
+    },
+    {
+      "episode_index": 72,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0080_20260823_191831.h5",
+      "raw_rows": 1606,
+      "retained_rows": 1602,
+      "phase_counts": {
+        "-1": 44,
+        "0": 362,
+        "1": 327,
+        "2": 869
+      },
+      "label_sha256": "4d847ee48ca2652fa37fbd363a4e250b53292ef6b6f5b6e0f7eac823e5dab0f8"
+    },
+    {
+      "episode_index": 73,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0081_20260823_191900.h5",
+      "raw_rows": 1342,
+      "retained_rows": 1339,
+      "phase_counts": {
+        "-1": 45,
+        "0": 286,
+        "1": 455,
+        "2": 553
+      },
+      "label_sha256": "9f3f8b3bc00177d53adaa9d8365e7eec42eb387400fce7108f0006a99d12cca1"
+    },
+    {
+      "episode_index": 74,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0082_20260823_191923.h5",
+      "raw_rows": 1349,
+      "retained_rows": 1348,
+      "phase_counts": {
+        "-1": 47,
+        "0": 277,
+        "1": 356,
+        "2": 668
+      },
+      "label_sha256": "8cf93b48f4932607328a8a3e4bc64820a4a3827151f3288d6c1b332f3727a5aa"
+    },
+    {
+      "episode_index": 75,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0083_20260823_191946.h5",
+      "raw_rows": 1234,
+      "retained_rows": 1231,
+      "phase_counts": {
+        "-1": 45,
+        "0": 274,
+        "1": 394,
+        "2": 518
+      },
+      "label_sha256": "e68bfe090a865b1679c448b6e853067d8eabe83704b0e9e5adeec895e8a9594b"
+    },
+    {
+      "episode_index": 76,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0084_20260823_192055.h5",
+      "raw_rows": 1694,
+      "retained_rows": 1692,
+      "phase_counts": {
+        "-1": 46,
+        "0": 321,
+        "1": 332,
+        "2": 993
+      },
+      "label_sha256": "79621fb5545a4bb57200de6faa7dae0de1eb22618d1f689af6981cbf95a494ed"
+    },
+    {
+      "episode_index": 77,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0085_20260823_192122.h5",
+      "raw_rows": 1520,
+      "retained_rows": 1519,
+      "phase_counts": {
+        "-1": 47,
+        "0": 208,
+        "1": 394,
+        "2": 870
+      },
+      "label_sha256": "339205e7fb4410adaff9ad35e5bd3a17553c8e863e9fc5645ff70a4ce3c1e8f9"
+    },
+    {
+      "episode_index": 78,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0086_20260823_192151.h5",
+      "raw_rows": 1393,
+      "retained_rows": 1392,
+      "phase_counts": {
+        "-1": 47,
+        "0": 211,
+        "1": 428,
+        "2": 706
+      },
+      "label_sha256": "9e4ff26b47a28956f00585fee9224824175cf0e41c9e66cafb6ba1821a4223a8"
+    },
+    {
+      "episode_index": 79,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0087_20260823_192216.h5",
+      "raw_rows": 1332,
+      "retained_rows": 1330,
+      "phase_counts": {
+        "-1": 46,
+        "0": 370,
+        "1": 264,
+        "2": 650
+      },
+      "label_sha256": "aed1c7304f73df593e5943cb14d98052c79e45f2c4886bb51d16608b02acc980"
+    },
+    {
+      "episode_index": 80,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0088_20260823_192244.h5",
+      "raw_rows": 1403,
+      "retained_rows": 1400,
+      "phase_counts": {
+        "-1": 45,
+        "0": 175,
+        "1": 459,
+        "2": 721
+      },
+      "label_sha256": "6279cb5b1a578575261212ac364fa4aedc3a6973d8a14741b051d8e0d22e1dfc"
+    },
+    {
+      "episode_index": 81,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0089_20260823_192307.h5",
+      "raw_rows": 1309,
+      "retained_rows": 1305,
+      "phase_counts": {
+        "-1": 44,
+        "0": 348,
+        "1": 234,
+        "2": 679
+      },
+      "label_sha256": "c752c2abb89d0e3b62f8c7723cb3372cac23d3e4e5346a728da0b2de734d307a"
+    },
+    {
+      "episode_index": 82,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0090_20260823_193338.h5",
+      "raw_rows": 1173,
+      "retained_rows": 1169,
+      "phase_counts": {
+        "-1": 44,
+        "0": 611,
+        "1": 162,
+        "2": 352
+      },
+      "label_sha256": "fa3505059fb965da2b4b34d043b0dd628440cbdac4a53d0bba3bfeceb0b20b67"
+    },
+    {
+      "episode_index": 83,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0091_20260823_193505.h5",
+      "raw_rows": 1259,
+      "retained_rows": 1257,
+      "phase_counts": {
+        "-1": 46,
+        "0": 370,
+        "1": 492,
+        "2": 349
+      },
+      "label_sha256": "470e3c12f524f37420d8d61231742b363c70b5fd47aaea467946dc570afd9be1"
+    },
+    {
+      "episode_index": 84,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0092_20260823_193526.h5",
+      "raw_rows": 1282,
+      "retained_rows": 1280,
+      "phase_counts": {
+        "-1": 46,
+        "0": 376,
+        "1": 364,
+        "2": 494
+      },
+      "label_sha256": "35542e5ec82ba232456529c2c84aba5407cd4daf8bf93e595be27aa4c642ca6e"
+    },
+    {
+      "episode_index": 85,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0093_20260823_193544.h5",
+      "raw_rows": 944,
+      "retained_rows": 940,
+      "phase_counts": {
+        "-1": 44,
+        "0": 368,
+        "1": 256,
+        "2": 272
+      },
+      "label_sha256": "929b417a721c84703d08c0ccad055aa26f7f704793bc0ed1613b7f4a125c1feb"
+    },
+    {
+      "episode_index": 86,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0094_20260823_193604.h5",
+      "raw_rows": 1232,
+      "retained_rows": 1229,
+      "phase_counts": {
+        "-1": 45,
+        "0": 322,
+        "1": 446,
+        "2": 416
+      },
+      "label_sha256": "5c361f245d68dc376adb1614a3cb9539525bea8dc48ce29d0f03736f7217cd70"
+    },
+    {
+      "episode_index": 87,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0095_20260823_193646.h5",
+      "raw_rows": 1152,
+      "retained_rows": 1148,
+      "phase_counts": {
+        "-1": 44,
+        "0": 320,
+        "1": 523,
+        "2": 261
+      },
+      "label_sha256": "6ca8da0b6848797634c953301280123eead60bcb53442a862cba400400408f71"
+    },
+    {
+      "episode_index": 88,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0096_20260823_193707.h5",
+      "raw_rows": 1312,
+      "retained_rows": 1311,
+      "phase_counts": {
+        "-1": 47,
+        "0": 392,
+        "1": 439,
+        "2": 433
+      },
+      "label_sha256": "fcacf78ca079ad9a74fddc5f13468da05fb175e7cc9a573407637949b31afbf6"
+    },
+    {
+      "episode_index": 89,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0097_20260823_193729.h5",
+      "raw_rows": 1273,
+      "retained_rows": 1272,
+      "phase_counts": {
+        "-1": 47,
+        "0": 364,
+        "1": 420,
+        "2": 441
+      },
+      "label_sha256": "5a34baf5146308a9caebe084fc8c4ad4cc9b6399f8c16e1760b1afe2974483f9"
+    },
+    {
+      "episode_index": 90,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0098_20260823_193804.h5",
+      "raw_rows": 1160,
+      "retained_rows": 1159,
+      "phase_counts": {
+        "-1": 47,
+        "0": 109,
+        "1": 576,
+        "2": 427
+      },
+      "label_sha256": "93eb541f5435d4eba3bebc42a39d96527420c36eb804852058f2d152c7bc4c00"
+    },
+    {
+      "episode_index": 91,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0099_20260823_193826.h5",
+      "raw_rows": 1254,
+      "retained_rows": 1253,
+      "phase_counts": {
+        "-1": 47,
+        "0": 289,
+        "1": 475,
+        "2": 442
+      },
+      "label_sha256": "bca03c73bf3e3142eb38033a5c15b2fa766181b2818321405304031c21e18335"
+    },
+    {
+      "episode_index": 92,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0100_20260823_193845.h5",
+      "raw_rows": 1122,
+      "retained_rows": 1119,
+      "phase_counts": {
+        "-1": 45,
+        "0": 316,
+        "1": 352,
+        "2": 406
+      },
+      "label_sha256": "054517109254d85b4fa00d9c6ffea1c6a20ca46352cef9b45957e8efc00bf029"
+    },
+    {
+      "episode_index": 93,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0101_20260823_193902.h5",
+      "raw_rows": 1024,
+      "retained_rows": 1020,
+      "phase_counts": {
+        "-1": 44,
+        "0": 194,
+        "1": 401,
+        "2": 381
+      },
+      "label_sha256": "21fede3ca94eb3f2e435b2644e5231916083d823cbd589d70931f4e619ca4d0e"
+    },
+    {
+      "episode_index": 94,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0102_20260823_193922.h5",
+      "raw_rows": 1225,
+      "retained_rows": 1221,
+      "phase_counts": {
+        "-1": 44,
+        "0": 270,
+        "1": 382,
+        "2": 525
+      },
+      "label_sha256": "af9fd923e0681d68bcf9b6a4b7e6ab038c3e58933333f11569117d9ea5ebe0a7"
+    },
+    {
+      "episode_index": 95,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0103_20260823_193939.h5",
+      "raw_rows": 1148,
+      "retained_rows": 1145,
+      "phase_counts": {
+        "-1": 45,
+        "0": 115,
+        "1": 429,
+        "2": 556
+      },
+      "label_sha256": "cfed8ae55c0687397d00c0252501fe2c614628356adf35084b31f1ab5088d64c"
+    },
+    {
+      "episode_index": 96,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0104_20260823_193957.h5",
+      "raw_rows": 1144,
+      "retained_rows": 1141,
+      "phase_counts": {
+        "-1": 45,
+        "0": 347,
+        "1": 467,
+        "2": 282
+      },
+      "label_sha256": "9f87f5973d06aedd3fbf0f380ce42c83243e27c74d6c4aff9d809f8c8eeabf75"
+    },
+    {
+      "episode_index": 97,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0105_20260823_194052.h5",
+      "raw_rows": 1186,
+      "retained_rows": 1183,
+      "phase_counts": {
+        "-1": 45,
+        "0": 253,
+        "1": 460,
+        "2": 425
+      },
+      "label_sha256": "6b03882d5a28cac9ca4a211f6ed5ff3ed1aaf8da6bb69991b3961809deae591f"
+    },
+    {
+      "episode_index": 98,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0106_20260823_194110.h5",
+      "raw_rows": 1209,
+      "retained_rows": 1205,
+      "phase_counts": {
+        "-1": 44,
+        "0": 324,
+        "1": 324,
+        "2": 513
+      },
+      "label_sha256": "fe07d568ef0f0d66855923c19f6df0dd495027f9aec4e86c7b32d28294034b79"
+    },
+    {
+      "episode_index": 99,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0107_20260823_194130.h5",
+      "raw_rows": 1228,
+      "retained_rows": 1224,
+      "phase_counts": {
+        "-1": 44,
+        "0": 234,
+        "1": 440,
+        "2": 506
+      },
+      "label_sha256": "3a9c07a70445f3f51088f6f92936584c2145259044c19b971160cf0274fcd4b3"
+    },
+    {
+      "episode_index": 100,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0108_20260823_194146.h5",
+      "raw_rows": 946,
+      "retained_rows": 943,
+      "phase_counts": {
+        "-1": 45,
+        "0": 321,
+        "1": 202,
+        "2": 375
+      },
+      "label_sha256": "319cea695d90ef45682245ec36212fc0ee745560d823b1409122e84d878a0b09"
+    },
+    {
+      "episode_index": 101,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0109_20260823_194206.h5",
+      "raw_rows": 1130,
+      "retained_rows": 1127,
+      "phase_counts": {
+        "-1": 45,
+        "0": 382,
+        "1": 347,
+        "2": 353
+      },
+      "label_sha256": "7ce7b0170fe25acd84ac0472b43461adce10269d2d1e69dd2a95e191939eb290"
+    },
+    {
+      "episode_index": 102,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0110_20260823_194223.h5",
+      "raw_rows": 1013,
+      "retained_rows": 1009,
+      "phase_counts": {
+        "-1": 44,
+        "0": 356,
+        "1": 157,
+        "2": 452
+      },
+      "label_sha256": "0e659f355b80d593424bc8aaf24cb16b934971c508c36a5e0b01777360190c9c"
+    },
+    {
+      "episode_index": 103,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0111_20260823_194239.h5",
+      "raw_rows": 1001,
+      "retained_rows": 997,
+      "phase_counts": {
+        "-1": 44,
+        "0": 265,
+        "1": 329,
+        "2": 359
+      },
+      "label_sha256": "e7bcfd02afbb6f72fef2c98e5b3e0944e22402617c56e8c5bb44f0746201cd26"
+    },
+    {
+      "episode_index": 104,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0112_20260823_194258.h5",
+      "raw_rows": 1005,
+      "retained_rows": 1004,
+      "phase_counts": {
+        "-1": 47,
+        "0": 373,
+        "1": 257,
+        "2": 327
+      },
+      "label_sha256": "35b9a83f2b249fbf990a513d97545a236c4adc1af78cd6af731513e1c327f3c8"
+    },
+    {
+      "episode_index": 105,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0113_20260823_194316.h5",
+      "raw_rows": 964,
+      "retained_rows": 960,
+      "phase_counts": {
+        "-1": 44,
+        "0": 235,
+        "1": 393,
+        "2": 288
+      },
+      "label_sha256": "6ba8f4839322cdc8f8bc223cee4454725716a27f41d529639a0cc648d1e18bd4"
+    },
+    {
+      "episode_index": 106,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0114_20260823_194344.h5",
+      "raw_rows": 931,
+      "retained_rows": 930,
+      "phase_counts": {
+        "-1": 47,
+        "0": 287,
+        "1": 305,
+        "2": 291
+      },
+      "label_sha256": "e777a20a1046abfd96cd1b1f13e40a42b46d63aec83d5607f4707f19aa759670"
+    },
+    {
+      "episode_index": 107,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0115_20260823_194401.h5",
+      "raw_rows": 1065,
+      "retained_rows": 1064,
+      "phase_counts": {
+        "-1": 47,
+        "0": 179,
+        "1": 435,
+        "2": 403
+      },
+      "label_sha256": "a8f7b5c03e63be05b7356272764ed665f8153f347a40c1cb7512fd0b0eb05c9b"
+    },
+    {
+      "episode_index": 108,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0116_20260823_194417.h5",
+      "raw_rows": 1047,
+      "retained_rows": 1044,
+      "phase_counts": {
+        "-1": 45,
+        "0": 328,
+        "1": 311,
+        "2": 360
+      },
+      "label_sha256": "60341c565cd1460978f9846021576faff3681bf115445233651c32e67543d787"
+    },
+    {
+      "episode_index": 109,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0117_20260823_194432.h5",
+      "raw_rows": 997,
+      "retained_rows": 995,
+      "phase_counts": {
+        "-1": 46,
+        "0": 188,
+        "1": 456,
+        "2": 305
+      },
+      "label_sha256": "cb5852f1176b51a8698b21db2761e08a0462eef325eaaa1dee514410735d5667"
+    },
+    {
+      "episode_index": 110,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0118_20260823_194447.h5",
+      "raw_rows": 827,
+      "retained_rows": 824,
+      "phase_counts": {
+        "-1": 45,
+        "0": 436,
+        "1": 121,
+        "2": 222
+      },
+      "label_sha256": "de18083f630afd3db89285f6174d93c6b22e237c8aa11ff7b8a868ffea551cfb"
+    },
+    {
+      "episode_index": 111,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0119_20260823_194506.h5",
+      "raw_rows": 1123,
+      "retained_rows": 1121,
+      "phase_counts": {
+        "-1": 46,
+        "0": 297,
+        "1": 245,
+        "2": 533
+      },
+      "label_sha256": "221f41c4dacd1f2407bad64e31f7d4e74de3a6504385897a79545fa2427f47bc"
+    },
+    {
+      "episode_index": 112,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0120_20260823_194522.h5",
+      "raw_rows": 987,
+      "retained_rows": 985,
+      "phase_counts": {
+        "-1": 46,
+        "0": 259,
+        "1": 199,
+        "2": 481
+      },
+      "label_sha256": "a4aefb7bc5490dcaa86dc27360be9799923f3eb00afe3e1c8f1a2e4fb1a0dec5"
+    },
+    {
+      "episode_index": 113,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0121_20260823_194537.h5",
+      "raw_rows": 896,
+      "retained_rows": 895,
+      "phase_counts": {
+        "-1": 47,
+        "0": 201,
+        "1": 246,
+        "2": 401
+      },
+      "label_sha256": "3df12b892d947a9ac76402e2e40deeac0278cbe66564044d7b81722c646e7b7f"
+    },
+    {
+      "episode_index": 114,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0122_20260823_195006.h5",
+      "raw_rows": 1315,
+      "retained_rows": 1314,
+      "phase_counts": {
+        "-1": 47,
+        "0": 301,
+        "1": 353,
+        "2": 613
+      },
+      "label_sha256": "40d1a3461c8392ec2c05aa44bc9c2f7fb42720920a532365348f53485edcc19c"
+    },
+    {
+      "episode_index": 115,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0123_20260823_195032.h5",
+      "raw_rows": 1356,
+      "retained_rows": 1354,
+      "phase_counts": {
+        "-1": 46,
+        "0": 153,
+        "1": 596,
+        "2": 559
+      },
+      "label_sha256": "ce3f1a88a1bff6d001c41bc7ddeabd4c1af134938182d1bd5597acb8ba7238e3"
+    },
+    {
+      "episode_index": 116,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0124_20260823_195053.h5",
+      "raw_rows": 1126,
+      "retained_rows": 1124,
+      "phase_counts": {
+        "-1": 46,
+        "0": 300,
+        "1": 427,
+        "2": 351
+      },
+      "label_sha256": "fccdbc93d84cf9e5c0807398e2a44c9064aed760526516851717943120a98dc3"
+    },
+    {
+      "episode_index": 117,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0125_20260823_195112.h5",
+      "raw_rows": 1095,
+      "retained_rows": 1093,
+      "phase_counts": {
+        "-1": 46,
+        "0": 368,
+        "1": 287,
+        "2": 392
+      },
+      "label_sha256": "af752fa84ec5fd6a3580c6b554f2ca99e4dc130d41053d98a2e05a52b5037931"
+    },
+    {
+      "episode_index": 118,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0126_20260823_195136.h5",
+      "raw_rows": 1408,
+      "retained_rows": 1406,
+      "phase_counts": {
+        "-1": 46,
+        "0": 419,
+        "1": 351,
+        "2": 590
+      },
+      "label_sha256": "da054dc47693091bcd82ee9fcd70a36512faee25be7ea0ff4ced6ca94db89064"
+    },
+    {
+      "episode_index": 119,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0127_20260823_195157.h5",
+      "raw_rows": 1246,
+      "retained_rows": 1243,
+      "phase_counts": {
+        "-1": 45,
+        "0": 145,
+        "1": 464,
+        "2": 589
+      },
+      "label_sha256": "f4e2d8c34a8362ed8f59376d4d5ff8e842e55dd5766bfdf6d5b1005e90759490"
+    },
+    {
+      "episode_index": 120,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0128_20260823_195219.h5",
+      "raw_rows": 1231,
+      "retained_rows": 1230,
+      "phase_counts": {
+        "-1": 47,
+        "0": 337,
+        "1": 423,
+        "2": 423
+      },
+      "label_sha256": "c12d7292a3128d40dd36f1e27d62371e4b66f198e83db426b3928c6b8d8728f7"
+    },
+    {
+      "episode_index": 121,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0129_20260823_195307.h5",
+      "raw_rows": 1259,
+      "retained_rows": 1258,
+      "phase_counts": {
+        "-1": 47,
+        "0": 253,
+        "1": 325,
+        "2": 633
+      },
+      "label_sha256": "1c3be84f55272f757890b353db9cce19794c5dd7d5542729a35952acae4a6db8"
+    },
+    {
+      "episode_index": 122,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0130_20260823_195456.h5",
+      "raw_rows": 1376,
+      "retained_rows": 1372,
+      "phase_counts": {
+        "-1": 44,
+        "0": 514,
+        "1": 287,
+        "2": 527
+      },
+      "label_sha256": "2088694496e53211bd88ac0084774a4ff3bd5a1cb2e167fe07b533744e1d50c5"
+    },
+    {
+      "episode_index": 123,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0131_20260823_195519.h5",
+      "raw_rows": 1337,
+      "retained_rows": 1334,
+      "phase_counts": {
+        "-1": 45,
+        "0": 319,
+        "1": 391,
+        "2": 579
+      },
+      "label_sha256": "5c9adf4f1423e99819be376751d8770f518ba281730c90578981e47d9b99cf6e"
+    },
+    {
+      "episode_index": 124,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0132_20260823_195544.h5",
+      "raw_rows": 1552,
+      "retained_rows": 1550,
+      "phase_counts": {
+        "-1": 46,
+        "0": 242,
+        "1": 512,
+        "2": 750
+      },
+      "label_sha256": "1202e959a48dd3b196926437bacc6b1696834f878a4383a498c69def428bc257"
+    },
+    {
+      "episode_index": 125,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0133_20260823_195608.h5",
+      "raw_rows": 1388,
+      "retained_rows": 1384,
+      "phase_counts": {
+        "-1": 44,
+        "0": 279,
+        "1": 482,
+        "2": 579
+      },
+      "label_sha256": "d5d3620504262f71c7c667618d172d413a7d8c4d6797f8df1f49b6db2538e762"
+    },
+    {
+      "episode_index": 126,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0134_20260823_195628.h5",
+      "raw_rows": 1067,
+      "retained_rows": 1066,
+      "phase_counts": {
+        "-1": 47,
+        "0": 230,
+        "1": 511,
+        "2": 278
+      },
+      "label_sha256": "5238edf91778517d22d3bbc4ccecea29cf885aa3f0ab1e904524dadbbf5cfa5a"
+    },
+    {
+      "episode_index": 127,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0135_20260823_195651.h5",
+      "raw_rows": 1408,
+      "retained_rows": 1405,
+      "phase_counts": {
+        "-1": 45,
+        "0": 188,
+        "1": 477,
+        "2": 695
+      },
+      "label_sha256": "9b94a2b90e10c060634a32b3ca7200266c4560add08f27c13b565460dda82b76"
+    },
+    {
+      "episode_index": 128,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0136_20260823_195716.h5",
+      "raw_rows": 1318,
+      "retained_rows": 1314,
+      "phase_counts": {
+        "-1": 44,
+        "0": 172,
+        "1": 447,
+        "2": 651
+      },
+      "label_sha256": "9366187b5ef8eea0eefd509606a91983e5d40ad27547a46bd91cd84130bcb6c1"
+    },
+    {
+      "episode_index": 129,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0137_20260823_195743.h5",
+      "raw_rows": 1474,
+      "retained_rows": 1471,
+      "phase_counts": {
+        "-1": 45,
+        "0": 209,
+        "1": 388,
+        "2": 829
+      },
+      "label_sha256": "5c8fd12df6aae0bf632b3e5d024ee7a85e3839963e01e043d5d9e1cb34da3aad"
+    },
+    {
+      "episode_index": 130,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0138_20260823_195805.h5",
+      "raw_rows": 1164,
+      "retained_rows": 1163,
+      "phase_counts": {
+        "-1": 47,
+        "0": 213,
+        "1": 399,
+        "2": 504
+      },
+      "label_sha256": "4a3db5ba3a420bf676c5443e5fd54d895301051e3997309e31e93716c360695c"
+    },
+    {
+      "episode_index": 131,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0139_20260823_195902.h5",
+      "raw_rows": 1513,
+      "retained_rows": 1510,
+      "phase_counts": {
+        "-1": 45,
+        "0": 256,
+        "1": 423,
+        "2": 786
+      },
+      "label_sha256": "529e2a15e5c1035675e8471057ce15e56ff60125481581d3d12f9161909f8635"
+    },
+    {
+      "episode_index": 132,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0140_20260823_195926.h5",
+      "raw_rows": 1374,
+      "retained_rows": 1371,
+      "phase_counts": {
+        "-1": 45,
+        "0": 261,
+        "1": 546,
+        "2": 519
+      },
+      "label_sha256": "a4f7cc5cfd5d77326e6a635824125158b02621eee6ba7400c48c68c5a0955082"
+    },
+    {
+      "episode_index": 133,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0141_20260823_195950.h5",
+      "raw_rows": 1453,
+      "retained_rows": 1452,
+      "phase_counts": {
+        "-1": 47,
+        "0": 205,
+        "1": 478,
+        "2": 722
+      },
+      "label_sha256": "412b7437eaa364ff5b00fc7535615f26b09c790f9b6a81f5dffc01b14d5c29ca"
+    },
+    {
+      "episode_index": 134,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0142_20260823_200018.h5",
+      "raw_rows": 1381,
+      "retained_rows": 1377,
+      "phase_counts": {
+        "-1": 44,
+        "0": 451,
+        "1": 232,
+        "2": 650
+      },
+      "label_sha256": "58e43b79dea5b94c9120e2e9e68293852c8d96ad4e11d42ba3890efe77085ec7"
+    },
+    {
+      "episode_index": 135,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0143_20260823_200041.h5",
+      "raw_rows": 1241,
+      "retained_rows": 1240,
+      "phase_counts": {
+        "-1": 47,
+        "0": 357,
+        "1": 278,
+        "2": 558
+      },
+      "label_sha256": "c9d9d7f44d9b710e9dbb2944984247d17c37cb5395d4f5f980e2a0b0500755a7"
+    },
+    {
+      "episode_index": 136,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0144_20260823_200103.h5",
+      "raw_rows": 1408,
+      "retained_rows": 1405,
+      "phase_counts": {
+        "-1": 45,
+        "0": 302,
+        "1": 429,
+        "2": 629
+      },
+      "label_sha256": "b9b193357130cf500dd70f90dcf5d993e0afb1d488a5037bf6de5b85561da537"
+    },
+    {
+      "episode_index": 137,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0145_20260823_200130.h5",
+      "raw_rows": 1355,
+      "retained_rows": 1351,
+      "phase_counts": {
+        "-1": 44,
+        "0": 229,
+        "1": 478,
+        "2": 600
+      },
+      "label_sha256": "b3e6594268ac13311882fa445758188bfb80dfdb31a8f4fae551d58ee9409ee9"
+    },
+    {
+      "episode_index": 138,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/cuccumber_peeling/episode_0146_20260823_200156.h5",
+      "raw_rows": 1359,
+      "retained_rows": 1355,
+      "phase_counts": {
+        "-1": 44,
+        "0": 319,
+        "1": 429,
+        "2": 563
+      },
+      "label_sha256": "d095cf751b6f026c913326ad246e924e1c5bbded7b0386d06f0de33c0c5087c9"
+    }
+  ],
+  "phase_counts": {
+    "-1": 6322,
+    "0": 43458,
+    "1": 55053,
+    "2": 69719
+  },
+  "label_contract_sha256": "951610277a7f844c58d978b29a0e98b181e796a7ebe308a3328756afa656af83"
+}

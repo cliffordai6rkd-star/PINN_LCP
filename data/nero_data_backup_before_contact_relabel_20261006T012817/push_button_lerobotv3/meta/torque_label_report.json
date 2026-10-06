@@ -1,0 +1,2036 @@
+{
+  "task": "push_button",
+  "source": "/mnt/code/lcx/nero_ws/runs/push_button",
+  "teacher": {
+    "checkpoint": "/mnt/code/lcx/PINN/outputs/tau_free_sequence/nero/epoch_124_val_tau_mse_nm2_0.005756.pt",
+    "checkpoint_sha256": "035084df420f3c7a435ffbed06f536638870280d872013ce8bb51619278c9df5",
+    "snapshot": "model",
+    "model": {
+      "architecture": "lstm",
+      "inputs": [
+        "q",
+        "dq",
+        "delta_q"
+      ],
+      "target_key": "tau",
+      "output_dim": 7,
+      "history_mode": "stateless_sliding_window"
+    },
+    "sample_rate_hz": 50.0,
+    "history_horizon": 25,
+    "history_mode": "stateless_sliding_window",
+    "normalization": {
+      "eps": 1e-06,
+      "normalize_mode": "gaussian",
+      "normalize_lowdim_keys": [
+        "q",
+        "dq",
+        "delta_q",
+        "tau"
+      ]
+    },
+    "filters": {
+      "q": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "dq": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "delta_q": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      },
+      "tau": {
+        "enabled": false,
+        "operations": [
+          {
+            "type": "median",
+            "window": 3
+          }
+        ],
+        "dataset_preprocessed_operations": []
+      }
+    },
+    "input_sampling": "every_second_raw_100hz_frame_episode_local",
+    "prediction_alignment": "linear_50hz_to_raw_timestamps_with_last_prediction_held_at_tail",
+    "residual": "tau_measured_minus_tau_free",
+    "warmup": "invalid_until_first_complete_history",
+    "velocity": "recorded_sign_corrected_velocity_no_additional_sign_flip"
+  },
+  "state_fps": 100,
+  "action_fps": 25,
+  "phase_rule": {
+    "metric": "sum_abs_tau_ext_nm",
+    "contact_threshold": 3.0,
+    "comparison": ">",
+    "alignment": "one_second_preceding_each_contact_onset_contact_takes_priority",
+    "precontact_duration_s": 1.0,
+    "classes": {
+      "-1": "unknown_context",
+      "0": "free",
+      "1": "alignment",
+      "2": "contact"
+    }
+  },
+  "episodes": [
+    {
+      "episode_index": 0,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0000_20260823_203721.h5",
+      "raw_rows": 1287,
+      "retained_rows": 1284,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1075,
+        "1": 107,
+        "2": 57
+      }
+    },
+    {
+      "episode_index": 1,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0001_20260823_203750.h5",
+      "raw_rows": 1953,
+      "retained_rows": 1948,
+      "phase_counts": {
+        "-1": 43,
+        "0": 1760,
+        "1": 103,
+        "2": 42
+      }
+    },
+    {
+      "episode_index": 2,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0002_20260823_203827.h5",
+      "raw_rows": 1828,
+      "retained_rows": 1826,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1430,
+        "1": 206,
+        "2": 144
+      }
+    },
+    {
+      "episode_index": 3,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0003_20260823_203919.h5",
+      "raw_rows": 1317,
+      "retained_rows": 1314,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1092,
+        "1": 118,
+        "2": 59
+      }
+    },
+    {
+      "episode_index": 4,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0004_20260823_203951.h5",
+      "raw_rows": 2264,
+      "retained_rows": 2263,
+      "phase_counts": {
+        "-1": 47,
+        "0": 2216,
+        "1": 0,
+        "2": 0
+      }
+    },
+    {
+      "episode_index": 5,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0005_20260823_204019.h5",
+      "raw_rows": 1768,
+      "retained_rows": 1765,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1542,
+        "1": 112,
+        "2": 66
+      }
+    },
+    {
+      "episode_index": 6,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0006_20260823_204037.h5",
+      "raw_rows": 1206,
+      "retained_rows": 1205,
+      "phase_counts": {
+        "-1": 47,
+        "0": 918,
+        "1": 109,
+        "2": 131
+      }
+    },
+    {
+      "episode_index": 7,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0007_20260823_204108.h5",
+      "raw_rows": 2336,
+      "retained_rows": 2333,
+      "phase_counts": {
+        "-1": 45,
+        "0": 2152,
+        "1": 102,
+        "2": 34
+      }
+    },
+    {
+      "episode_index": 8,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0008_20260823_204134.h5",
+      "raw_rows": 1165,
+      "retained_rows": 1163,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1117,
+        "1": 0,
+        "2": 0
+      }
+    },
+    {
+      "episode_index": 9,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0009_20260823_204238.h5",
+      "raw_rows": 3146,
+      "retained_rows": 3142,
+      "phase_counts": {
+        "-1": 44,
+        "0": 2975,
+        "1": 114,
+        "2": 9
+      }
+    },
+    {
+      "episode_index": 10,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0010_20260823_204312.h5",
+      "raw_rows": 1540,
+      "retained_rows": 1536,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1133,
+        "1": 212,
+        "2": 147
+      }
+    },
+    {
+      "episode_index": 11,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0011_20260823_204334.h5",
+      "raw_rows": 1186,
+      "retained_rows": 1183,
+      "phase_counts": {
+        "-1": 45,
+        "0": 972,
+        "1": 100,
+        "2": 66
+      }
+    },
+    {
+      "episode_index": 12,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0012_20260823_204353.h5",
+      "raw_rows": 1241,
+      "retained_rows": 1239,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1046,
+        "1": 99,
+        "2": 48
+      }
+    },
+    {
+      "episode_index": 13,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0013_20260823_204609.h5",
+      "raw_rows": 1297,
+      "retained_rows": 1294,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1010,
+        "1": 104,
+        "2": 135
+      }
+    },
+    {
+      "episode_index": 14,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0014_20260823_204802.h5",
+      "raw_rows": 2760,
+      "retained_rows": 2757,
+      "phase_counts": {
+        "-1": 45,
+        "0": 2219,
+        "1": 309,
+        "2": 184
+      }
+    },
+    {
+      "episode_index": 15,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0015_20260823_204844.h5",
+      "raw_rows": 1204,
+      "retained_rows": 1201,
+      "phase_counts": {
+        "-1": 45,
+        "0": 961,
+        "1": 107,
+        "2": 88
+      }
+    },
+    {
+      "episode_index": 16,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0016_20260823_204915.h5",
+      "raw_rows": 1819,
+      "retained_rows": 1816,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1286,
+        "1": 263,
+        "2": 222
+      }
+    },
+    {
+      "episode_index": 17,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0017_20260823_204943.h5",
+      "raw_rows": 1783,
+      "retained_rows": 1779,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1313,
+        "1": 219,
+        "2": 203
+      }
+    },
+    {
+      "episode_index": 18,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0018_20260823_205003.h5",
+      "raw_rows": 1126,
+      "retained_rows": 1124,
+      "phase_counts": {
+        "-1": 46,
+        "0": 850,
+        "1": 111,
+        "2": 117
+      }
+    },
+    {
+      "episode_index": 19,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0019_20260823_205028.h5",
+      "raw_rows": 1554,
+      "retained_rows": 1550,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1074,
+        "1": 204,
+        "2": 228
+      }
+    },
+    {
+      "episode_index": 20,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0020_20260823_205053.h5",
+      "raw_rows": 1027,
+      "retained_rows": 1024,
+      "phase_counts": {
+        "-1": 45,
+        "0": 761,
+        "1": 102,
+        "2": 116
+      }
+    },
+    {
+      "episode_index": 21,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0021_20260823_205128.h5",
+      "raw_rows": 1133,
+      "retained_rows": 1129,
+      "phase_counts": {
+        "-1": 44,
+        "0": 878,
+        "1": 106,
+        "2": 101
+      }
+    },
+    {
+      "episode_index": 22,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0022_20260823_205209.h5",
+      "raw_rows": 1763,
+      "retained_rows": 1761,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1294,
+        "1": 206,
+        "2": 215
+      }
+    },
+    {
+      "episode_index": 23,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0023_20260823_205234.h5",
+      "raw_rows": 1199,
+      "retained_rows": 1197,
+      "phase_counts": {
+        "-1": 46,
+        "0": 927,
+        "1": 106,
+        "2": 118
+      }
+    },
+    {
+      "episode_index": 24,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0024_20260823_205314.h5",
+      "raw_rows": 1055,
+      "retained_rows": 1054,
+      "phase_counts": {
+        "-1": 47,
+        "0": 817,
+        "1": 104,
+        "2": 86
+      }
+    },
+    {
+      "episode_index": 25,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0025_20260823_205341.h5",
+      "raw_rows": 1903,
+      "retained_rows": 1900,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1425,
+        "1": 226,
+        "2": 204
+      }
+    },
+    {
+      "episode_index": 26,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0026_20260823_205448.h5",
+      "raw_rows": 1211,
+      "retained_rows": 1208,
+      "phase_counts": {
+        "-1": 45,
+        "0": 963,
+        "1": 106,
+        "2": 94
+      }
+    },
+    {
+      "episode_index": 27,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0027_20260823_205513.h5",
+      "raw_rows": 1099,
+      "retained_rows": 1098,
+      "phase_counts": {
+        "-1": 47,
+        "0": 871,
+        "1": 102,
+        "2": 78
+      }
+    },
+    {
+      "episode_index": 28,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0028_20260823_205534.h5",
+      "raw_rows": 1465,
+      "retained_rows": 1463,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1027,
+        "1": 207,
+        "2": 183
+      }
+    },
+    {
+      "episode_index": 29,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0029_20260823_205558.h5",
+      "raw_rows": 1717,
+      "retained_rows": 1713,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1317,
+        "1": 207,
+        "2": 145
+      }
+    },
+    {
+      "episode_index": 30,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0030_20260823_205623.h5",
+      "raw_rows": 1793,
+      "retained_rows": 1792,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1309,
+        "1": 214,
+        "2": 222
+      }
+    },
+    {
+      "episode_index": 31,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0031_20260823_205647.h5",
+      "raw_rows": 1716,
+      "retained_rows": 1713,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1456,
+        "1": 99,
+        "2": 113
+      }
+    },
+    {
+      "episode_index": 32,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0032_20260823_205705.h5",
+      "raw_rows": 1036,
+      "retained_rows": 1035,
+      "phase_counts": {
+        "-1": 47,
+        "0": 802,
+        "1": 126,
+        "2": 60
+      }
+    },
+    {
+      "episode_index": 33,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0033_20260823_210030.h5",
+      "raw_rows": 2463,
+      "retained_rows": 2460,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1851,
+        "1": 304,
+        "2": 260
+      }
+    },
+    {
+      "episode_index": 34,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0034_20260823_210049.h5",
+      "raw_rows": 1024,
+      "retained_rows": 1020,
+      "phase_counts": {
+        "-1": 44,
+        "0": 789,
+        "1": 101,
+        "2": 86
+      }
+    },
+    {
+      "episode_index": 35,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0035_20260823_210110.h5",
+      "raw_rows": 973,
+      "retained_rows": 971,
+      "phase_counts": {
+        "-1": 46,
+        "0": 706,
+        "1": 100,
+        "2": 119
+      }
+    },
+    {
+      "episode_index": 36,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0036_20260823_210140.h5",
+      "raw_rows": 2340,
+      "retained_rows": 2336,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1776,
+        "1": 303,
+        "2": 213
+      }
+    },
+    {
+      "episode_index": 37,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0037_20260823_210215.h5",
+      "raw_rows": 1165,
+      "retained_rows": 1161,
+      "phase_counts": {
+        "-1": 44,
+        "0": 902,
+        "1": 103,
+        "2": 112
+      }
+    },
+    {
+      "episode_index": 38,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0038_20260823_210254.h5",
+      "raw_rows": 1647,
+      "retained_rows": 1644,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1286,
+        "1": 211,
+        "2": 102
+      }
+    },
+    {
+      "episode_index": 39,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0039_20260823_210326.h5",
+      "raw_rows": 1600,
+      "retained_rows": 1598,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1177,
+        "1": 209,
+        "2": 166
+      }
+    },
+    {
+      "episode_index": 40,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0040_20260823_210346.h5",
+      "raw_rows": 1150,
+      "retained_rows": 1146,
+      "phase_counts": {
+        "-1": 44,
+        "0": 919,
+        "1": 102,
+        "2": 81
+      }
+    },
+    {
+      "episode_index": 41,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0041_20260823_210409.h5",
+      "raw_rows": 1744,
+      "retained_rows": 1742,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1268,
+        "1": 209,
+        "2": 219
+      }
+    },
+    {
+      "episode_index": 42,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0042_20260823_210429.h5",
+      "raw_rows": 1107,
+      "retained_rows": 1105,
+      "phase_counts": {
+        "-1": 46,
+        "0": 848,
+        "1": 100,
+        "2": 111
+      }
+    },
+    {
+      "episode_index": 43,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0043_20260823_210446.h5",
+      "raw_rows": 1167,
+      "retained_rows": 1165,
+      "phase_counts": {
+        "-1": 46,
+        "0": 939,
+        "1": 108,
+        "2": 72
+      }
+    },
+    {
+      "episode_index": 44,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0044_20260823_210514.h5",
+      "raw_rows": 2225,
+      "retained_rows": 2224,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1593,
+        "1": 305,
+        "2": 279
+      }
+    },
+    {
+      "episode_index": 45,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0045_20260823_210535.h5",
+      "raw_rows": 1195,
+      "retained_rows": 1192,
+      "phase_counts": {
+        "-1": 45,
+        "0": 986,
+        "1": 99,
+        "2": 62
+      }
+    },
+    {
+      "episode_index": 46,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0046_20260823_210555.h5",
+      "raw_rows": 1108,
+      "retained_rows": 1106,
+      "phase_counts": {
+        "-1": 46,
+        "0": 849,
+        "1": 104,
+        "2": 107
+      }
+    },
+    {
+      "episode_index": 47,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0047_20260823_210622.h5",
+      "raw_rows": 1036,
+      "retained_rows": 1035,
+      "phase_counts": {
+        "-1": 47,
+        "0": 812,
+        "1": 99,
+        "2": 77
+      }
+    },
+    {
+      "episode_index": 48,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0048_20260823_210640.h5",
+      "raw_rows": 1219,
+      "retained_rows": 1215,
+      "phase_counts": {
+        "-1": 44,
+        "0": 949,
+        "1": 100,
+        "2": 122
+      }
+    },
+    {
+      "episode_index": 49,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0049_20260823_210735.h5",
+      "raw_rows": 1576,
+      "retained_rows": 1572,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1166,
+        "1": 206,
+        "2": 156
+      }
+    },
+    {
+      "episode_index": 50,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0050_20260823_210755.h5",
+      "raw_rows": 1143,
+      "retained_rows": 1141,
+      "phase_counts": {
+        "-1": 46,
+        "0": 871,
+        "1": 124,
+        "2": 100
+      }
+    },
+    {
+      "episode_index": 51,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0051_20260823_210819.h5",
+      "raw_rows": 1668,
+      "retained_rows": 1667,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1301,
+        "1": 203,
+        "2": 116
+      }
+    },
+    {
+      "episode_index": 52,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0052_20260823_210849.h5",
+      "raw_rows": 1840,
+      "retained_rows": 1839,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1449,
+        "1": 204,
+        "2": 139
+      }
+    },
+    {
+      "episode_index": 53,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0053_20260823_210910.h5",
+      "raw_rows": 1258,
+      "retained_rows": 1254,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1016,
+        "1": 103,
+        "2": 91
+      }
+    },
+    {
+      "episode_index": 54,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0054_20260823_210929.h5",
+      "raw_rows": 1223,
+      "retained_rows": 1222,
+      "phase_counts": {
+        "-1": 47,
+        "0": 962,
+        "1": 114,
+        "2": 99
+      }
+    },
+    {
+      "episode_index": 55,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0055_20260823_210952.h5",
+      "raw_rows": 1571,
+      "retained_rows": 1570,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1115,
+        "1": 223,
+        "2": 185
+      }
+    },
+    {
+      "episode_index": 56,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0056_20260823_211032.h5",
+      "raw_rows": 2426,
+      "retained_rows": 2422,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1818,
+        "1": 315,
+        "2": 245
+      }
+    },
+    {
+      "episode_index": 57,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0057_20260823_211051.h5",
+      "raw_rows": 1019,
+      "retained_rows": 1016,
+      "phase_counts": {
+        "-1": 45,
+        "0": 776,
+        "1": 101,
+        "2": 94
+      }
+    },
+    {
+      "episode_index": 58,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0058_20260823_211112.h5",
+      "raw_rows": 1280,
+      "retained_rows": 1278,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1029,
+        "1": 102,
+        "2": 101
+      }
+    },
+    {
+      "episode_index": 59,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0059_20260823_211135.h5",
+      "raw_rows": 1635,
+      "retained_rows": 1632,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1248,
+        "1": 214,
+        "2": 125
+      }
+    },
+    {
+      "episode_index": 60,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0060_20260823_211156.h5",
+      "raw_rows": 1304,
+      "retained_rows": 1301,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1038,
+        "1": 102,
+        "2": 116
+      }
+    },
+    {
+      "episode_index": 61,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0061_20260823_211214.h5",
+      "raw_rows": 1174,
+      "retained_rows": 1172,
+      "phase_counts": {
+        "-1": 46,
+        "0": 876,
+        "1": 133,
+        "2": 117
+      }
+    },
+    {
+      "episode_index": 62,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0062_20260823_211301.h5",
+      "raw_rows": 2375,
+      "retained_rows": 2371,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1755,
+        "1": 308,
+        "2": 264
+      }
+    },
+    {
+      "episode_index": 63,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0063_20260823_211350.h5",
+      "raw_rows": 1053,
+      "retained_rows": 1052,
+      "phase_counts": {
+        "-1": 47,
+        "0": 786,
+        "1": 106,
+        "2": 113
+      }
+    },
+    {
+      "episode_index": 64,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0064_20260823_211428.h5",
+      "raw_rows": 1220,
+      "retained_rows": 1218,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1006,
+        "1": 104,
+        "2": 62
+      }
+    },
+    {
+      "episode_index": 65,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0065_20260823_211447.h5",
+      "raw_rows": 1189,
+      "retained_rows": 1187,
+      "phase_counts": {
+        "-1": 46,
+        "0": 919,
+        "1": 104,
+        "2": 118
+      }
+    },
+    {
+      "episode_index": 66,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0066_20260823_211526.h5",
+      "raw_rows": 1289,
+      "retained_rows": 1285,
+      "phase_counts": {
+        "-1": 44,
+        "0": 995,
+        "1": 104,
+        "2": 142
+      }
+    },
+    {
+      "episode_index": 67,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0067_20260823_211544.h5",
+      "raw_rows": 1076,
+      "retained_rows": 1075,
+      "phase_counts": {
+        "-1": 47,
+        "0": 829,
+        "1": 108,
+        "2": 91
+      }
+    },
+    {
+      "episode_index": 68,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0068_20260823_211846.h5",
+      "raw_rows": 1070,
+      "retained_rows": 1066,
+      "phase_counts": {
+        "-1": 44,
+        "0": 826,
+        "1": 111,
+        "2": 85
+      }
+    },
+    {
+      "episode_index": 69,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0069_20260823_211909.h5",
+      "raw_rows": 1542,
+      "retained_rows": 1538,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1273,
+        "1": 101,
+        "2": 120
+      }
+    },
+    {
+      "episode_index": 70,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0070_20260823_211951.h5",
+      "raw_rows": 1801,
+      "retained_rows": 1800,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1386,
+        "1": 204,
+        "2": 163
+      }
+    },
+    {
+      "episode_index": 71,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0071_20260823_213134.h5",
+      "raw_rows": 1774,
+      "retained_rows": 1771,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1548,
+        "1": 100,
+        "2": 78
+      }
+    },
+    {
+      "episode_index": 72,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0072_20260823_213153.h5",
+      "raw_rows": 1113,
+      "retained_rows": 1109,
+      "phase_counts": {
+        "-1": 44,
+        "0": 872,
+        "1": 100,
+        "2": 93
+      }
+    },
+    {
+      "episode_index": 73,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0073_20260823_213211.h5",
+      "raw_rows": 1188,
+      "retained_rows": 1187,
+      "phase_counts": {
+        "-1": 47,
+        "0": 931,
+        "1": 102,
+        "2": 107
+      }
+    },
+    {
+      "episode_index": 74,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0074_20260823_213348.h5",
+      "raw_rows": 1348,
+      "retained_rows": 1345,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1107,
+        "1": 102,
+        "2": 91
+      }
+    },
+    {
+      "episode_index": 75,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0075_20260823_213424.h5",
+      "raw_rows": 1210,
+      "retained_rows": 1208,
+      "phase_counts": {
+        "-1": 46,
+        "0": 965,
+        "1": 102,
+        "2": 95
+      }
+    },
+    {
+      "episode_index": 76,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0076_20260823_213452.h5",
+      "raw_rows": 2208,
+      "retained_rows": 2206,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1967,
+        "1": 108,
+        "2": 85
+      }
+    },
+    {
+      "episode_index": 77,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0077_20260823_213513.h5",
+      "raw_rows": 1321,
+      "retained_rows": 1320,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1040,
+        "1": 107,
+        "2": 126
+      }
+    },
+    {
+      "episode_index": 78,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0078_20260823_213530.h5",
+      "raw_rows": 1049,
+      "retained_rows": 1046,
+      "phase_counts": {
+        "-1": 45,
+        "0": 805,
+        "1": 102,
+        "2": 94
+      }
+    },
+    {
+      "episode_index": 79,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0079_20260823_213553.h5",
+      "raw_rows": 1137,
+      "retained_rows": 1136,
+      "phase_counts": {
+        "-1": 47,
+        "0": 859,
+        "1": 100,
+        "2": 130
+      }
+    },
+    {
+      "episode_index": 80,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0080_20260823_213636.h5",
+      "raw_rows": 1433,
+      "retained_rows": 1431,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1177,
+        "1": 101,
+        "2": 107
+      }
+    },
+    {
+      "episode_index": 81,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0081_20260823_213711.h5",
+      "raw_rows": 2691,
+      "retained_rows": 2690,
+      "phase_counts": {
+        "-1": 47,
+        "0": 2105,
+        "1": 305,
+        "2": 233
+      }
+    },
+    {
+      "episode_index": 82,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0082_20260823_213733.h5",
+      "raw_rows": 1027,
+      "retained_rows": 1026,
+      "phase_counts": {
+        "-1": 47,
+        "0": 837,
+        "1": 103,
+        "2": 39
+      }
+    },
+    {
+      "episode_index": 83,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0083_20260823_213752.h5",
+      "raw_rows": 1140,
+      "retained_rows": 1136,
+      "phase_counts": {
+        "-1": 44,
+        "0": 860,
+        "1": 103,
+        "2": 129
+      }
+    },
+    {
+      "episode_index": 84,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0084_20260823_213807.h5",
+      "raw_rows": 943,
+      "retained_rows": 940,
+      "phase_counts": {
+        "-1": 45,
+        "0": 641,
+        "1": 100,
+        "2": 154
+      }
+    },
+    {
+      "episode_index": 85,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0085_20260823_213842.h5",
+      "raw_rows": 1039,
+      "retained_rows": 1037,
+      "phase_counts": {
+        "-1": 46,
+        "0": 815,
+        "1": 102,
+        "2": 74
+      }
+    },
+    {
+      "episode_index": 86,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0086_20260823_213905.h5",
+      "raw_rows": 1741,
+      "retained_rows": 1738,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1259,
+        "1": 203,
+        "2": 231
+      }
+    },
+    {
+      "episode_index": 87,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0087_20260823_213928.h5",
+      "raw_rows": 1570,
+      "retained_rows": 1569,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1150,
+        "1": 200,
+        "2": 172
+      }
+    },
+    {
+      "episode_index": 88,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0088_20260823_214013.h5",
+      "raw_rows": 1856,
+      "retained_rows": 1855,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1493,
+        "1": 202,
+        "2": 113
+      }
+    },
+    {
+      "episode_index": 89,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0089_20260823_214051.h5",
+      "raw_rows": 1186,
+      "retained_rows": 1183,
+      "phase_counts": {
+        "-1": 45,
+        "0": 981,
+        "1": 100,
+        "2": 57
+      }
+    },
+    {
+      "episode_index": 90,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0090_20260823_214108.h5",
+      "raw_rows": 1147,
+      "retained_rows": 1145,
+      "phase_counts": {
+        "-1": 46,
+        "0": 928,
+        "1": 103,
+        "2": 68
+      }
+    },
+    {
+      "episode_index": 91,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0091_20260823_214136.h5",
+      "raw_rows": 2054,
+      "retained_rows": 2050,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1676,
+        "1": 219,
+        "2": 111
+      }
+    },
+    {
+      "episode_index": 92,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0092_20260823_214200.h5",
+      "raw_rows": 1194,
+      "retained_rows": 1190,
+      "phase_counts": {
+        "-1": 44,
+        "0": 983,
+        "1": 101,
+        "2": 62
+      }
+    },
+    {
+      "episode_index": 93,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0093_20260823_214341.h5",
+      "raw_rows": 2097,
+      "retained_rows": 2095,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1708,
+        "1": 212,
+        "2": 129
+      }
+    },
+    {
+      "episode_index": 94,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0094_20260823_214444.h5",
+      "raw_rows": 2032,
+      "retained_rows": 2030,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1591,
+        "1": 204,
+        "2": 189
+      }
+    },
+    {
+      "episode_index": 95,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0095_20260823_214528.h5",
+      "raw_rows": 1703,
+      "retained_rows": 1699,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1241,
+        "1": 214,
+        "2": 200
+      }
+    },
+    {
+      "episode_index": 96,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0096_20260823_214551.h5",
+      "raw_rows": 1645,
+      "retained_rows": 1644,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1245,
+        "1": 200,
+        "2": 152
+      }
+    },
+    {
+      "episode_index": 97,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0097_20260823_214610.h5",
+      "raw_rows": 1155,
+      "retained_rows": 1151,
+      "phase_counts": {
+        "-1": 44,
+        "0": 899,
+        "1": 103,
+        "2": 105
+      }
+    },
+    {
+      "episode_index": 98,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0098_20260823_214635.h5",
+      "raw_rows": 1808,
+      "retained_rows": 1807,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1390,
+        "1": 205,
+        "2": 165
+      }
+    },
+    {
+      "episode_index": 99,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0099_20260823_214654.h5",
+      "raw_rows": 1192,
+      "retained_rows": 1189,
+      "phase_counts": {
+        "-1": 45,
+        "0": 962,
+        "1": 116,
+        "2": 66
+      }
+    },
+    {
+      "episode_index": 100,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0100_20260823_214712.h5",
+      "raw_rows": 1256,
+      "retained_rows": 1254,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1018,
+        "1": 107,
+        "2": 83
+      }
+    },
+    {
+      "episode_index": 101,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0101_20260823_214733.h5",
+      "raw_rows": 1030,
+      "retained_rows": 1026,
+      "phase_counts": {
+        "-1": 44,
+        "0": 803,
+        "1": 103,
+        "2": 76
+      }
+    },
+    {
+      "episode_index": 102,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0102_20260823_214751.h5",
+      "raw_rows": 1133,
+      "retained_rows": 1130,
+      "phase_counts": {
+        "-1": 45,
+        "0": 896,
+        "1": 101,
+        "2": 88
+      }
+    },
+    {
+      "episode_index": 103,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0103_20260823_214807.h5",
+      "raw_rows": 1035,
+      "retained_rows": 1031,
+      "phase_counts": {
+        "-1": 44,
+        "0": 771,
+        "1": 102,
+        "2": 114
+      }
+    },
+    {
+      "episode_index": 104,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0104_20260823_214830.h5",
+      "raw_rows": 1770,
+      "retained_rows": 1766,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1323,
+        "1": 202,
+        "2": 197
+      }
+    },
+    {
+      "episode_index": 105,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0105_20260823_214856.h5",
+      "raw_rows": 1897,
+      "retained_rows": 1893,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1453,
+        "1": 206,
+        "2": 190
+      }
+    },
+    {
+      "episode_index": 106,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0106_20260823_214922.h5",
+      "raw_rows": 1943,
+      "retained_rows": 1941,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1505,
+        "1": 205,
+        "2": 185
+      }
+    },
+    {
+      "episode_index": 107,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0107_20260823_214945.h5",
+      "raw_rows": 1586,
+      "retained_rows": 1584,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1261,
+        "1": 112,
+        "2": 165
+      }
+    },
+    {
+      "episode_index": 108,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0108_20260823_215002.h5",
+      "raw_rows": 1045,
+      "retained_rows": 1041,
+      "phase_counts": {
+        "-1": 44,
+        "0": 814,
+        "1": 105,
+        "2": 78
+      }
+    },
+    {
+      "episode_index": 109,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0109_20260823_215042.h5",
+      "raw_rows": 1110,
+      "retained_rows": 1108,
+      "phase_counts": {
+        "-1": 46,
+        "0": 871,
+        "1": 105,
+        "2": 86
+      }
+    },
+    {
+      "episode_index": 110,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0110_20260823_215113.h5",
+      "raw_rows": 1247,
+      "retained_rows": 1245,
+      "phase_counts": {
+        "-1": 46,
+        "0": 929,
+        "1": 102,
+        "2": 168
+      }
+    },
+    {
+      "episode_index": 111,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0111_20260823_215130.h5",
+      "raw_rows": 1171,
+      "retained_rows": 1169,
+      "phase_counts": {
+        "-1": 46,
+        "0": 919,
+        "1": 103,
+        "2": 101
+      }
+    },
+    {
+      "episode_index": 112,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0112_20260823_215147.h5",
+      "raw_rows": 1022,
+      "retained_rows": 1020,
+      "phase_counts": {
+        "-1": 46,
+        "0": 784,
+        "1": 99,
+        "2": 91
+      }
+    },
+    {
+      "episode_index": 113,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0113_20260823_215203.h5",
+      "raw_rows": 1066,
+      "retained_rows": 1062,
+      "phase_counts": {
+        "-1": 44,
+        "0": 818,
+        "1": 105,
+        "2": 95
+      }
+    },
+    {
+      "episode_index": 114,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0114_20260823_215232.h5",
+      "raw_rows": 2259,
+      "retained_rows": 2258,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1881,
+        "1": 203,
+        "2": 127
+      }
+    },
+    {
+      "episode_index": 115,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0115_20260823_215251.h5",
+      "raw_rows": 1110,
+      "retained_rows": 1106,
+      "phase_counts": {
+        "-1": 44,
+        "0": 848,
+        "1": 102,
+        "2": 112
+      }
+    },
+    {
+      "episode_index": 116,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0116_20260823_215308.h5",
+      "raw_rows": 1112,
+      "retained_rows": 1109,
+      "phase_counts": {
+        "-1": 45,
+        "0": 857,
+        "1": 104,
+        "2": 103
+      }
+    },
+    {
+      "episode_index": 117,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0117_20260823_215326.h5",
+      "raw_rows": 1209,
+      "retained_rows": 1206,
+      "phase_counts": {
+        "-1": 45,
+        "0": 930,
+        "1": 116,
+        "2": 115
+      }
+    },
+    {
+      "episode_index": 118,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0118_20260823_215343.h5",
+      "raw_rows": 1141,
+      "retained_rows": 1137,
+      "phase_counts": {
+        "-1": 44,
+        "0": 915,
+        "1": 106,
+        "2": 72
+      }
+    },
+    {
+      "episode_index": 119,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0119_20260823_215402.h5",
+      "raw_rows": 1262,
+      "retained_rows": 1261,
+      "phase_counts": {
+        "-1": 47,
+        "0": 957,
+        "1": 106,
+        "2": 151
+      }
+    },
+    {
+      "episode_index": 120,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0120_20260823_215453.h5",
+      "raw_rows": 1775,
+      "retained_rows": 1774,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1421,
+        "1": 205,
+        "2": 101
+      }
+    },
+    {
+      "episode_index": 121,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0121_20260823_215512.h5",
+      "raw_rows": 1212,
+      "retained_rows": 1211,
+      "phase_counts": {
+        "-1": 47,
+        "0": 886,
+        "1": 102,
+        "2": 176
+      }
+    },
+    {
+      "episode_index": 122,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0122_20260823_215540.h5",
+      "raw_rows": 2176,
+      "retained_rows": 2172,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1712,
+        "1": 205,
+        "2": 211
+      }
+    },
+    {
+      "episode_index": 123,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0123_20260823_215620.h5",
+      "raw_rows": 1245,
+      "retained_rows": 1243,
+      "phase_counts": {
+        "-1": 46,
+        "0": 959,
+        "1": 111,
+        "2": 127
+      }
+    },
+    {
+      "episode_index": 124,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0124_20260823_215639.h5",
+      "raw_rows": 1312,
+      "retained_rows": 1311,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1033,
+        "1": 120,
+        "2": 111
+      }
+    },
+    {
+      "episode_index": 125,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0125_20260823_215714.h5",
+      "raw_rows": 1356,
+      "retained_rows": 1352,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1109,
+        "1": 101,
+        "2": 98
+      }
+    },
+    {
+      "episode_index": 126,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0126_20260823_215738.h5",
+      "raw_rows": 1620,
+      "retained_rows": 1619,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1362,
+        "1": 107,
+        "2": 103
+      }
+    },
+    {
+      "episode_index": 127,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0127_20260823_215800.h5",
+      "raw_rows": 1306,
+      "retained_rows": 1302,
+      "phase_counts": {
+        "-1": 44,
+        "0": 1054,
+        "1": 107,
+        "2": 97
+      }
+    },
+    {
+      "episode_index": 128,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0128_20260823_220154.h5",
+      "raw_rows": 1552,
+      "retained_rows": 1551,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1220,
+        "1": 117,
+        "2": 167
+      }
+    },
+    {
+      "episode_index": 129,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0129_20260823_220220.h5",
+      "raw_rows": 1137,
+      "retained_rows": 1133,
+      "phase_counts": {
+        "-1": 44,
+        "0": 874,
+        "1": 109,
+        "2": 106
+      }
+    },
+    {
+      "episode_index": 130,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0130_20260823_220239.h5",
+      "raw_rows": 1267,
+      "retained_rows": 1263,
+      "phase_counts": {
+        "-1": 44,
+        "0": 955,
+        "1": 109,
+        "2": 155
+      }
+    },
+    {
+      "episode_index": 131,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0131_20260823_220259.h5",
+      "raw_rows": 1368,
+      "retained_rows": 1367,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1088,
+        "1": 102,
+        "2": 130
+      }
+    },
+    {
+      "episode_index": 132,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0132_20260823_220347.h5",
+      "raw_rows": 2098,
+      "retained_rows": 2096,
+      "phase_counts": {
+        "-1": 46,
+        "0": 1631,
+        "1": 209,
+        "2": 210
+      }
+    },
+    {
+      "episode_index": 133,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0133_20260823_220410.h5",
+      "raw_rows": 1506,
+      "retained_rows": 1505,
+      "phase_counts": {
+        "-1": 47,
+        "0": 1221,
+        "1": 103,
+        "2": 134
+      }
+    },
+    {
+      "episode_index": 134,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0134_20260823_220444.h5",
+      "raw_rows": 1533,
+      "retained_rows": 1530,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1276,
+        "1": 110,
+        "2": 99
+      }
+    },
+    {
+      "episode_index": 135,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0135_20260823_220506.h5",
+      "raw_rows": 1436,
+      "retained_rows": 1433,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1153,
+        "1": 106,
+        "2": 129
+      }
+    },
+    {
+      "episode_index": 136,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0136_20260823_220546.h5",
+      "raw_rows": 1220,
+      "retained_rows": 1218,
+      "phase_counts": {
+        "-1": 46,
+        "0": 970,
+        "1": 104,
+        "2": 98
+      }
+    },
+    {
+      "episode_index": 137,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0137_20260823_220626.h5",
+      "raw_rows": 1250,
+      "retained_rows": 1246,
+      "phase_counts": {
+        "-1": 44,
+        "0": 962,
+        "1": 113,
+        "2": 127
+      }
+    },
+    {
+      "episode_index": 138,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0138_20260823_220651.h5",
+      "raw_rows": 1369,
+      "retained_rows": 1366,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1142,
+        "1": 100,
+        "2": 79
+      }
+    },
+    {
+      "episode_index": 139,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0139_20260823_220709.h5",
+      "raw_rows": 1187,
+      "retained_rows": 1184,
+      "phase_counts": {
+        "-1": 45,
+        "0": 901,
+        "1": 108,
+        "2": 130
+      }
+    },
+    {
+      "episode_index": 140,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0140_20260823_220726.h5",
+      "raw_rows": 1147,
+      "retained_rows": 1144,
+      "phase_counts": {
+        "-1": 45,
+        "0": 874,
+        "1": 102,
+        "2": 123
+      }
+    },
+    {
+      "episode_index": 141,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0141_20260823_220748.h5",
+      "raw_rows": 1557,
+      "retained_rows": 1554,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1293,
+        "1": 123,
+        "2": 93
+      }
+    },
+    {
+      "episode_index": 142,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0142_20260823_220806.h5",
+      "raw_rows": 1226,
+      "retained_rows": 1224,
+      "phase_counts": {
+        "-1": 46,
+        "0": 993,
+        "1": 101,
+        "2": 84
+      }
+    },
+    {
+      "episode_index": 143,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0143_20260823_220824.h5",
+      "raw_rows": 1208,
+      "retained_rows": 1205,
+      "phase_counts": {
+        "-1": 45,
+        "0": 959,
+        "1": 100,
+        "2": 101
+      }
+    },
+    {
+      "episode_index": 144,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0144_20260823_220844.h5",
+      "raw_rows": 1327,
+      "retained_rows": 1324,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1034,
+        "1": 100,
+        "2": 145
+      }
+    },
+    {
+      "episode_index": 145,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0145_20260823_220902.h5",
+      "raw_rows": 1213,
+      "retained_rows": 1209,
+      "phase_counts": {
+        "-1": 44,
+        "0": 931,
+        "1": 105,
+        "2": 129
+      }
+    },
+    {
+      "episode_index": 146,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0146_20260823_220936.h5",
+      "raw_rows": 2290,
+      "retained_rows": 2287,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1799,
+        "1": 207,
+        "2": 236
+      }
+    },
+    {
+      "episode_index": 147,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0147_20260823_220953.h5",
+      "raw_rows": 1011,
+      "retained_rows": 1008,
+      "phase_counts": {
+        "-1": 45,
+        "0": 724,
+        "1": 100,
+        "2": 139
+      }
+    },
+    {
+      "episode_index": 148,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0148_20260823_221010.h5",
+      "raw_rows": 1099,
+      "retained_rows": 1096,
+      "phase_counts": {
+        "-1": 45,
+        "0": 781,
+        "1": 117,
+        "2": 153
+      }
+    },
+    {
+      "episode_index": 149,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0149_20260823_221033.h5",
+      "raw_rows": 1021,
+      "retained_rows": 1019,
+      "phase_counts": {
+        "-1": 46,
+        "0": 755,
+        "1": 114,
+        "2": 104
+      }
+    },
+    {
+      "episode_index": 150,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0150_20260823_221050.h5",
+      "raw_rows": 1149,
+      "retained_rows": 1148,
+      "phase_counts": {
+        "-1": 47,
+        "0": 890,
+        "1": 113,
+        "2": 98
+      }
+    },
+    {
+      "episode_index": 151,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0151_20260823_221105.h5",
+      "raw_rows": 1008,
+      "retained_rows": 1006,
+      "phase_counts": {
+        "-1": 46,
+        "0": 763,
+        "1": 100,
+        "2": 97
+      }
+    },
+    {
+      "episode_index": 152,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0152_20260823_221126.h5",
+      "raw_rows": 1487,
+      "retained_rows": 1484,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1105,
+        "1": 202,
+        "2": 132
+      }
+    },
+    {
+      "episode_index": 153,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0153_20260823_221145.h5",
+      "raw_rows": 1174,
+      "retained_rows": 1173,
+      "phase_counts": {
+        "-1": 47,
+        "0": 884,
+        "1": 107,
+        "2": 135
+      }
+    },
+    {
+      "episode_index": 154,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0154_20260823_221221.h5",
+      "raw_rows": 1300,
+      "retained_rows": 1297,
+      "phase_counts": {
+        "-1": 45,
+        "0": 1023,
+        "1": 111,
+        "2": 118
+      }
+    },
+    {
+      "episode_index": 155,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0155_20260823_221245.h5",
+      "raw_rows": 1081,
+      "retained_rows": 1079,
+      "phase_counts": {
+        "-1": 46,
+        "0": 814,
+        "1": 106,
+        "2": 113
+      }
+    },
+    {
+      "episode_index": 156,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0156_20260823_221300.h5",
+      "raw_rows": 973,
+      "retained_rows": 970,
+      "phase_counts": {
+        "-1": 45,
+        "0": 680,
+        "1": 107,
+        "2": 138
+      }
+    },
+    {
+      "episode_index": 157,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0157_20260823_221316.h5",
+      "raw_rows": 1124,
+      "retained_rows": 1122,
+      "phase_counts": {
+        "-1": 46,
+        "0": 818,
+        "1": 105,
+        "2": 153
+      }
+    },
+    {
+      "episode_index": 158,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0158_20260823_221335.h5",
+      "raw_rows": 1309,
+      "retained_rows": 1307,
+      "phase_counts": {
+        "-1": 46,
+        "0": 992,
+        "1": 111,
+        "2": 158
+      }
+    },
+    {
+      "episode_index": 159,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0159_20260823_221353.h5",
+      "raw_rows": 1094,
+      "retained_rows": 1093,
+      "phase_counts": {
+        "-1": 47,
+        "0": 832,
+        "1": 103,
+        "2": 111
+      }
+    },
+    {
+      "episode_index": 160,
+      "source_file": "/mnt/code/lcx/nero_ws/runs/push_button/episode_0160_20260823_221414.h5",
+      "raw_rows": 1045,
+      "retained_rows": 1044,
+      "phase_counts": {
+        "-1": 47,
+        "0": 785,
+        "1": 110,
+        "2": 102
+      }
+    }
+  ],
+  "phase_counts": {
+    "-1": 7319,
+    "0": 181324,
+    "1": 22066,
+    "2": 19847
+  },
+  "label_contract_sha256": "ed6b6573022fc80faa4853bd966088842eafd4ca045968af267b9b6d9c765114"
+}

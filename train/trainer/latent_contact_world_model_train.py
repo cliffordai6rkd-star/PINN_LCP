@@ -1,4 +1,4 @@
-"""Independent two-stage CLI; Flow budgets count successful optimizer updates."""
+"""Codec/Flow pretraining and interface SFT with optimizer-update budgets."""
 from __future__ import annotations
 
 import argparse
@@ -71,8 +71,9 @@ class LatentContactWorldModelTrainer(BaseTrainer):
         super().__init__(config)
         self.loss_calculator = LatentContactWorldModelLoss(self.config)
         self.requested_stage = self.train_config.get("stage", "all")
-        if self.requested_stage not in {"all", "codec", "flow"}:
-            raise ValueError("train.stage must be codec, flow or all")
+        if self.requested_stage not in {"all", "codec", "flow", "sft"}:
+            raise ValueError("train.stage must be codec, flow, all or sft")
+        self.sft_config = self.config.get("sft") or {}
         if self.split_mode != "episode":
             raise ValueError("latent v1 trainer requires episode split")
         if self.early_stopping_enabled:
@@ -81,6 +82,10 @@ class LatentContactWorldModelTrainer(BaseTrainer):
         if rollout.get("enabled"):
             raise ValueError("use evaluate_feedback() for measured reconditioning; legacy free-running rollout is unsupported")
         self.codec_config = self.config.get("codec") or {}
+        self.flow_lr = self.lr
+        self.codec_lr = float(self.codec_config.get("lr", self.flow_lr))
+        if not math.isfinite(self.codec_lr) or self.codec_lr <= 0:
+            raise ValueError("codec.lr must be finite and positive")
         self.codec_max_steps = int(self.codec_config.get("max_optimizer_steps", 10000))
         self.flow_max_steps = int(self.train_config.get("max_optimizer_steps", 250000))
         if self.codec_max_steps < 1 or self.flow_max_steps < 1:
@@ -101,7 +106,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
             raise ValueError("recovery_every_steps must be positive")
         if self.device_batch_keys is not None:
             self.device_batch_keys.update({*LatentContactWorldModel.CONDITION_KEYS, *LatentContactWorldModel.TARGET_KEYS,
-                "contact", "history_valid_mask", "importance_weight"})
+                "contact", "history_valid_mask", "importance_weight", "task_index"})
 
     def build_dataset(self):
         return LatentContactWorldModelDataset(self.config, compute_normalizer=False)
@@ -157,6 +162,10 @@ class LatentContactWorldModelTrainer(BaseTrainer):
             if not equal_contract(resume_payload.get("normalizer"), self.model.wm_normalizer):
                 raise ValueError("resume train-split normalizer mismatch")
             self.stage = state["stage"]
+            if (self.stage == "sft") != (self.requested_stage == "sft"):
+                raise ValueError("resume stage mismatch: SFT must resume with train.stage=sft")
+            if self.stage == "sft" and state.get("sft_objective") != self._sft_objective():
+                raise ValueError("resume SFT objective mismatch")
             self.codec_step = int(state["codec_step"])
             self.stage_epoch = int(state["stage_epoch"])
             self.order = state.get("sample_order")
@@ -166,15 +175,30 @@ class LatentContactWorldModelTrainer(BaseTrainer):
             self.loss_calculator.set_contact_class_weights(state["contact_class_weights"])
             # No initialization paths are opened during resume.
         else:
-            source_preprocessing = self._source_preprocessing()
-            self.model.initialize_pretrained_motion(wm_filters=self.dataset.filter_config,
-                                                   source_preprocessing=source_preprocessing)
-            if self.codec_config.get("checkpoint_path"):
+            if self.requested_stage == "sft":
+                path = self.sft_config.get("pretrained_checkpoint")
+                if not path:
+                    raise ValueError("train.stage=sft requires sft.pretrained_checkpoint or a full SFT resume")
+                if self.codec_config.get("checkpoint_path"):
+                    raise ValueError("SFT imports the pretrained model's codec; codec.checkpoint_path must be null")
+                payload = self.model.initialize_sft(self.resolve_resume_checkpoint(path),
+                                                  use_ema=bool(self.sft_config.get("use_ema", True)))
+                self.codec_step = int((payload.get("latent_training") or {}).get("codec_step", 0))
+                self.latent_statistics_report = (payload.get("latent_training") or {}).get("latent_statistics_report", {})
+                self.stage = "sft"
+            else:
+                source_preprocessing = self._source_preprocessing()
+                self.model.initialize_pretrained_motion(wm_filters=self.dataset.filter_config,
+                                                       source_preprocessing=source_preprocessing)
+            if self.requested_stage != "sft" and self.codec_config.get("checkpoint_path"):
                 self.load_codec(self.codec_config["checkpoint_path"])
                 self.stage = "flow"
             elif self.requested_stage == "flow":
                 raise ValueError("train.stage=flow requires a codec checkpoint or a full resume checkpoint")
         self._configure_stage(self.stage)
+        if resume_payload is None and self.stage == "sft":
+            self.codec_validation = self.evaluate(codec=True)
+            self._write_json("sft_initial_reconstruction.json", self.codec_validation)
         if resume_payload is not None:
             super()._load_resume_checkpoint()
             self.model.set_stage(self.stage)
@@ -183,7 +207,15 @@ class LatentContactWorldModelTrainer(BaseTrainer):
             # BaseTrainer's epoch records are not sample consumption cursors.
             self.current_epoch = self.stage_epoch
         self.setup_wandb()
+        if self.model.transfer_provenance is not None:
+            self._write_json("transfer.json", self.model.transfer_provenance)
         self._write_status("ready")
+
+    def _sft_objective(self):
+        return {"lambda_fm": self.loss_calculator.sft_fm_weight,
+                "lambda_reconstruction": self.loss_calculator.sft_reconstruction_weight,
+                "lambda_free": self.loss_calculator.lambda_free,
+                "codec_contact_weight": self.loss_calculator.codec_contact_weight}
 
     def _source_preprocessing(self):
         result = {}
@@ -204,12 +236,13 @@ class LatentContactWorldModelTrainer(BaseTrainer):
     def _configure_stage(self, stage):
         self.stage = stage
         self.model.set_stage(stage)
+        self.lr = self.codec_lr if stage == "codec" else self.flow_lr
         self.optimizer = torch.optim.AdamW(self.model.parameter_groups(), lr=self.lr, weight_decay=self.weight_decay)
         self.max_optimizer_steps = self.codec_max_steps if stage == "codec" else self.flow_max_steps
         self.scheduler = self.build_scheduler()
         self.max_optimizer_steps = self.flow_max_steps
         # The codec snapshot is final raw; EMA begins only after freezing it.
-        self.ema = ModelEMA(self.model, self.ema_decay, self.ema_update_after_step, self.ema_update_every) if stage == "flow" and self.ema_enabled else None
+        self.ema = ModelEMA(self.model, self.ema_decay, self.ema_update_after_step, self.ema_update_every) if stage != "codec" and self.ema_enabled else None
 
     def compute_loss(self, batch):
         out = self.model(batch)
@@ -223,6 +256,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
             "data_contract": self.data_contract, "codec_validation": self.codec_validation,
             "latent_statistics_report": self.latent_statistics_report,
             "contact_class_weights": self.loss_calculator.contact_class_weights,
+            "sft_objective": self._sft_objective() if self.stage == "sft" else None,
             "codec_snapshot_policy": "final_raw", "frozen_modules": [name for name, module in self.model.named_children()
                 if not any(p.requires_grad for p in module.parameters())],
             "final_validation": self.final_validation}}
@@ -244,6 +278,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
     def _write_status(self, status, **extra):
         self._write_json("status.json", {"status":status, "pid":os.getpid(), "stage":self.stage,
             "codec_step":self.codec_step, "flow_step":self.global_step, "flow_budget":self.flow_max_steps,
+            "sft_step":self.global_step if self.stage == "sft" else 0,
             "codec_budget":self.codec_max_steps, "output_dir":str(self.output_dir),
             "codec_ready":bool(self.model.codec_ready) if self.model is not None else False,
             "updated_at_unix":time.time(), **extra})
@@ -253,7 +288,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
         if self.order is None or self.batch_cursor >= len(self.order):
             if self.order is not None:
                 self.stage_epoch += 1
-            generator = torch.Generator().manual_seed(self.seed + self.stage_epoch + (1_000_000 if self.stage == "flow" else 0))
+            generator = torch.Generator().manual_seed(self.seed + self.stage_epoch + (1_000_000 if self.stage != "codec" else 0))
             if self.train_sampler is None:
                 self.order = torch.randperm(n, generator=generator)
             else:
@@ -334,7 +369,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
                     self.log_wandb({f"{self.stage}/{k}":v for k,v in metrics.items()}, step=self.global_step)
                     self._write_status("running")
                     metric_sums, metric_counts = {}, {}
-                if successful and self.stage == "flow" and step < budget and self.checkpoint_every_steps and step % self.checkpoint_every_steps == 0:
+                if successful and self.stage != "codec" and step < budget and self.checkpoint_every_steps and step % self.checkpoint_every_steps == 0:
                     # Reuse the original newest-step top_k retention semantics.
                     validation = self.evaluate()
                     super().save_step_checkpoint(self.stage_epoch, {"avg_loss":float(loss.detach()), **validation})
@@ -360,6 +395,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
     @torch.no_grad()
     def finalize_codec(self):
         # The final RAW snapshot and every decoder are fixed before statistics.
+        self.model.snapshot_target_encoder()
         self.model.set_stage("flow")
         self.model.eval()
         self.codec_validation = self.evaluate(codec=True)
@@ -370,7 +406,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
         for batch in stats_loader:
             batch = self.batch_to_device(batch)
             # Welford merge, not moving statistics during codec training.
-            latent = self.model.future_encoder(self.model.future_input(batch)).reshape(-1, self.model.latent_dim).double()
+            latent = self.model.encode_future(batch, target=True).reshape(-1, self.model.latent_dim).double()
             chunk_count, chunk_mean = latent.shape[0], latent.mean(0)
             delta = chunk_mean - mean
             total = count + chunk_count
@@ -398,11 +434,12 @@ class LatentContactWorldModelTrainer(BaseTrainer):
             "near_zero_channels":torch.nonzero(std < floor).flatten().tolist(),
             "unclamped_min_std":float(std.min()), "snapshot":self.model.codec_snapshot}
         log.info("frozen codec: validation=%s latent_statistics=%s", self.codec_validation, self.latent_statistics_report)
-        payload = {"model_version":"latent_codec_v1", "codec_contract":self.model.codec_contract(),
+        payload = {"model_version":self.model.codec_contract()["schema"], "codec_contract":self.model.codec_contract(),
             "modules":{name:getattr(self.model,name).state_dict() for name in self.model.CODEC_MODULES},
             "latent_mean":self.model.latent_mean, "latent_std":self.model.latent_std,
             "codec_snapshot":self.model.codec_snapshot, "codec_step":self.codec_step,
-            "normalizer":self.model.wm_normalizer, "statistics":self.latent_statistics_report,
+            "normalizer":self.model.wm_normalizer, "codec_normalizer":self.model.codec_normalizer,
+            "statistics":self.latent_statistics_report,
             "validation":self.codec_validation, "data_contract":self.data_contract}
         self._save_checkpoint_atomic(payload, self.output_dir / "codec.pt")
         self._write_json("codec_validation.json", {**self.codec_validation, "latent_statistics":self.latent_statistics_report})
@@ -412,7 +449,7 @@ class LatentContactWorldModelTrainer(BaseTrainer):
 
     def load_codec(self, path):
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("model_version") != "latent_codec_v1" or payload.get("codec_contract") != self.model.codec_contract():
+        if payload.get("model_version") != self.model.codec_contract()["schema"] or payload.get("codec_contract") != self.model.codec_contract():
             raise ValueError("codec checkpoint architecture/preprocessing contract mismatch")
         if not equal_contract(payload.get("normalizer"), self.model.wm_normalizer):
             raise ValueError("codec input normalizer mismatch; frozen heads require their training scales")
@@ -427,6 +464,9 @@ class LatentContactWorldModelTrainer(BaseTrainer):
         self.model.latent_std.copy_(std)
         self.model.codec_ready.fill_(True)
         self.model.codec_snapshot = payload["codec_snapshot"]
+        self.model.codec_normalizer = copy.deepcopy(payload.get("codec_normalizer"))
+        if self.model.conditional_codec and not equal_contract(self.model.codec_normalizer, self.model.wm_normalizer):
+            raise ValueError("conditional codec target normalizer mismatch")
         self.codec_step = int(payload["codec_step"])
         self.codec_validation = payload["validation"]
         self.latent_statistics_report = payload["statistics"]
@@ -453,9 +493,14 @@ class LatentContactWorldModelTrainer(BaseTrainer):
         model.eval()
         sums, counts = {}, {}
         confusion = torch.zeros(3,3, dtype=torch.long, device=self.device)
+        task_confusions, task_batches, task_windows = {}, {}, {}
         probability_cfg = self.train_config.get("probabilistic_validation") or {}
         samples = int(probability_cfg.get("num_samples", 8))
         limit = int(probability_cfg.get("max_batches", 8))
+        per_task_limit = int(probability_cfg.get("per_task_max_batches", 0))
+        if per_task_limit < 0 or limit < 0 or samples < 1:
+            raise ValueError("invalid probabilistic validation limits or sample count")
+        ablations = bool(probability_cfg.get("latent_ablation", False)) and model.conditional_codec
         generator = torch.Generator(device=self.device).manual_seed(int((self.train_config.get("rollout_validation") or {}).get("source_seed", 1234)))
         # Validation cannot advance the training RNG.
         rng = self._capture_rng_state()
@@ -471,9 +516,25 @@ class LatentContactWorldModelTrainer(BaseTrainer):
                     else:
                         noise = torch.randn(b,model.future_horizon,model.latent_dim,device=self.device,generator=generator)
                         out = model(batch, flow_time=self.train_config.get("validation_flow_time", 0.5), source_noise=noise)
-                        _, metrics = self.loss_calculator.flow_loss(out, batch)
+                        _, metrics = self.loss_calculator(out, batch)
                 self._accumulate_scalar_metrics(sums, counts, metrics, b, defer_device_sync=True)
-                if codec or (probability_cfg.get("enabled", True) and (limit == 0 or i < limit)):
+                tasks = prepared.get("task_index", torch.zeros(b, dtype=torch.long, device=self.device))
+                if not codec:
+                    fm_errors = (out["flow_velocity_pred"].float()-out["flow_velocity_target"].float()).square().mean((1,2))
+                    for task in tasks.unique().tolist():
+                        rows = tasks == task
+                        self._accumulate_scalar_metrics(sums, counts, {f"task_{task}_latent_fm_mse": fm_errors[rows].mean()},
+                                                        int(rows.sum()), defer_device_sync=True)
+                selected = torch.ones(b, dtype=torch.bool, device=tasks.device) if codec else torch.zeros(b, dtype=torch.bool, device=tasks.device)
+                if not codec and probability_cfg.get("enabled", True):
+                    if per_task_limit:
+                        for task in tasks.unique().tolist():
+                            if task_batches.get(task, 0) < per_task_limit:
+                                selected |= tasks == task
+                                task_batches[task] = task_batches.get(task, 0)+1
+                    elif limit == 0 or i < limit:
+                        selected.fill_(True)
+                if selected.any():
                     if codec:
                         sampled = {key:value[:,None] for key,value in out.items() if key in
                                    ("q_pred", "tau_pred", "contact_logits", "contact_probability")}
@@ -481,36 +542,72 @@ class LatentContactWorldModelTrainer(BaseTrainer):
                         noise = torch.randn(b,samples,model.future_horizon,model.latent_dim,device=self.device,generator=generator)
                         with self.autocast_context():
                             sampled = model.sample(batch, num_samples=samples, source_noise=noise)
+                    # Device filtering keeps timestamps/indices on CPU while
+                    # predictions and task IDs live on the training device.
+                    sampled = {key: value[selected.to(value.device)] for key, value in sampled.items() if torch.is_tensor(value) and value.shape[0] == b}
+                    prepared = {key: value[selected.to(value.device)] if torch.is_tensor(value) and value.ndim and value.shape[0] == b else value
+                                for key, value in prepared.items()}
+                    tasks = tasks[selected]
+                    b = int(selected.sum())
+                    if not codec:
                         metrics = distribution_metrics({k:sampled[k+"_pred"].float() for k in ("q","tau")},
                             {k:prepared[k+"_future"].float() for k in ("q","tau")},
                             sampled["contact_probability"].float(), prepared["contact_future"])
                         self._accumulate_scalar_metrics(sums, counts, {k:v.mean() for k,v in metrics.items()}, b, defer_device_sync=True)
-                    physical = {}
+                    physical, per_window = {}, {}
                     for key in ("q","tau"):
                         prediction = convert_scale(key, sampled[key+"_pred"].float(), model.wm_normalizer, inverse=True)
                         truth = convert_scale(key, prepared[key+"_future"].float(), model.wm_normalizer, inverse=True)
                         error = prediction-truth[:,None]
-                        physical[key+"_physical_mae"] = error.abs().mean()
-                        physical[key+"_physical_mse"] = error.square().mean()
+                        per_window[key+"_physical_mae"] = error.abs().mean((1,2,3))
+                        per_window[key+"_physical_mse"] = error.square().mean((1,2,3))
                     probability = sampled["contact_probability"].float().mean(1).clamp_min(1e-8)
                     labels = prepared["contact_future"][...,0].long()
-                    physical["contact_ce"] = -probability.gather(-1, labels[...,None]).log().mean()
+                    per_window["contact_ce"] = -probability.gather(-1, labels[...,None]).log().mean((1,2))
+                    physical.update({key: value.mean() for key, value in per_window.items()})
                     self._accumulate_scalar_metrics(sums, counts, physical, b, defer_device_sync=True)
                     confusion += contact_confusion_matrix(sampled["contact_probability"], prepared["contact_future"])
+                    for task in tasks.unique().tolist():
+                        rows = tasks == task
+                        windows = int(rows.sum())
+                        task_windows[task] = task_windows.get(task, 0)+windows
+                        self._accumulate_scalar_metrics(sums, counts,
+                            {f"task_{task}_{key}": value[rows].mean() for key, value in per_window.items()}, windows, defer_device_sync=True)
+                        matrix = contact_confusion_matrix(sampled["contact_probability"][rows], prepared["contact_future"][rows])
+                        task_confusions[task] = task_confusions.get(task, torch.zeros_like(matrix))+matrix
+                    if not codec and ablations:
+                        raw = sampled["raw_latent"]
+                        variants = {"zero": model.latent_mean.expand_as(raw)}
+                        if b > 1:
+                            variants["shuffled"] = raw.roll(1, 0)
+                        for name, latent in variants.items():
+                            with self.autocast_context():
+                                decoded = model.decode(latent, prepared)
+                            ablation_metrics = {}
+                            for key in ("q", "tau"):
+                                prediction = convert_scale(key, decoded[key+"_pred"].float(), model.wm_normalizer, inverse=True)
+                                truth = convert_scale(key, prepared[key+"_future"].float(), model.wm_normalizer, inverse=True)
+                                ablation_metrics[f"latent_{name}_{key}_physical_mse"] = (prediction-truth[:,None]).square().mean()
+                            probability = decoded["contact_probability"].float().mean(1).clamp_min(1e-8)
+                            ablation_metrics[f"latent_{name}_contact_ce"] = -probability.gather(-1, labels[...,None]).log().mean()
+                            self._accumulate_scalar_metrics(sums, counts, ablation_metrics, b, defer_device_sync=True)
         finally:
             model.train(previous_mode)
             self.model = training_model
             self._restore_rng_state(rng)
         result = self._average_scalar_metrics(sums, counts)
-        for key in ("q","tau"):
-            if key+"_physical_mse" in result:
-                result[key+"_physical_rmse"] = math.sqrt(result[key+"_physical_mse"])
+        for key in list(result):
+            if key.endswith("_physical_mse"):
+                result[key.removesuffix("mse")+"rmse"] = math.sqrt(result[key])
         result.update(self._class_metrics(confusion))
+        for task, matrix in task_confusions.items():
+            result.update({f"task_{task}_{key}": value for key, value in self._class_metrics(matrix).items()})
+            result[f"task_{task}_evaluated_windows"] = task_windows[task]
         result["val_loss"] = (result["energy_score"] if not codec and probability_cfg.get("replace_val_loss", False)
                               and "energy_score" in result else result["total_loss"])
         result["validation_ode_steps"] = 0 if codec else model.flow_inference_steps
         result["validation_nfe"] = 0 if codec else model.flow_inference_steps*(2 if model.flow_solver == "heun" else 1)
-        self._append_metrics({"stage":"codec_validation" if codec else "flow_validation",
+        self._append_metrics({"stage":"codec_validation" if codec else self.stage+"_validation",
                               "codec_step":self.codec_step, "flow_step":self.global_step, **result})
         log.info("%s validation codec_step=%d flow_step=%d %s", self.stage, self.codec_step, self.global_step, result)
         return result
@@ -632,14 +729,16 @@ class LatentContactWorldModelTrainer(BaseTrainer):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train independent latent LSTM CARS-WM codec then Flow")
+    parser = argparse.ArgumentParser(description="Train latent WM codec/Flow or adapt pretrained v2 interfaces with SFT")
     parser.add_argument("--config", "-c", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device")
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--stage", choices=("codec","flow","all"))
+    parser.add_argument("--stage", choices=("codec","flow","all","sft"))
     parser.add_argument("--codec-checkpoint", type=Path)
     parser.add_argument("--pretrained-taufree", type=Path)
+    parser.add_argument("--pretrained-checkpoint", type=Path, help="v2 Flow checkpoint for SFT initialization")
+    parser.add_argument("--flow-adaptation", choices=("frozen", "adapter"))
     parser.add_argument("--audit-only", action="store_true")
     args = parser.parse_args()
     config = yaml.safe_load(args.config.read_text())
@@ -650,6 +749,10 @@ def main():
         config.setdefault("codec",{})["checkpoint_path"] = str(args.codec_checkpoint)
     if args.pretrained_taufree:
         config.setdefault("model",{})["pretrained_taufree_path"] = str(args.pretrained_taufree)
+    if args.pretrained_checkpoint:
+        config.setdefault("sft",{})["pretrained_checkpoint"] = str(args.pretrained_checkpoint)
+    if args.flow_adaptation:
+        config.setdefault("sft",{})["flow_mode"] = args.flow_adaptation
     trainer = LatentContactWorldModelTrainer(config)
     if args.audit_only:
         trainer.setup()

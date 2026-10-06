@@ -1,0 +1,95 @@
+io:
+  input: /mnt/code/lcx/nero_ws/runs/wipe_board
+  output: /mnt/code/lcx/PINN/data/nero_data/wipe_board_lerobotv3
+  repo_id: wipe_board_lerobotv3
+  max_episodes: null
+  no_videos: true
+  push_to_hub: false
+task: wipe_board
+fps: 100
+timeline:
+  mode: raw_lowdim_action_hold
+  state_timestamp_path: teleop/timestamp_us
+  action_anchor_timestamp_path: cameras/wrist/timestamp_us
+  action_fps: 25
+  max_action_gap_s: 0.015
+features:
+  observation.joint:
+    rate: state
+    dtype: float32
+    shape:
+    - 7
+    h5_path: teleop/q_follower
+    align: index
+    lowpass: false
+  observation.velocity:
+    rate: state
+    dtype: float32
+    shape:
+    - 7
+    h5_path: teleop/dq_follower
+    align: index
+    lowpass: false
+  observation.torque:
+    rate: state
+    dtype: float32
+    shape:
+    - 7
+    h5_path: teleop/tau_follower
+    align: index
+    lowpass: false
+  observation.delta_q:
+    rate: state
+    dtype: float32
+    shape:
+    - 7
+    sources:
+    - h5_path: teleop/q_cmd
+      align: index
+    - h5_path: teleop/q_follower
+      align: index
+    combine: subtract
+    lowpass: false
+  observation.ee_pose:
+    rate: state
+    dtype: float32
+    shape:
+    - 7
+    h5_path: teleop/ee_pose_follower
+    align: index
+    transform: ee_pose_matrix_to_quaternion
+    lowpass: false
+  action.joint:
+    rate: action
+    dtype: float32
+    shape:
+    - 7
+    h5_path: teleop/q_cmd
+    timestamp_path: teleop/timestamp_us
+    resample: previous
+    lowpass: false
+  action.ee_pose:
+    rate: action
+    dtype: float32
+    shape:
+    - 7
+    h5_path: teleop/ee_pose_follower
+    timestamp_path: teleop/timestamp_us
+    resample: previous
+    transform: ee_pose_matrix_to_quaternion
+    lowpass: false
+  observation.q_cmd:
+    rate: state
+    dtype: float32
+    shape:
+    - 7
+    h5_path: teleop/q_cmd
+    align: index
+    lowpass: false
+tau_labels:
+  checkpoint: /mnt/code/lcx/PINN/outputs/tau_free_sequence/nero/epoch_124_val_tau_mse_nm2_0.005756.pt
+  metric: tau_ext_l1
+  contact_threshold: 1.0
+  precontact_duration_s: 1.0
+  valid_key: observation.tau_label_valid
+  phase_key: observation.contact_phase
